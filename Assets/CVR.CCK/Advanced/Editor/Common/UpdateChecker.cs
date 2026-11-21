@@ -73,7 +73,7 @@ namespace CVR.CCKEditor.Advanced
                         "CCK Advanced update available",
                         $"Version {Format(latest)} is available; you have {CCKAdvancedInfo.Version}.\n\n" +
                         $"CCK {CVRCommon.CCK_VERSION}  •  Advanced {CCKAdvancedInfo.Version}  •  AvatarBridge {AvatarBridge.BridgeDefines.Version}\n\n" +
-                        "Update through your VCC package manager, or open the release page to download it.",
+                        "The installer will fetch it automatically, or open the release page for details.",
                         "Open release page", "Later");
                     if (open)
                     {
