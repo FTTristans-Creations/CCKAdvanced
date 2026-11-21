@@ -687,10 +687,45 @@ namespace AvatarBridge
             voiceLocal = default;
             visibleHead = null;
             detail = null;
-            if (!DecoyRigAnchors(root, animator, out var head, out var leftEye, out var rightEye))
+
+            // Best-effort heuristic: a failure here must never sink the conversion. The
+            // stage is logged so a recurring null deref can be tracked to its source.
+            Transform head, leftEye, rightEye;
+            try
             {
+                if (!DecoyRigAnchors(root, animator, out head, out leftEye, out rightEye))
+                {
+                    return false;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                Debug.LogWarning("[AvatarBridge] Decoy-rig anchor scan failed; treating the rig as ordinary.");
                 return false;
             }
+
+            try
+            {
+                return DecoyRigPlacementCore(root, animator, head, leftEye, rightEye,
+                    out viewLocal, out voiceLocal, out visibleHead, out detail);
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                Debug.LogWarning("[AvatarBridge] Decoy-rig placement failed; treating the rig as ordinary.");
+                viewLocal = default;
+                voiceLocal = default;
+                visibleHead = null;
+                detail = null;
+                return false;
+            }
+        }
+
+        static bool DecoyRigPlacementCore(GameObject root, Animator animator,
+            Transform head, Transform leftEye, Transform rightEye,
+            out Vector3 viewLocal, out Vector3 voiceLocal, out Transform visibleHead, out string detail)
+        {
             visibleHead = head;
 
             // Offsets scale with the avatar, not a human head; the humanoid chain always exists.

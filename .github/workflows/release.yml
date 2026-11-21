@@ -17,8 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The package lives in the repo as an embedded UPM package so the dev
-      # project compiles it exactly like an end-user install.
+      # The CCK lives in Assets/ like the official CCK so scripts compile into
+      # Assembly-CSharp/Assembly-CSharp-Editor exactly like a .unitypackage install.
       - name: Resolve version
         id: version
         run: |
@@ -53,34 +53,89 @@ jobs:
           PY
 
           sed -i "s/public const string Version = \"[^\"]*\";/public const string Version = \"$VERSION\";/" \
-            "$PKG_DIR/Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
           grep -q "Version = \"$VERSION\"" \
-            "$PKG_DIR/Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+
+          # Version marker the installer reads to decide install vs update.
+          echo "$VERSION" > Assets/CVR.CCK/CCKAdvanced.version
+
+          # The installer package tracks the same release version.
+          python3 - "$VERSION" "installer/com.fttristan.cck-advanced.installer/package.json" <<'PY'
+          import json, sys
+          version, path = sys.argv[1], sys.argv[2]
+          with open(path) as f:
+              data = json.load(f)
+          data['version'] = version
+          with open(path, 'w') as f:
+              json.dump(data, f, indent=2)
+              f.write('\n')
+          PY
           echo "Stamped version $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
-      # VPM package: package.json at zip root + the Assets tree with metas.
-      - name: Create Package Zip
+      # Source snapshot: package.json at zip root + the Assets tree with metas.
+      - name: Create Source Zip
         run: |
           set -euo pipefail
-          ZIP_NAME="com.fttristan.cck-advanced.zip"
-          rm -f "$ZIP_NAME"
-          (cd Packages/com.fttristan.cck-advanced && \
-            zip -r "../../$ZIP_NAME" package.json package.json.meta Assets.meta Assets \
+          ZIP_NAME="com.fttristan.cck-advanced-src.zip"
+          STAGE="$(mktemp -d)"
+          cp Packages/com.fttristan.cck-advanced/package.json* "$STAGE/"
+          mkdir -p "$STAGE/Assets"
+          cp -r Assets/CVR.CCK "$STAGE/Assets/"
+          cp Assets/CVR.CCK.meta "$STAGE/Assets/"
+          cp Assets/csc.rsp* "$STAGE/Assets/" 2>/dev/null || true
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . \
+            -x "*.DS_Store" "*/.DS_Store" "*.tmp" "*.backup" "*.backup.meta")
+          rm -rf "$STAGE"
+          echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+
+      # Payload the installer downloads: Assets/CVR.CCK + csc.rsp + a manifest
+      # of every installed path so updates can delete what upstream removed.
+      - name: Create Payload Zip
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          ZIP_NAME="cck-advanced-payload-$VERSION.zip"
+          STAGE="$(mktemp -d)/payload"
+          mkdir -p "$STAGE/Assets"
+          cp -r Assets/CVR.CCK "$STAGE/Assets/"
+          cp Assets/CVR.CCK.meta "$STAGE/Assets/"
+          cp Assets/csc.rsp* "$STAGE/Assets/" 2>/dev/null || true
+          (cd "$STAGE/Assets" && find . -type f | sed 's|^\./|Assets/|' | LC_ALL=C sort) \
+            > "$STAGE/install-manifest.txt"
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . \
             -x "*.DS_Store" "*/.DS_Store" "*.tmp" "*.backup" "*.backup.meta")
           echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
 
-      # .unitypackage needs Assets/-rooted paths, so stage the package content
-      # under Assets/ in the (otherwise empty) checkout before listing metas.
-      - name: Stage Assets tree for unitypackage
+      # Installer distribution: VPM-style zip (package.json + Assets) for VCC,
+      # and a .unitypackage wrapping the same Editor scripts.
+      - name: Create Installer Zip
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          mkdir -p Assets
-          cp -r "Packages/com.fttristan.cck-advanced/Assets/CVR.CCK" Assets/
-          cp "Packages/com.fttristan.cck-advanced/Assets/CVR.CCK.meta" Assets/
-          cp -r "Packages/com.fttristan.cck-advanced/Assets/CompatStubs" Assets/
+          ZIP_NAME="com.fttristan.cck-advanced-installer-$VERSION.zip"
+          STAGE="$(mktemp -d)"
+          cp -r installer/com.fttristan.cck-advanced.installer/. "$STAGE/"
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . \
+            -x "*.DS_Store" "*/.DS_Store" "*.tmp" "*.backup" "*.backup.meta")
+          rm -rf "$STAGE"
+          echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
 
+      # .unitypackage needs Assets/-rooted paths. The CCK already lives at
+      # Assets/CVR.CCK in this repo, so only the meta list needs building.
+      # Assets/csc.rsp ships too: its defines must exist on a consumer's very
+      # first compile, before CCK_EnvConfig can add them to ProjectSettings.
       - name: Track Package Meta Files
-        run: find "Assets/CVR.CCK" "Assets/CompatStubs" -name "*.meta" > metaList
+        run: |
+          find "Assets/CVR.CCK" -name "*.meta" > metaList
+          [ -f Assets/csc.rsp.meta ] && echo "Assets/csc.rsp.meta" >> metaList
+          # The installer ships as a second unitypackage; stage its Editor
+          # scripts under Assets/ so they get Assets/-rooted meta paths, and
+          # remove them again after both packages are built.
+          cp -r installer/com.fttristan.cck-advanced.installer/Assets/CCKInstaller Assets/
+          find "Assets/CCKInstaller" -name "*.meta" > installerMetaList
 
       - name: Create UnityPackage
         uses: pCYSl5EDgo/create-unitypackage@v1.2.3
@@ -90,6 +145,17 @@ jobs:
           package-path: com.fttristan.cck-advanced-${{ steps.version.outputs.value }}.unitypackage
           include-files: metaList
 
+      - name: Create Installer UnityPackage
+        uses: pCYSl5EDgo/create-unitypackage@v1.2.3
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        with:
+          package-path: com.fttristan.cck-advanced-installer-${{ steps.version.outputs.value }}.unitypackage
+          include-files: installerMetaList
+
+      - name: Clean installer staging
+        run: rm -rf Assets/CCKInstaller Assets/CCKInstaller.meta
+
       # Tag is the bare version, matching the official template convention.
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -97,8 +163,11 @@ jobs:
           tag_name: ${{ steps.version.outputs.value }}
           name: CCK Advanced ${{ steps.version.outputs.value }}
           files: |
-            com.fttristan.cck-advanced.zip
+            com.fttristan.cck-advanced-src.zip
+            cck-advanced-payload-${{ steps.version.outputs.value }}.zip
             com.fttristan.cck-advanced-${{ steps.version.outputs.value }}.unitypackage
+            com.fttristan.cck-advanced-installer-${{ steps.version.outputs.value }}.zip
+            com.fttristan.cck-advanced-installer-${{ steps.version.outputs.value }}.unitypackage
             Packages/com.fttristan.cck-advanced/package.json
           generate_release_notes: true
           overwrite_files: true

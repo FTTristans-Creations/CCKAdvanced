@@ -41,11 +41,15 @@ crashlytics-build.properties
 Thumbs.db
 
 # ---------------------------------------------------------------
-# The shippable package lives in Packages/com.fttristan.cck-advanced.
-# Everything else under Assets/ is local project content (DynamicBone
-# stub installs, test assets) and stays out of git.
+# The shippable CCK lives in Assets/CVR.CCK (Assembly-CSharp layout,
+# same as a .unitypackage install). Everything else under Assets/ is
+# local project content (DynamicBone stub installs, test assets)
+# and stays out of git.
 # ---------------------------------------------------------------
 Assets/*
+!Assets/CVR.CCK/
+!Assets/csc.rsp
+!Assets/csc.rsp.meta
 
 # Package payload dependencies live outside the package or are resolved
 # by VCC at install time; keep only the manifests for reference.

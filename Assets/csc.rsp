@@ -1,0 +1,4 @@
+-r:System.Drawing.dll
+-define:SYSTEM_DRAWING
+-define:CVR_CCK_EXISTS
+-define:CVR_CCK_4_OR_NEWER
