@@ -17,8 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Version comes from package.json like the official template; the input
-      # only overrides it for one-off builds.
+      # The package lives in the repo as an embedded UPM package so the dev
+      # project compiles it exactly like an end-user install.
       - name: Resolve version
         id: version
         run: |
@@ -26,7 +26,7 @@ jobs:
           VERSION="${{ inputs.version }}"
           VERSION="${VERSION#v}"
           if [ -z "$VERSION" ]; then
-            VERSION="$(python3 -c "import json; print(json.load(open('package.json'))['version'])")"
+            VERSION="$(python3 -c "import json; print(json.load(open('Packages/com.fttristan.cck-advanced/package.json'))['version'])")"
           fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Version '$VERSION' is not plain semver (expected X.Y.Z)."
@@ -40,21 +40,22 @@ jobs:
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          python3 - "$VERSION" <<'PY'
+          PKG_DIR="Packages/com.fttristan.cck-advanced"
+          python3 - "$VERSION" "$PKG_DIR/package.json" <<'PY'
           import json, sys
-          version = sys.argv[1]
-          with open('package.json') as f:
+          version, path = sys.argv[1], sys.argv[2]
+          with open(path) as f:
               data = json.load(f)
           data['version'] = version
-          with open('package.json', 'w') as f:
+          with open(path, 'w') as f:
               json.dump(data, f, indent=2)
               f.write('\n')
           PY
 
           sed -i "s/public const string Version = \"[^\"]*\";/public const string Version = \"$VERSION\";/" \
-            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+            "$PKG_DIR/Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
           grep -q "Version = \"$VERSION\"" \
-            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+            "$PKG_DIR/Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
           echo "Stamped version $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       # VPM package: package.json at zip root + the Assets tree with metas.
@@ -63,13 +64,23 @@ jobs:
           set -euo pipefail
           ZIP_NAME="com.fttristan.cck-advanced.zip"
           rm -f "$ZIP_NAME"
-          zip -r "$ZIP_NAME" package.json "Assets/CVR.CCK" \
-            -x "*.DS_Store" "*/.DS_Store" "*.tmp"
+          (cd Packages/com.fttristan.cck-advanced && \
+            zip -r "../../$ZIP_NAME" package.json package.json.meta Assets.meta Assets \
+            -x "*.DS_Store" "*/.DS_Store" "*.tmp" "*.backup" "*.backup.meta")
           echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
 
-      # Legacy .unitypackage built from the .meta list, same as the template.
+      # .unitypackage needs Assets/-rooted paths, so stage the package content
+      # under Assets/ in the (otherwise empty) checkout before listing metas.
+      - name: Stage Assets tree for unitypackage
+        run: |
+          set -euo pipefail
+          mkdir -p Assets
+          cp -r "Packages/com.fttristan.cck-advanced/Assets/CVR.CCK" Assets/
+          cp "Packages/com.fttristan.cck-advanced/Assets/CVR.CCK.meta" Assets/
+          cp -r "Packages/com.fttristan.cck-advanced/Assets/CompatStubs" Assets/
+
       - name: Track Package Meta Files
-        run: find "Assets/CVR.CCK" -name "*.meta" > metaList
+        run: find "Assets/CVR.CCK" "Assets/CompatStubs" -name "*.meta" > metaList
 
       - name: Create UnityPackage
         uses: pCYSl5EDgo/create-unitypackage@v1.2.3
@@ -88,6 +99,6 @@ jobs:
           files: |
             com.fttristan.cck-advanced.zip
             com.fttristan.cck-advanced-${{ steps.version.outputs.value }}.unitypackage
-            package.json
+            Packages/com.fttristan.cck-advanced/package.json
           generate_release_notes: true
           overwrite_files: true

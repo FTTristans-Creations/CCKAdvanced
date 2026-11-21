@@ -41,17 +41,18 @@ crashlytics-build.properties
 Thumbs.db
 
 # ---------------------------------------------------------------
-# Only Assets/CVR.CCK ships in the release zip — everything else
-# under Assets/ is local project content and stays out of git.
+# The shippable package lives in Packages/com.fttristan.cck-advanced.
+# Everything else under Assets/ is local project content (DynamicBone
+# stub installs, test assets) and stays out of git.
 # ---------------------------------------------------------------
 Assets/*
-!Assets/CVR.CCK/
 
-# Package payload dependencies live outside Assets/ or are resolved
+# Package payload dependencies live outside the package or are resolved
 # by VCC at install time; keep only the manifests for reference.
 Packages/*
 !Packages/manifest.json
 !Packages/packages-lock.json
+!Packages/com.fttristan.cck-advanced/
 
 # Reference copies of the official CCK kept for diffing.
 Official/
