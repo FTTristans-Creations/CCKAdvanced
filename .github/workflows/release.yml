@@ -1,9 +1,12 @@
 name: Release package
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z, no v prefix)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,12 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stamp version from tag
+      - name: Stamp version
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION#v}"
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag '$GITHUB_REF_NAME' is not a plain semver (expected vX.Y.Z)."
+            echo "'$VERSION' is not a plain semver (expected X.Y.Z)."
             exit 1
           fi
 
@@ -41,19 +46,23 @@ jobs:
           grep -q "Version = \"$VERSION\"" \
             "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
 
-          echo "Stamped version $VERSION"
+          echo "Stamped version $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build VPM package zip
         run: |
           set -euo pipefail
+          # Fixed asset name: package.json's url uses /releases/latest/download,
+          # which only resolves while the name stays constant across releases.
           ZIP_NAME="com.fttristan.cck-advanced.zip"
           rm -f "$ZIP_NAME"
           zip -r "$ZIP_NAME" package.json "Assets/CVR.CCK" \
             -x "*.DS_Store" "*/.DS_Store" "*.tmp"
-          echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))"
+          echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ inputs.version }}
+          name: CCK Advanced v${{ inputs.version }}
           files: com.fttristan.cck-advanced.zip
           generate_release_notes: true
