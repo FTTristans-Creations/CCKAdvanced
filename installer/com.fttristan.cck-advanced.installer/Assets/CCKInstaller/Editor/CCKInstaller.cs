@@ -57,6 +57,16 @@ namespace FTTristan.CCKInstaller
             catch (Exception e) { Debug.LogException(e); }
         }
 
+        // Invoked via reflection by the payload's UpdateChecker dialog so
+        // "Update now" downloads immediately instead of waiting for the
+        // daily check. Reflection keeps the payload compilable without
+        // this package installed.
+        public static void InstallLatest()
+        {
+            try { Tick(true); }
+            catch (Exception e) { Debug.LogException(e); }
+        }
+
         static void Tick(bool forceCheck)
         {
             if (_running) return;

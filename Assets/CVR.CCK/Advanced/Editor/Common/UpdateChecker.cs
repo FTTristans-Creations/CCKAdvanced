@@ -69,15 +69,23 @@ namespace CVR.CCKEditor.Advanced
 
                 if (Compare(latest, ParseVersion(CCKAdvancedInfo.Version)) > 0)
                 {
-                    bool open = EditorUtility.DisplayDialog(
+                    bool update = EditorUtility.DisplayDialog(
                         "CCK Advanced update available",
                         $"Version {Format(latest)} is available; you have {CCKAdvancedInfo.Version}.\n\n" +
                         $"CCK {CVRCommon.CCK_VERSION}  •  Advanced {CCKAdvancedInfo.Version}  •  AvatarBridge {AvatarBridge.BridgeDefines.Version}\n\n" +
-                        "The installer will fetch it automatically, or open the release page for details.",
-                        "Open release page", "Later");
-                    if (open)
+                        "Update now, or the installer will fetch it automatically.",
+                        "Update now", "Later");
+                    if (update)
                     {
-                        Application.OpenURL(release.html_url ?? CCKAdvancedInfo.ReleasePageUrl);
+                        // Defer so the dialog closes before the download blocks
+                        // the main thread.
+                        EditorApplication.delayCall += () =>
+                        {
+                            if (!TryInvokeInstallerUpdate())
+                            {
+                                Application.OpenURL(release.html_url ?? CCKAdvancedInfo.ReleasePageUrl);
+                            }
+                        };
                     }
                 }
                 else if (notify)
@@ -90,6 +98,31 @@ namespace CVR.CCKEditor.Advanced
             {
                 if (notify) Debug.LogWarning($"[CCK Advanced] Update check failed: {e.Message}");
             }
+        }
+
+        // The installer package may not be present (dev projects, manual
+        // payload installs), so look the entry point up by name rather than
+        // referencing it directly.
+        static bool TryInvokeInstallerUpdate()
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var type = asm.GetType("FTTristan.CCKInstaller.CCKInstaller");
+                var method = type?.GetMethod("InstallLatest",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (method == null) continue;
+                try
+                {
+                    method.Invoke(null, null);
+                    return true;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[CCK Advanced] Installer update failed: {e.Message}");
+                    return false;
+                }
+            }
+            return false;
         }
 
         [Serializable]
