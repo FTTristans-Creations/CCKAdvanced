@@ -7503,10 +7503,11 @@ namespace AvatarBridge
         static void WriteRestoreClip(AnimationClip clip, string dir, HashSet<string> writtenPaths,
             List<(AnimationClip clip, string path)> pending)
         {
-            string path = $"{dir}/{clip.name}.anim";
+            string safeName = SanitizeFileName(clip.name);
+            string path = $"{dir}/{safeName}.anim";
             for (int n = 2; !writtenPaths.Add(path) || !OutputAssetPaths.Reserve(path); n++)
             {
-                path = $"{dir}/{clip.name} {n}.anim";
+                path = $"{dir}/{safeName} {n}.anim";
             }
             pending.Add((clip, path));
         }
@@ -10035,6 +10036,12 @@ namespace AvatarBridge
                 return "Asset";
             }
             foreach (char c in System.IO.Path.GetInvalidFileNameChars())
+            {
+                name = name.Replace(c, '_');
+            }
+            // Unity rejects these in asset paths on every OS, but
+            // GetInvalidFileNameChars only reports them on Windows.
+            foreach (char c in new[] { ':', '?', '*', '"', '<', '>', '|' })
             {
                 name = name.Replace(c, '_');
             }
