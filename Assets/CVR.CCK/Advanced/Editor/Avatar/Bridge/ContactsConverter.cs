@@ -799,7 +799,7 @@ namespace AvatarBridge
                 {
                     if (!perLayer.TryGetValue(clip, out var owned))
                     {
-                        owned = Object.Instantiate(clip);
+                        owned = ClipCloner.Clone(clip);
                         owned.name = clip.name;
                         owned.hideFlags = HideFlags.None;
                         UnityEditor.AssetDatabase.AddObjectToAsset(owned, ctx.MergedController);

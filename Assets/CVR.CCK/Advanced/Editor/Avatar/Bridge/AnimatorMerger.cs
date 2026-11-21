@@ -2311,7 +2311,7 @@ namespace AvatarBridge
                 return clip;
             }
 
-            var clone = UnityEngine.Object.Instantiate(clip);
+            var clone = ClipCloner.Clone(clip);
             clone.name = clip.name + "_cvr";
             clone.hideFlags = HideFlags.None;
             foreach (var binding in renames)
@@ -6042,7 +6042,7 @@ namespace AvatarBridge
                 if (!clipMap.TryGetValue(clip, out var clone))
                 {
                     copyClock.Start();
-                    clone = UnityEngine.Object.Instantiate(clip);
+                    clone = ClipCloner.Clone(clip);
                     copyClock.Stop();
                     clone.name = clip.name;
                     // The whole point of the clone is that it CAN persist; a copied DontSave flag
@@ -8449,7 +8449,7 @@ namespace AvatarBridge
                         {
                             // Cloned, never shared; the same sampled clip
                             // can sit in unrelated trees.
-                            owned = UnityEngine.Object.Instantiate(clip);
+                            owned = ClipCloner.Clone(clip);
                             owned.name = clip.name;
                             owned.hideFlags = HideFlags.None;
                         }
@@ -8717,7 +8717,7 @@ namespace AvatarBridge
                     repaired[clip] = clip;
                     return clip;
                 }
-                var clone = UnityEngine.Object.Instantiate(clip);
+                var clone = ClipCloner.Clone(clip);
                 clone.name = clip.name;
                 clone.hideFlags = HideFlags.None;
                 foreach (var (oldB, newB, objRef) in moves)
@@ -9204,7 +9204,7 @@ namespace AvatarBridge
                 }
                 if (!copies.TryGetValue(clip, out var copy))
                 {
-                    copy = UnityEngine.Object.Instantiate(clip);
+                    copy = ClipCloner.Clone(clip);
                     copy.name = clip.name + " Emote";
                     pending.Add((copy, OutputAssetPaths.Claim(
                         $"{ctx.OutputDir}/RehomedAssets/{SanitizeFileName(copy.name)}.anim", stale)));

@@ -365,7 +365,7 @@ namespace AvatarBridge
                     rewired[clip] = clip;
                     return clip;
                 }
-                var clone = UnityEngine.Object.Instantiate(clip);
+                var clone = ClipCloner.Clone(clip);
                 clone.name = clip.name;
                 clone.hideFlags = HideFlags.None;
                 foreach (var pair in additions)
@@ -628,7 +628,7 @@ namespace AvatarBridge
                         }
                         if (!perLayer.TryGetValue(clip, out var owned))
                         {
-                            owned = UnityEngine.Object.Instantiate(clip);
+                            owned = ClipCloner.Clone(clip);
                             owned.name = clip.name;
                             owned.hideFlags = HideFlags.None;
                             perLayer[clip] = owned;

@@ -65,7 +65,7 @@ namespace AvatarBridge
                 // curves baked, and that needs a clone.
                 if (keepPose && NeedsBake(clip))
                 {
-                    var poseOnly = UnityEngine.Object.Instantiate(clip);
+                    var poseOnly = ClipCloner.Clone(clip);
                     poseOnly.name = clip.name;
                     BakeIntoPose(poseOnly);
                     MotionStripped[(clip, onlyIfTravels, keepPose)] = poseOnly;
@@ -74,7 +74,7 @@ namespace AvatarBridge
                 MotionStripped[(clip, onlyIfTravels, keepPose)] = clip;
                 return clip;
             }
-            var clone = UnityEngine.Object.Instantiate(clip);
+            var clone = ClipCloner.Clone(clip);
             clone.name = clip.name;
             if (keepPose)
             {

@@ -452,7 +452,7 @@ namespace AvatarBridge
                 return clip;
             }
 
-            var clone = Object.Instantiate(clip);
+            var clone = ClipCloner.Clone(clip);
             clone.name = clip.name;
             clone.hideFlags = HideFlags.None;
             foreach (var b in hits)

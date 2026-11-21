@@ -298,7 +298,7 @@ namespace AvatarBridge
                 }
                 if (copy == null)
                 {
-                    copy = UnityEngine.Object.Instantiate(clip);
+                    copy = ClipCloner.Clone(clip);
                     copy.name = clip.name;
                     AssetDatabase.CreateAsset(copy, dst);
                 }

@@ -289,7 +289,7 @@ namespace AvatarBridge
             var result = clip;
             if (renames.Length > 0)
             {
-                result = Object.Instantiate(clip);
+                result = ClipCloner.Clone(clip);
                 result.name = clip.name;
                 foreach (var binding in renames)
                 {

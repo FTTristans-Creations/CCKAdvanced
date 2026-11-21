@@ -376,7 +376,7 @@ namespace AvatarBridge
             }
             else if (foreign && motion is AnimationClip clip && touches(clip))
             {
-                mine = Object.Instantiate(clip);
+                mine = ClipCloner.Clone(clip);
             }
             if (mine != motion)
             {

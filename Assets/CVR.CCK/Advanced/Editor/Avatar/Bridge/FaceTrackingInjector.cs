@@ -604,7 +604,7 @@ namespace AvatarBridge
                 return clip;
             }
 
-            var clone = UnityEngine.Object.Instantiate(clip);
+            var clone = ClipCloner.Clone(clip);
             clone.name = clip.name;
             clone.hideFlags = HideFlags.None;
 
