@@ -952,8 +952,30 @@ namespace AvatarBridge
                 else if (existing.type != param.type &&
                          !GestureMap.GestureParameters.Contains(param.name))
                 {
-                    ctx.Report.Warning(Category, $"Parameter \"{param.name}\"",
-                        $"Type conflict between controllers ({existing.type} vs {param.type}); keeping {existing.type}.");
+                    // VRCFury bakes one toggle Bool in some controllers and Float
+                    // in others. Float is the only type a blend tree can read,
+                    // and float conditions reconcile downstream, so Bool vs
+                    // Float resolves to Float; other disagreements keep first.
+                    bool boolFloat = (existing.type == AnimatorControllerParameterType.Bool &&
+                                      param.type == AnimatorControllerParameterType.Float) ||
+                                     (existing.type == AnimatorControllerParameterType.Float &&
+                                      param.type == AnimatorControllerParameterType.Bool);
+                    if (boolFloat)
+                    {
+                        if (existing.type != AnimatorControllerParameterType.Float)
+                        {
+                            existing.type = AnimatorControllerParameterType.Float;
+                            existing.defaultFloat = param.defaultFloat;
+                        }
+                        ctx.Report.Converted(Category, $"Parameter \"{param.name}\"",
+                            "Declared Bool by one controller and Float by another; kept Float, " +
+                            "the only type blend trees and analog conditions can read.");
+                    }
+                    else
+                    {
+                        ctx.Report.Warning(Category, $"Parameter \"{param.name}\"",
+                            $"Type conflict between controllers ({existing.type} vs {param.type}); keeping {existing.type}.");
+                    }
                 }
             }
             master.parameters = masterParams.ToArray();
