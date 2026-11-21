@@ -135,7 +135,9 @@ jobs:
           # scripts under Assets/ so they get Assets/-rooted meta paths, and
           # remove them again after both packages are built.
           cp -r installer/com.fttristan.cck-advanced.installer/Assets/CCKInstaller Assets/
+          cp installer/com.fttristan.cck-advanced.installer/Assets/CCKInstaller.meta Assets/
           find "Assets/CCKInstaller" -name "*.meta" > installerMetaList
+          echo "Assets/CCKInstaller.meta" >> installerMetaList
 
       - name: Create UnityPackage
         uses: pCYSl5EDgo/create-unitypackage@v1.2.3
