@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (X.Y.Z, no v prefix)"
-        required: true
+        description: "Version override (X.Y.Z). Leave empty to use package.json."
+        required: false
         type: string
 
 permissions:
@@ -17,18 +17,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stamp version
-        env:
-          VERSION: ${{ inputs.version }}
+      # Version comes from package.json like the official template; the input
+      # only overrides it for one-off builds.
+      - name: Resolve version
+        id: version
         run: |
           set -euo pipefail
+          VERSION="${{ inputs.version }}"
           VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            VERSION="$(python3 -c "import json; print(json.load(open('package.json'))['version'])")"
+          fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "'$VERSION' is not a plain semver (expected X.Y.Z)."
+            echo "Version '$VERSION' is not plain semver (expected X.Y.Z)."
             exit 1
           fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # package.json: set the version the VCC publisher reads.
+      # Stamp the resolved version into both places the updater reads it.
+      - name: Stamp version
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
           python3 - "$VERSION" <<'PY'
           import json, sys
           version = sys.argv[1]
@@ -40,29 +51,43 @@ jobs:
               f.write('\n')
           PY
 
-          # The updater's own version constant, patched inside the shipped sources.
           sed -i "s/public const string Version = \"[^\"]*\";/public const string Version = \"$VERSION\";/" \
             "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
           grep -q "Version = \"$VERSION\"" \
             "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
-
           echo "Stamped version $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build VPM package zip
+      # VPM package: package.json at zip root + the Assets tree with metas.
+      - name: Create Package Zip
         run: |
           set -euo pipefail
-          # Fixed asset name: package.json's url uses /releases/latest/download,
-          # which only resolves while the name stays constant across releases.
           ZIP_NAME="com.fttristan.cck-advanced.zip"
           rm -f "$ZIP_NAME"
           zip -r "$ZIP_NAME" package.json "Assets/CVR.CCK" \
             -x "*.DS_Store" "*/.DS_Store" "*.tmp"
           echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
 
+      # Legacy .unitypackage built from the .meta list, same as the template.
+      - name: Track Package Meta Files
+        run: find "Assets/CVR.CCK" -name "*.meta" > metaList
+
+      - name: Create UnityPackage
+        uses: pCYSl5EDgo/create-unitypackage@v1.2.3
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        with:
+          package-path: com.fttristan.cck-advanced-${{ steps.version.outputs.value }}.unitypackage
+          include-files: metaList
+
+      # Tag is the bare version, matching the official template convention.
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ inputs.version }}
-          name: CCK Advanced v${{ inputs.version }}
-          files: com.fttristan.cck-advanced.zip
+          tag_name: ${{ steps.version.outputs.value }}
+          name: CCK Advanced ${{ steps.version.outputs.value }}
+          files: |
+            com.fttristan.cck-advanced.zip
+            com.fttristan.cck-advanced-${{ steps.version.outputs.value }}.unitypackage
+            package.json
           generate_release_notes: true
+          overwrite_files: true
