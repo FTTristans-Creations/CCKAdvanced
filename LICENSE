@@ -2,8 +2,9 @@ CCK Advanced — Original Work
 Copyright (c) 2026 FTTristan
 
 This license applies to the original "CCK Advanced" code and content authored by
-FTTristan (everything under Assets/CVR.CCK/Advanced that is not a vendored or
-bundled third-party component). Bundled third-party components — including
+FTTristan — everything under Assets/CVR.CCK/Advanced and the
+com.fttristan.cck-advanced.installer package that is not a vendored or
+bundled third-party component. Bundled third-party components — including
 AvatarBridge (MrTactical, MIT), Harmony (Andreas Pardeike, MIT), the VRLabs
 Dynamic Bones Stub (MIT), and the ChilloutVR CCK itself — remain the property of
 their respective owners and are licensed under their own terms. See

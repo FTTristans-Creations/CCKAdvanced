@@ -3,8 +3,13 @@
 An enhanced distribution of the **ChilloutVR CCK** (Creator Companion Kit) with a full
 VRChat-to-ChilloutVR avatar conversion suite, bundled under `Assets/CVR.CCK/Advanced`.
 
-> **Important:** This package *contains the entire CCK*. Do **not** also install the
-> official ChilloutVR CCK — remove any existing `Assets/CVR.CCK` folder first.
+> **Install via the CCK Advanced Installer — not the raw package.** The installer
+> (`com.fttristan.cck-advanced.installer`) downloads, installs, and **force
+> auto-updates** CCK Advanced into `Assets/` on every editor launch. Installing the
+> CCK files directly means you will **not** receive updates.
+>
+> **Important:** This distribution *contains the entire CCK*. Do **not** also install
+> the official ChilloutVR CCK — remove any existing `Assets/CVR.CCK` folder first.
 
 ## Features
 
@@ -32,7 +37,7 @@ VRChat-to-ChilloutVR avatar conversion suite, bundled under `Assets/CVR.CCK/Adva
 
 ## Installation
 
-### VCC / ALCOM (recommended)
+### VCC / ALCOM (recommended — the only supported method)
 
 Add this listing to your package manager:
 
@@ -40,13 +45,31 @@ Add this listing to your package manager:
 https://vcc.vrcband.com/index.json
 ```
 
-Then install **CCK Advanced**. Requires Unity **2021.3.19+** / **2022.3 LTS**.
+Then install **CCK Advanced Installer** (`com.fttristan.cck-advanced.installer`).
 
-### Manual
+On the next editor launch the installer automatically downloads the latest CCK
+Advanced release and installs it into `Assets/CVR.CCK`. It re-checks for updates
+once per day and force-updates without asking — you never have to install CCK
+Advanced itself. Requires Unity **2021.3.19+** / **2022.3 LTS**.
 
-Download `com.fttristan.cck-advanced.zip` from [Releases](https://github.com/FTTristans-Creations/CCKAdvanced/releases/latest)
-and extract so that `Assets/CVR.CCK` lands in your project root. A `.unitypackage`
-artifact is also attached to each release for legacy installs.
+To trigger a check manually: `ChilloutVR CCK/Advanced/Common/Check for CCK Advanced Updates`.
+
+### Why the installer?
+
+CCK Advanced ships as plain `Assets/` content so its scripts live in
+`Assembly-CSharp`/`Assembly-CSharp-Editor` — the same assemblies the official CCK
+uses, which third-party tools (e.g. ThryEditor integrations) rely on. Because it is
+not a versioned UPM package, the installer handles downloading, manifest-tracked
+updates (files removed upstream are deleted locally, your own files are untouched),
+and merging `Assets/csc.rsp` so the required compile defines always exist.
+
+### Unsupported: manual installs
+
+The release page also attaches `com.fttristan.cck-advanced-installer-*.unitypackage`
+for projects without a package manager — import it and the installer does the rest.
+Raw CCK payloads and `cck-advanced-source-*.zip` snapshots are provided for
+inspection/backup only; installing them directly is **not supported** and will not
+auto-update.
 
 ## Credits
 
