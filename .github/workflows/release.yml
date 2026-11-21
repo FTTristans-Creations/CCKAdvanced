@@ -53,9 +53,9 @@ jobs:
           PY
 
           sed -i "s/public const string Version = \"[^\"]*\";/public const string Version = \"$VERSION\";/" \
-            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+            "Assets/CVR.CCK/Advanced/Runtime/Common/CCKAdvancedInfo.cs"
           grep -q "Version = \"$VERSION\"" \
-            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+            "Assets/CVR.CCK/Advanced/Runtime/Common/CCKAdvancedInfo.cs"
 
           # Version marker the installer reads to decide install vs update.
           echo "$VERSION" > Assets/CVR.CCK/CCKAdvanced.version
