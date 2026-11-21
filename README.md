@@ -13,6 +13,8 @@ VRChat-to-ChilloutVR avatar conversion suite, bundled under `Assets/CVR.CCK/Adva
 
 ## Features
 
+Everything lives under the **`ChilloutVR CCK/Advanced/`** menu.
+
 ### Avatars — `ChilloutVR CCK/Advanced/Avatars`
 
 - **VRChat to ChilloutVR Converter** (bundled [AvatarBridge](https://github.com/MrTactical/AvatarBridge) by MrTactical)
@@ -26,14 +28,27 @@ VRChat-to-ChilloutVR avatar conversion suite, bundled under `Assets/CVR.CCK/Adva
 ### Common — `ChilloutVR CCK/Advanced/Common`
 
 - **ChilloutVR Toolkit** — utilities for any CVR avatar
-- **YAPS** — squash & stretch, plugs, sockets, rings
+- **YAPS** — squash & stretch, plugs, sockets, rings (setup windows, prefab
+  creators, shader patching tools)
 - **Ask me to report problems** — pre-filled diagnostics for bug reports
+
+### Advanced root
+
 - **Check for Updates** — GitHub release checker (runs once per day)
 - **Credits**
 
 ### Worlds — `ChilloutVR CCK/Advanced/Worlds`
 
 - Reserved for upcoming VRC World → CVR conversion tools
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `Assets/CVR.CCK/` | The full CCK + Advanced content. `Advanced/Editor/` holds all editor tooling; `Advanced/Runtime/` holds the few scripts that must exist in player builds (CCKAdvancedInfo, YAPS components). |
+| `Assets/csc.rsp` | Response file shipping the `CVR_CCK_*` compile defines so fresh projects compile on the first try. |
+| `installer/com.fttristan.cck-advanced.installer/` | Source of the installer package distributed via VPM/VCC. |
+| `.github/workflows/release.yml` | Builds the release payload zip, installer zip + unitypackage, and CCK unitypackage. |
 
 ## Installation
 
