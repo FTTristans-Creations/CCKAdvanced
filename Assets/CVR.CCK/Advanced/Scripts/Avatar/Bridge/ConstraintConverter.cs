@@ -1,0 +1,1350 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.Animations;
+
+namespace AvatarBridge
+{
+    // VRC constraints to Unity constraints, almost 1:1. Reflection so any SDK version compiles;
+    // missing members become report entries.
+    public static class ConstraintConverter
+    {
+        const string Category = "Constraints";
+
+        static HashSet<Transform> reparented = new HashSet<Transform>();
+
+        static Dictionary<string, string> relocated = new Dictionary<string, string>();
+
+        // VRC source index to Unity source index, keyed by SourceKey. They differ: a source with
+        // no transform is skipped, and a merged constraint's sources land after the first one's.
+        static Dictionary<string, int> sourceIndex = new Dictionary<string, int>();
+
+        internal static readonly string[] VrcConstraintTypeNames =
+        {
+            "VRCParentConstraint", "VRCPositionConstraint", "VRCRotationConstraint",
+            "VRCScaleConstraint", "VRCAimConstraint", "VRCLookAtConstraint"
+        };
+
+        public static void Run(BridgeContext ctx)
+        {
+            if (!ctx.Settings.convertConstraints)
+            {
+                return;
+            }
+
+            int converted = 0;
+            var localSpaceRelays = new List<string>();
+            var mirrored = new List<string>();
+            var disabledLocalSpace = new List<string>();
+            animatedRotationPaths = null;   // per conversion, like `relocated` below
+            missingAxisMembers.Clear();
+            // MUST run before anything converts: a Unity constraint bakes its rest offsets
+            // against the parent the transform has when it is created.
+            relocated = new Dictionary<string, string>();   // per conversion, never carried over
+            sourceIndex = new Dictionary<string, int>();
+            sourceStandIns.Clear();
+            reparented = AlignLocalSpaceRelays(ctx);
+            // One list shared with AvatarAdvisor, so its count matches what this pass converts.
+            var realigned = reparented;
+            foreach (var component in ctx.Target.GetComponentsInChildren<Component>(true))
+            {
+                if (component == null)
+                {
+                    continue;
+                }
+                string typeName = component.GetType().Name;
+                if (Array.IndexOf(VrcConstraintTypeNames, typeName) < 0)
+                {
+                    continue;
+                }
+                try
+                {
+                    switch (typeName)
+                    {
+                        case "VRCParentConstraint": ConvertParent(ctx, component); break;
+                        case "VRCPositionConstraint": ConvertPosition(ctx, component); break;
+                        case "VRCRotationConstraint": ConvertRotation(ctx, component); break;
+                        case "VRCScaleConstraint": ConvertScale(ctx, component); break;
+                        case "VRCAimConstraint": ConvertAim(ctx, component); break;
+                        case "VRCLookAtConstraint": ConvertLookAt(ctx, component); break;
+                        default: continue;   // unreachable: the guard above already filtered
+                    }
+                }
+                catch (Exception e)
+                {
+                    // One malformed constraint must not abort the whole
+                    // conversion. The throwing site goes into the report
+                    // so the report alone diagnoses it.
+                    ctx.Report.Warning(Category, component.name,
+                        $"{typeName} conversion failed and was skipped: {e.GetType().Name}: {e.Message} [{TopFrame(e)}]");
+                    Debug.LogWarning($"[AvatarBridge] {typeName} on '{component.name}' " +
+                        $"(path '{ctx.PathInTarget(component.transform)}') could not be converted:\n{e}");
+                    continue;
+                }
+                converted++;
+                if (!realigned.Contains(component.transform))
+                {
+                    NoteLocalSpace(ctx, component, localSpaceRelays);
+                    DisableUnfollowableLocalSpace(ctx, component, typeName, disabledLocalSpace);
+                }
+                NoteMirrored(ctx, component, mirrored);
+                UnityEngine.Object.DestroyImmediate(component);
+            }
+
+            if (converted > 0)
+            {
+                ctx.Report.Converted(Category, $"{BridgeElements.Count(converted, "VRC constraint", "VRC constraints")} -> Unity constraints");
+            }
+            // Curve rewriting happens later, on owned copies.
+            // See RepointCurvesOnOurCopies.
+            ReportLocalSpace(ctx, localSpaceRelays);
+            ReportMirrored(ctx, mirrored);
+            ReportDisabledLocalSpace(ctx, disabledLocalSpace);
+        }
+
+        static void DisableUnfollowableLocalSpace(BridgeContext ctx, Component vrc, string typeName,
+            List<string> disabled)
+        {
+            if (typeName != "VRCRotationConstraint" || !Get(vrc, "SolveInLocalSpace", false))
+            {
+                return;
+            }
+            string path = ctx.PathInTarget(vrc.transform);
+            if (!AnimatedRotationPaths(ctx).Contains(path))
+            {
+                return;
+            }
+            var unity = vrc.GetComponent<RotationConstraint>();
+            if (unity == null)
+            {
+                return;
+            }
+            unity.constraintActive = false;
+            unity.enabled = false;
+            disabled.Add(path);
+        }
+
+        static HashSet<string> animatedRotationPaths;
+
+        static HashSet<string> AnimatedRotationPaths(BridgeContext ctx)
+        {
+            if (animatedRotationPaths != null)
+            {
+                return animatedRotationPaths;
+            }
+            animatedRotationPaths = new HashSet<string>();
+            foreach (var clip in AllClips(ctx))
+            {
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type == typeof(Transform)
+                        && (binding.propertyName.StartsWith("m_LocalRotation", StringComparison.Ordinal)
+                            || binding.propertyName.StartsWith("localEulerAngles", StringComparison.Ordinal)))
+                    {
+                        animatedRotationPaths.Add(binding.path);
+                    }
+                }
+            }
+            return animatedRotationPaths;
+        }
+
+        // Also the merged controller directly: one that would crash Unity is never assigned to
+        // the Animator (see AnimatorMerger), and those avatars need the most repair.
+        static HashSet<AnimationClip> AllClips(BridgeContext ctx)
+        {
+            var controllers = new List<RuntimeAnimatorController>();
+            foreach (var animator in ctx.Target.GetComponentsInChildren<Animator>(true))
+            {
+                if (animator.runtimeAnimatorController != null)
+                {
+                    controllers.Add(animator.runtimeAnimatorController);
+                }
+            }
+            if (ctx.MergedController != null)
+            {
+                controllers.Add(ctx.MergedController);
+            }
+            var clips = new HashSet<AnimationClip>();
+            foreach (var controller in controllers)
+            {
+                foreach (var clip in controller.animationClips)
+                {
+                    if (clip != null)
+                    {
+                        clips.Add(clip);
+                    }
+                }
+            }
+            return clips;
+        }
+
+        static void ReportDisabledLocalSpace(BridgeContext ctx, List<string> disabled)
+        {
+            if (disabled.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(disabled.Count, "unfollowable local-space constraint", "unfollowable local-space constraints")} disabled: their animation takes over",
+                $"{string.Join(", ", disabled)}: local-space constraints Unity cannot match, also posed by an " +
+                "animation. The animation holds the bone; the live follow is lost.");
+        }
+
+        public static void RepointCurvesOnOurCopies(BridgeContext ctx) => RepointConstraintCurves(ctx);
+
+        static bool SafeToRewrite(AnimationClip clip, BridgeContext ctx, out string sourcePath)
+        {
+            sourcePath = AssetDatabase.GetAssetPath(clip);
+            if (string.IsNullOrEmpty(sourcePath))
+            {
+                return true;
+            }
+            string path = sourcePath.Replace('\\', '/');
+            string output = (ctx.OutputDir ?? string.Empty).Replace('\\', '/').TrimEnd('/');
+            if (output.Length > 0 && path.StartsWith(output + "/", System.StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            // NDMF writes Modular Avatar's and VRCFury's bake output here; "GeneratedAssets" is
+            // the older spelling. Both are rebuilt from scratch on every bake.
+            return path.Contains("__Generated")
+                   || path.Contains("GeneratedAssets")
+                   || path.Contains("/VRCFury/Generated");
+        }
+
+        static void RepointConstraintCurves(BridgeContext ctx)
+        {
+            // Nothing was built to repoint at. The VRC curves die with
+            // their components; warning about them here would blame the
+            // bake for a choice the user made.
+            if (!ctx.Settings.convertConstraints)
+            {
+                return;
+            }
+            var clips = AllClips(ctx);
+
+            int repointed = 0, followed = 0;
+            var dropped = new SortedSet<string>(StableSampleOrder.Instance);
+            var droppedOffsets = new SortedSet<string>(StableSampleOrder.Instance); // not Freeze To World, so not worded as it
+            var droppedRest = new SortedSet<string>(StableSampleOrder.Instance);    // rest pose or axis switches, likewise
+            var unmappedSources = new SortedSet<string>(StableSampleOrder.Instance); // a VRC source with no Unity source
+            var lost = new SortedSet<string>(StableSampleOrder.Instance);        // the object is gone: something here removed it
+            var neverBuilt = new SortedSet<string>(StableSampleOrder.Instance);  // the object is there, but never had a constraint
+            var movedByBake = new SortedSet<string>(StableSampleOrder.Instance); // the object exists under a different parent
+
+            var protectedSources = new SortedSet<string>(StableSampleOrder.Instance);
+
+            foreach (var clip in clips)
+            {
+                bool mayRewrite = SafeToRewrite(clip, ctx, out string sourcePath);
+                // GetCurveBindings hands back a copy, so rewriting inside the loop is safe.
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type == null
+                        || !binding.type.Name.StartsWith("VRC", StringComparison.Ordinal)
+                        || !binding.type.Name.EndsWith("Constraint", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    // Nested Animators' clips can still be the author's files, even after self-containment.
+                    if (!mayRewrite)
+                    {
+                        protectedSources.Add(sourcePath);
+                        continue;
+                    }
+                    var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                    string property = MapConstraintProperty(binding.propertyName, out int vrcSource);
+
+                    string path = binding.path;
+                    var replacement = FollowConstraint(ctx, ref path, binding.type.Name);
+                    if (path != binding.path)
+                    {
+                        followed++;
+                    }
+                    string where = $"\"{clip.name}\" -> {binding.path} ({binding.propertyName})";
+
+                    // Either way the old binding goes: it names a component that no longer exists.
+                    AnimationUtility.SetEditorCurve(clip, binding, null);
+                    if (property == null)
+                    {
+                        // "Offset." and not "Offset": RebakeOffsetsWhenUnfrozen belongs to Freeze To World.
+                        string name = binding.propertyName;
+                        (name.Contains("Offset.") ? droppedOffsets
+                            : name.Contains("AtRest.") || name.StartsWith("Affects", StringComparison.Ordinal)
+                                ? droppedRest
+                                : dropped).Add(where);
+                        continue;
+                    }
+                    if (replacement == null)
+                    {
+                        // Deleted with a stripped system: dead by design, and
+                        // already reported where the system was removed.
+                        if (ctx.RemovedOnPurpose(binding.path))
+                        {
+                            continue;
+                        }
+                        // Missing: this conversion removed it. Present without a constraint: usually a partial bake.
+                        if (ObjectExists(ctx, binding.path))
+                        {
+                            neverBuilt.Add(where);
+                        }
+                        else if (ElsewhereByName(ctx, binding.path, out string actualPath))
+                        {
+                            // VRCFury moves generated objects at upload; a test-copy bake may not.
+                            movedByBake.Add($"{where}: found at `{actualPath}`");
+                        }
+                        else
+                        {
+                            lost.Add(where);
+                        }
+                        continue;
+                    }
+                    if (vrcSource >= 0)
+                    {
+                        // Keyed by the curve's own path, not the followed one: a relocated
+                        // constraint's sources were recorded under the object it sat on.
+                        if (!sourceIndex.TryGetValue(SourceKey(binding.path, binding.type.Name, vrcSource),
+                                out int unitySource))
+                        {
+                            unmappedSources.Add(where);
+                            continue;
+                        }
+                        property = string.Format(property, unitySource);
+                    }
+                    AnimationUtility.SetEditorCurve(clip, new EditorCurveBinding
+                    {
+                        path = path,
+                        type = replacement,
+                        propertyName = property
+                    }, curve);
+                    repointed++;
+                }
+            }
+
+            if (protectedSources.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(protectedSources.Count, "clip", "clips")} left untouched to protect your original files",
+                    $"{string.Join(", ", System.Linq.Enumerable.Take(protectedSources, 6))}" +
+                    $"{(protectedSources.Count > 6 ? ", …" : "")}: the avatar's own files, not copies. What they " +
+                    "switch (limb lock, sit, flight) will not work. Convert from a baked copy to fix it.");
+            }
+            if (repointed > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(repointed, "animation curve", "animation curves")} repointed at the Unity constraints",
+                    "So limb-lock, sit and flight toggles still work." +
+                    (followed > 0 ? $" {followed} followed their constraint to a new object." : ""));
+            }
+            if (dropped.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(dropped.Count, "curve", "curves")} drove a constraint property Unity doesn't have",
+                    "Dropped rather than left pointing at nothing: almost always 'Freeze To " +
+                    "World', which has no Unity or ChilloutVR equivalent. A toggle relying on it " +
+                    "will change the constraint but not pin anything in place: " +
+                    string.Join("; ", dropped) + ".");
+            }
+            if (droppedOffsets.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(droppedOffsets.Count, "curve", "curves")} animated a constraint offset, which is not carried over",
+                    "Dropped rather than left pointing at nothing. The constraint keeps the offset it was " +
+                    "built with, so whatever the animation shifted stays at rest: " +
+                    string.Join("; ", droppedOffsets) + ".");
+            }
+            if (droppedRest.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(droppedRest.Count, "curve", "curves")} animated a constraint's rest pose or axes, which is not carried over",
+                    "Dropped rather than left pointing at nothing. The constraint keeps the rest pose and axes " +
+                    "it was built with: " + string.Join("; ", droppedRest) + ".");
+            }
+            if (unmappedSources.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(unmappedSources.Count, "curve", "curves")} animated a constraint source that was not carried over",
+                    "Usually an empty source slot, which converts to nothing. Dropped rather than left " +
+                    "driving a different source: " + string.Join("; ", unmappedSources) + ".");
+            }
+            if (lost.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(lost.Count, "curve", "curves")} drove a constraint on an object that is now GONE",
+                    "Objects removed with a stripped system are not counted here, so this is unexpected. " +
+                    "Please report it: " +
+                    string.Join("; ", lost) + ".");
+            }
+            if (movedByBake.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(movedByBake.Count, "curve names", "curves name")} a path the avatar's own build step didn't produce",
+                    "The object is under a different parent: a VRCFury or Modular Avatar bake stopped short. " +
+                    "Get the source avatar building cleanly and convert again. Found: " +
+                    string.Join("; ", movedByBake) + ".");
+            }
+            if (neverBuilt.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(neverBuilt.Count, "curve", "curves")} drove a constraint that was never built",
+                    "Usually a VRCFury or Modular Avatar bake that errored partway. Build a test copy of the " +
+                    "source avatar and check it completes: " + string.Join("; ", neverBuilt) + ".");
+            }
+        }
+
+        static bool ElsewhereByName(BridgeContext ctx, string path, out string actualPath)
+        {
+            actualPath = null;
+            if (ctx.Target == null || string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+            int slash = path.LastIndexOf('/');
+            string leaf = slash >= 0 ? path.Substring(slash + 1) : path;
+            Transform found = null;
+            foreach (var t in ctx.Target.GetComponentsInChildren<Transform>(true))
+            {
+                if (t.name != leaf)
+                {
+                    continue;
+                }
+                if (found != null)
+                {
+                    return false;   // ambiguous, a shared leaf name proves nothing
+                }
+                found = t;
+            }
+            if (found == null)
+            {
+                return false;
+            }
+            actualPath = ctx.PathInTarget(found);
+            return true;
+        }
+
+        static bool ObjectExists(BridgeContext ctx, string path)
+        {
+            if (ctx.Target == null)
+            {
+                return false;
+            }
+            return BridgeContext.FindByAnimationPath(ctx.Target.transform, path) != null;
+        }
+
+        // A per-source property comes back with {0} where the Unity index goes and `source` set to
+        // the VRC index; the caller fills it in from sourceIndex.
+        static string MapConstraintProperty(string vrcProperty, out int source)
+        {
+            source = -1;
+            switch (vrcProperty)
+            {
+                case "IsActive": return "m_Active";
+                case "GlobalWeight": return "m_Weight";
+                case "Locked": return "m_IsLocked";
+                case "Enabled":
+                case "m_Enabled": return "m_Enabled";
+            }
+            // "Sources.source0.Weight": VRC's source list is sixteen fixed fields, so they are animatable.
+            const string fieldPrefix = "Sources.source";
+            int dot = vrcProperty.StartsWith(fieldPrefix, StringComparison.Ordinal)
+                ? vrcProperty.IndexOf('.', fieldPrefix.Length)
+                : -1;
+            if (dot > 0 && int.TryParse(vrcProperty.Substring(fieldPrefix.Length, dot - fieldPrefix.Length),
+                    out int n))
+            {
+                // Parent offsets copy 1:1, same axes and same units (measured).
+                // ConvertParent copies the static values raw too, so an animated one agrees with them.
+                string field = vrcProperty.Substring(dot + 1);
+                const string position = "ParentPositionOffset.", rotation = "ParentRotationOffset.";
+                string unity = field == "Weight" ? "m_Sources.Array.data[{0}].weight"
+                    : field.StartsWith(position, StringComparison.Ordinal)
+                        ? "m_TranslationOffsets.Array.data[{0}]." + field.Substring(position.Length)
+                    : field.StartsWith(rotation, StringComparison.Ordinal)
+                        ? "m_RotationOffsets.Array.data[{0}]." + field.Substring(rotation.Length)
+                    : null;
+                if (unity != null)
+                {
+                    source = n;
+                }
+                return unity;
+            }
+            // The array spelling, kept in case any serialization path ever produces it.
+            const string prefix = "Sources.Array.data[";
+            const string arraySuffix = "].Weight";
+            if (vrcProperty.StartsWith(prefix, StringComparison.Ordinal) &&
+                vrcProperty.EndsWith(arraySuffix, StringComparison.Ordinal) &&
+                int.TryParse(vrcProperty.Substring(prefix.Length,
+                    vrcProperty.Length - prefix.Length - arraySuffix.Length), out n))
+            {
+                source = n;
+                return "m_Sources.Array.data[{0}].weight";
+            }
+            return null;
+        }
+
+        // Where a curve on a VRC constraint lands. A Target Transform constraint is rebuilt on the
+        // object it drives, so the clip's path names somewhere the constraint no longer is.
+        // ConstraintScaleRelay asks this before the curves are repointed and must get the same answer.
+        internal static Type FollowConstraint(BridgeContext ctx, ref string path, string vrcTypeName)
+        {
+            var replacement = ConstraintTypeOnPath(ctx, path, vrcTypeName);
+            if (replacement == null && relocated.TryGetValue(path, out string movedTo))
+            {
+                var afterMove = ConstraintTypeOnPath(ctx, movedTo, vrcTypeName);
+                if (afterMove != null)
+                {
+                    path = movedTo;
+                    return afterMove;
+                }
+            }
+            return replacement;
+        }
+
+        static Type ConstraintTypeOnPath(BridgeContext ctx, string path, string vrcTypeName)
+        {
+            var transform = BridgeContext.FindByAnimationPath(ctx.Target.transform, path);
+            if (transform == null)
+            {
+                return null;
+            }
+            string sameKind = vrcTypeName.Substring("VRC".Length);
+            Type any = null;
+            foreach (var component in transform.GetComponents<Component>())
+            {
+                if (component == null || !(component is IConstraint))
+                {
+                    continue;
+                }
+                var type = component.GetType();
+                if (type.Name == sameKind)
+                {
+                    return type;
+                }
+                any = any ?? type;
+            }
+            return any;
+        }
+
+        static void NoteMirrored(BridgeContext ctx, Component vrc, List<string> mirrored)
+        {
+            var target = Get<Transform>(vrc, "TargetTransform", null);
+            var constrained = target != null ? target : vrc.transform;
+            var parent = constrained.parent;
+            if (parent == null)
+            {
+                return;
+            }
+            var s = parent.lossyScale;
+            bool mixedSign = Mathf.Min(s.x, Mathf.Min(s.y, s.z)) < 0f
+                             && Mathf.Max(s.x, Mathf.Max(s.y, s.z)) >= 0f;
+            if (mixedSign)
+            {
+                mirrored.Add($"`{ctx.PathInTarget(constrained)}` (parent \"{parent.name}\" scale " +
+                             $"{s.x:0.##}, {s.y:0.##}, {s.z:0.##})");
+            }
+        }
+
+        static void ReportMirrored(BridgeContext ctx, List<string> mirrored)
+        {
+            if (mirrored.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Warning(Category,
+                $"{BridgeElements.Count(mirrored.Count, "constraint sits", "constraints sit")} under a mirrored parent and will be reflected",
+                "Unity's constraints do not correct for a negatively scaled parent. Un-mirror those bones " +
+                "and re-rig; no setting changes it.\n\n" +
+                string.Join("\n", mirrored));
+        }
+
+        static HashSet<Transform> AlignLocalSpaceRelays(BridgeContext ctx)
+        {
+            var moved = new HashSet<Transform>();
+            var skinned = SkinningBones(ctx.Target);
+
+            var animatedPaths = new HashSet<string>();
+            foreach (var clip in AllClips(ctx))
+            {
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    animatedPaths.Add(binding.path);
+                }
+                foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                {
+                    animatedPaths.Add(binding.path);
+                }
+            }
+
+            foreach (var component in ctx.Target.GetComponentsInChildren<Component>(true))
+            {
+                if (component == null || component.GetType().Name != "VRCRotationConstraint"
+                    || !Get(component, "SolveInLocalSpace", false))
+                {
+                    continue;
+                }
+                var targetField = Get<Transform>(component, "TargetTransform", null);
+                var constrained = targetField != null ? targetField : component.transform;
+                var source = FirstWeightedSource(component);
+                if (source == null || source.parent == null || constrained.parent == null
+                    || source.parent == constrained.parent
+                    || !constrained.IsChildOf(ctx.Target.transform)
+                    || !source.IsChildOf(ctx.Target.transform))
+                {
+                    continue;
+                }
+
+                // A PhysBone-moved bone with children cannot move: they stop following the chain
+                // (measured 11 cm off at rest). If the source never rotates, a fixed copy under the
+                // bone's parent gives the same world answer.
+                if (constrained.childCount > 0 && Simulated(ctx, constrained.parent))
+                {
+                    // Not a new object: MagicaCloth2 makes every transform under a root a particle,
+                    // so it would swing. One full-weight source only, as ConvertRotation.
+                    var only = ReadSources(component);
+                    bool measured = Get(component, "IsActive", true) && component.gameObject.activeInHierarchy
+                        && Mathf.Approximately(Get(component, "GlobalWeight", 1f), 1f)
+                        && only.Count == 1 && only[0].Weight >= 0.999f;
+                    if (measured && StaticLocally(ctx, source, animatedPaths))
+                    {
+                        sourceStandIns[(component, source)] = constrained.parent;
+                        ctx.Report.Converted(Category, ctx.PathInTarget(constrained),
+                            $"Local-space rotation relay from \"{source.name}\": that source never changes its own " +
+                            $"rotation, so this bone's own parent (\"{constrained.parent.name}\") drives it instead, " +
+                            "and a world-space constraint reproduces it exactly while the bone stays where it is, " +
+                            "with the bones it carries.");
+                    }
+                    else
+                    {
+                        string cause = measured
+                            ? "the source changes its own rotation, so its parent cannot stand in for it"
+                            : "its offset could not be measured from the pose (the constraint is inactive, or has " +
+                              "more than one source or less than full weight), so its parent cannot stand in for the source";
+                        ctx.Report.Approximated(Category, ctx.PathInTarget(constrained),
+                            $"Solved in local space against \"{source.name}\", which Unity cannot do. Moving the " +
+                            $"bone would take the bones it carries out of the physics chain it hangs from, and {cause}. " +
+                            "Converted as a world-space constraint; it will not follow correctly.");
+                    }
+                    continue;
+                }
+
+                string why = BlocksMove(ctx, constrained, skinned, animatedPaths)
+                             ?? BlocksMirroredMove(constrained, source.parent);
+                if (why != null)
+                {
+                    ctx.Report.Approximated(Category, ctx.PathInTarget(constrained),
+                        $"Solved in local space against \"{source.name}\", which Unity cannot do, and " +
+                        $"the bone could not be moved under that source's parent to make it " +
+                        $"equivalent: {why}. The relay is converted as a world-space constraint and " +
+                        "will not follow correctly.");
+                    continue;
+                }
+
+                string before = ctx.PathInTarget(constrained);
+                constrained.SetParent(source.parent, worldPositionStays: true);
+                moved.Add(constrained);
+                ctx.Report.Converted(Category, ctx.PathInTarget(constrained),
+                    $"Local-space rotation relay from \"{source.name}\": moved under that bone's " +
+                    $"parent (\"{source.parent.name}\") so a world-space constraint reproduces it " +
+                    "exactly. Was " + before + ". Rotation is all this bone supplies: nothing skins " +
+                    "to it and no animation addresses it, so where it sits does not matter.");
+            }
+
+            if (moved.Count > 0)
+            {
+                RepointMaskPaths(ctx);
+            }
+            return moved;
+        }
+
+        // A local-space relay's source, swapped per constraint for the constrained bone's
+        // parent. Per conversion.
+        static readonly Dictionary<(object, Transform), Transform> sourceStandIns =
+            new Dictionary<(object, Transform), Transform>();
+
+        // Whether physics simulates this bone: it sits under a chain's root. This pass runs after
+        // physics conversion, so the chain may already be a MagicaCloth2 or DynamicBone component.
+        static bool Simulated(BridgeContext ctx, Transform t)
+        {
+            if (t == null) return false;
+            foreach (var c in ctx.Target.GetComponentsInChildren<Component>(true))
+            {
+                if (c == null) continue;
+                var roots = new List<Transform>();
+                switch (c.GetType().Name)
+                {
+                    case "VRCPhysBone":
+                        var root = Get<Transform>(c, "rootTransform", null);
+                        roots.Add(root != null ? root : c.transform);   // Unity's null, which ?? does not see
+                        break;
+                    case "DynamicBone":
+                        roots.Add(Get<Transform>(c, "m_Root", null));
+                        break;
+                    case "MagicaCloth":
+                        if (Get<object>(Get<object>(c, "SerializeData", null), "rootBones", null) is IEnumerable bones)
+                        {
+                            foreach (var b in bones) roots.Add(b as Transform);
+                        }
+                        break;
+                    default:
+                        continue;
+                }
+                foreach (var r in roots)
+                {
+                    if (r != null && (t == r || t.IsChildOf(r))) return true;
+                }
+            }
+            return false;
+        }
+
+        // Whether nothing ever changes this bone's rotation relative to its parent: no animation,
+        // no constraint writing it, no PhysBone simulating it, and no humanoid mapping, since
+        // muscle curves bind at the root and tracking writes no curve at all.
+        static bool StaticLocally(BridgeContext ctx, Transform t, HashSet<string> animatedPaths)
+        {
+            if (animatedPaths.Contains(ctx.PathInTarget(t)) || Simulated(ctx, t)) return false;
+            var animator = ctx.Target.GetComponent<Animator>();
+            if (animator != null && animator.isHuman)
+                for (var bone = HumanBodyBones.Hips; bone < HumanBodyBones.LastBone; bone++)
+                    if (animator.GetBoneTransform(bone) == t) return false;
+            foreach (var c in ctx.Target.GetComponentsInChildren<Component>(true))
+            {
+                if (c == null) continue;
+                if (c is UnityEngine.Animations.IConstraint && c.transform == t) return false;
+                if (!c.GetType().Name.StartsWith("VRC") || !c.GetType().Name.EndsWith("Constraint")) continue;
+                var target = Get<Transform>(c, "TargetTransform", null);
+                if ((target != null ? target : c.transform) == t) return false;
+            }
+            return true;
+        }
+
+        static HashSet<Transform> SkinningBones(GameObject root)
+        {
+            var used = new HashSet<Transform>();
+            foreach (var smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                var mesh = smr.sharedMesh;
+                var bones = smr.bones;
+                if (mesh == null || bones == null || bones.Length == 0)
+                {
+                    continue;
+                }
+                var indices = new HashSet<int>();
+                try
+                {
+                    var weights = mesh.GetAllBoneWeights();
+                    for (int i = 0; i < weights.Length; i++)
+                    {
+                        if (weights[i].weight > 0f)
+                        {
+                            indices.Add(weights[i].boneIndex);
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // Unreadable for some reason: assume every listed bone deforms, which only
+                    // ever refuses a move that might have been safe.
+                    foreach (var bone in bones)
+                    {
+                        if (bone != null)
+                        {
+                            used.Add(bone);
+                        }
+                    }
+                    continue;
+                }
+                foreach (int index in indices)
+                {
+                    if (index >= 0 && index < bones.Length && bones[index] != null)
+                    {
+                        used.Add(bones[index]);
+                    }
+                }
+            }
+            return used;
+        }
+
+        static string BlocksMirroredMove(Transform constrained, Transform newParent)
+        {
+            bool Mirrored(Vector3 s) => s.x < 0f || s.y < 0f || s.z < 0f;
+
+            foreach (var t in constrained.GetComponentsInChildren<Transform>(true))
+            {
+                if (Mirrored(t.localScale))
+                {
+                    return $"\"{t.name}\" is mirrored (negative scale), and handedness cannot " +
+                           "survive re-parenting";
+                }
+            }
+            if (constrained.parent != null
+                && Mirrored(constrained.parent.lossyScale) != Mirrored(newParent.lossyScale))
+            {
+                return $"\"{constrained.parent.name}\" and \"{newParent.name}\" have opposite " +
+                       "handedness, so the move would reflect the bone";
+            }
+            return null;
+        }
+
+        static string BlocksMove(BridgeContext ctx, Transform root, HashSet<Transform> skinned,
+                                 HashSet<string> animatedPaths)
+        {
+            foreach (var t in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (skinned.Contains(t))
+                {
+                    return $"\"{t.name}\" is a skinning bone";
+                }
+                if (animatedPaths.Contains(ctx.PathInTarget(t)))
+                {
+                    return $"an animation animates \"{t.name}\", and curves are addressed by path";
+                }
+            }
+            return null;
+        }
+
+        static Transform FirstWeightedSource(object vrc)
+        {
+            foreach (var s in ReadSources(vrc))
+            {
+                if (s.Transform != null && !Mathf.Approximately(s.Weight, 0f))
+                {
+                    return s.Transform;
+                }
+            }
+            return null;
+        }
+
+        static void RepointMaskPaths(BridgeContext ctx)
+        {
+            if (ctx.MergedController == null)
+            {
+                return;
+            }
+            var live = new HashSet<string>();
+            foreach (var t in ctx.Target.GetComponentsInChildren<Transform>(true))
+            {
+                live.Add(ctx.PathInTarget(t));
+            }
+            string controllerPath = AssetDatabase.GetAssetPath(ctx.MergedController);
+            foreach (var layer in ctx.MergedController.layers)
+            {
+                var mask = layer.avatarMask;
+                if (mask == null)
+                {
+                    continue;
+                }
+                // Only a mask this conversion owns. This runs before the
+                // self-container copies foreign masks, so the CCK's, the
+                // package's and the source avatar's are still theirs.
+                string maskPath = AssetDatabase.GetAssetPath(mask);
+                bool ours = string.IsNullOrEmpty(maskPath) || maskPath == controllerPath
+                            || maskPath.StartsWith(ctx.OutputDir + "/", StringComparison.Ordinal);
+                if (!ours)
+                {
+                    continue;
+                }
+                bool dirty = false;
+                for (int i = mask.transformCount - 1; i >= 0; i--)
+                {
+                    string path = mask.GetTransformPath(i);
+                    if (string.IsNullOrEmpty(path) || live.Contains(path))
+                    {
+                        continue;
+                    }
+                    // The leaf still exists somewhere; find it and rewrite, else drop the entry.
+                    string leaf = path.Substring(path.LastIndexOf('/') + 1);
+                    string replacement = null;
+                    foreach (string candidate in live)
+                    {
+                        if (candidate.EndsWith("/" + leaf, StringComparison.Ordinal) || candidate == leaf)
+                        {
+                            if (replacement != null)
+                            {
+                                replacement = null; // ambiguous, leave it rather than guess
+                                break;
+                            }
+                            replacement = candidate;
+                        }
+                    }
+                    if (replacement != null)
+                    {
+                        mask.SetTransformPath(i, replacement);
+                        dirty = true;
+                    }
+                }
+                if (dirty)
+                {
+                    EditorUtility.SetDirty(mask);
+                }
+            }
+        }
+
+        static void NoteLocalSpace(BridgeContext ctx, Component vrc, List<string> crossChain)
+        {
+            if (!Get(vrc, "SolveInLocalSpace", false))
+            {
+                return;
+            }
+            // A relay whose bone's parent stands in for the source was solved, and reported,
+            // when it was aligned. The stand-in's own parent is the grandparent, so the test
+            // below would call it a cross-chain relay.
+            foreach (var key in sourceStandIns.Keys)
+            {
+                if (ReferenceEquals(key.Item1, vrc))
+                {
+                    return;
+                }
+            }
+            // The Unity constraint may sit on TargetTransform instead.
+            // Not "?? vrc.transform": an unassigned Transform is
+            // Unity's fake null, and ?? passes it through.
+            var target = Get<Transform>(vrc, "TargetTransform", null);
+            var constrained = target != null ? target : vrc.transform;
+            bool isScale = vrc.GetType().Name == "VRCScaleConstraint";
+            foreach (var s in ReadSources(vrc))
+            {
+                if (s.Transform == null || Mathf.Approximately(s.Weight, 0f)
+                    || s.Transform.parent == constrained.parent)
+                {
+                    continue;
+                }
+                // VRChat copies localScale, Unity lossyScale: the same when every source ancestor is unit-scaled.
+                if (isScale && AncestorsAreUnitScaled(ctx, s.Transform))
+                {
+                    continue;
+                }
+                crossChain.Add($"`{ctx.PathInTarget(constrained)}` from `{ctx.PathInTarget(s.Transform)}`");
+                return; // one line per constraint is enough to find it
+            }
+        }
+
+        static bool AncestorsAreUnitScaled(BridgeContext ctx, Transform t)
+        {
+            var root = ctx.Target != null ? ctx.Target.transform : null;
+            for (var p = t.parent; p != null && p != root; p = p.parent)
+            {
+                var s = p.localScale;
+                if (!Mathf.Approximately(s.x, 1f) || !Mathf.Approximately(s.y, 1f)
+                    || !Mathf.Approximately(s.z, 1f))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static void ReportLocalSpace(BridgeContext ctx, List<string> crossChain)
+        {
+            if (crossChain.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Warning(Category,
+                $"{BridgeElements.Count(crossChain.Count, "constraint", "constraints")} relayed a bone from another chain in local space",
+                "Unity solves constraints in world space only, so these will not follow their source. A gap " +
+                "in the conversion: please report the avatar.\n\n" +
+                string.Join("\n", crossChain));
+        }
+
+        // ------------------------------------------------------------------------------
+
+        class SourceData
+        {
+            public int Index;   // VRC's, the N in a curve's "Sources.sourceN"
+            public Transform Transform;
+            public float Weight;
+            public Vector3 ParentPositionOffset;
+            public Vector3 ParentRotationOffset;
+        }
+
+        static List<SourceData> ReadSources(object vrcConstraint)
+        {
+            var result = new List<SourceData>();
+            object sources = Get<object>(vrcConstraint, "Sources", null);
+            if (!(sources is IEnumerable enumerable))
+            {
+                return result;
+            }
+            int index = -1;
+            foreach (var item in enumerable)
+            {
+                index++;
+                if (item == null)
+                {
+                    continue;
+                }
+                var transform = Get<Transform>(item, "SourceTransform", null);
+                if (transform == null)
+                {
+                    continue; // a source with no transform constrains to nothing, and null-sources crash AddSource
+                }
+                if (sourceStandIns.TryGetValue((vrcConstraint, transform), out var standIn))
+                {
+                    transform = standIn;
+                }
+                result.Add(new SourceData
+                {
+                    Index = index,
+                    Transform = transform,
+                    Weight = Get(item, "Weight", 1f),
+                    ParentPositionOffset = Get(item, "ParentPositionOffset", Vector3.zero),
+                    ParentRotationOffset = Get(item, "ParentRotationOffset", Vector3.zero)
+                });
+            }
+            return result;
+        }
+
+        static string SourceKey(string path, string vrcTypeName, int vrcIndex) => $"{path}|{vrcTypeName}|{vrcIndex}";
+
+        static int AddSource(BridgeContext ctx, Component vrc, IConstraint unity, SourceData s)
+        {
+            int idx = unity.AddSource(new ConstraintSource { sourceTransform = s.Transform, weight = s.Weight });
+            // First wins: with two constraints of one type on an object, a curve binds to the first.
+            string key = SourceKey(ctx.PathInTarget(vrc.transform), vrc.GetType().Name, s.Index);
+            if (!sourceIndex.ContainsKey(key))
+            {
+                sourceIndex[key] = idx;
+            }
+            return idx;
+        }
+
+        static void ApplyCommon<T>(object vrc, T unity) where T : Behaviour, IConstraint
+        {
+            unity.weight = Get(vrc, "GlobalWeight", 1f);
+            unity.locked = Get(vrc, "Locked", true);
+            // The component's own checkbox travels too: a constraint left
+            // disabled at rest and switched on by a toggle must start off,
+            // or the toggle can only ever release it.
+            if (vrc is Behaviour source)
+            {
+                unity.enabled = source.enabled;
+            }
+            // Activate last so Unity doesn't recompute rest values.
+            unity.constraintActive = Get(vrc, "IsActive", true);
+        }
+
+        static void WarnIfUnsupported(BridgeContext ctx, object vrc, Component component)
+        {
+            if (Get(vrc, "FreezeToWorld", false))
+            {
+                ctx.Report.Approximated(Category, component.name,
+                    "'Freeze To World' has no Unity constraint equivalent and was dropped.");
+            }
+            var target = Get<Transform>(vrc, "TargetTransform", null);
+            if (target != null && target != component.transform)
+            {
+                var host = HostFor(ctx, component);
+                if (host == target.gameObject)
+                {
+                    ctx.Report.Converted(Category, component.name,
+                        $"Drove another transform via VRC 'Target Transform'; the Unity constraint was " +
+                        $"placed on that target ({ctx.PathInTarget(target)}) instead, since Unity's " +
+                        "constraints only ever affect the object they sit on.");
+                }
+                else
+                {
+                    ctx.Report.Approximated(Category, component.name,
+                        $"'Target Transform' points at \"{target.name}\", which is outside this avatar, so the " +
+                        "redirection was dropped and the constraint now affects its own transform. " +
+                        "Whatever it was driving will not move.");
+                }
+            }
+        }
+
+        static void ConvertParent(BridgeContext ctx, Component vrc)
+        {
+            var unity = GetOrAdd<ParentConstraint>(ctx, vrc, out bool existed);
+            var sources = ReadSources(vrc);
+            foreach (var s in sources)
+            {
+                int idx = AddSource(ctx, vrc, unity, s);
+                unity.SetTranslationOffset(idx, s.ParentPositionOffset);
+                unity.SetRotationOffset(idx, s.ParentRotationOffset);
+            }
+            if (existed)
+            {
+                ReportMerged(ctx, vrc, "parent");
+                return; // keep the first constraint's rest/axis; just merge these sources in
+            }
+            var parentDriven = DrivenBy(ctx, vrc);
+            unity.translationAtRest = parentDriven != vrc.transform
+                ? parentDriven.localPosition
+                : Get(vrc, "PositionAtRest", vrc.transform.localPosition);
+            unity.rotationAtRest = parentDriven != vrc.transform
+                ? parentDriven.localEulerAngles
+                : Get(vrc, "RotationAtRest", vrc.transform.localEulerAngles);
+            unity.translationAxis = AxesFrom(ctx, vrc, "AffectsPositionX", "AffectsPositionY", "AffectsPositionZ");
+            unity.rotationAxis = AxesFrom(ctx, vrc, "AffectsRotationX", "AffectsRotationY", "AffectsRotationZ");
+            WarnIfUnsupported(ctx, vrc, vrc);
+            ApplyCommon(vrc, unity);
+            ctx.Report.Converted(Category, ctx.PathInTarget(vrc.transform), "Parent constraint");
+        }
+
+        static void ConvertPosition(BridgeContext ctx, Component vrc)
+        {
+            var unity = GetOrAdd<PositionConstraint>(ctx, vrc, out bool existed);
+            foreach (var s in ReadSources(vrc))
+            {
+                AddSource(ctx, vrc, unity, s);
+            }
+            if (existed)
+            {
+                ReportMerged(ctx, vrc, "position");
+                return;
+            }
+            var posDriven = DrivenBy(ctx, vrc);
+            unity.translationOffset = Get(vrc, "PositionOffset", Vector3.zero);
+            unity.translationAtRest = posDriven != vrc.transform
+                ? posDriven.localPosition
+                : Get(vrc, "PositionAtRest", vrc.transform.localPosition);
+            unity.translationAxis = AxesFrom(ctx, vrc, "AffectsPositionX", "AffectsPositionY", "AffectsPositionZ");
+            WarnIfUnsupported(ctx, vrc, vrc);
+            ApplyCommon(vrc, unity);
+            ctx.Report.Converted(Category, ctx.PathInTarget(vrc.transform), "Position constraint");
+        }
+
+        static void ConvertRotation(BridgeContext ctx, Component vrc)
+        {
+            var unity = GetOrAdd<RotationConstraint>(ctx, vrc, out bool existed);
+            foreach (var s in ReadSources(vrc))
+            {
+                AddSource(ctx, vrc, unity, s);
+            }
+            if (existed)
+            {
+                ReportMerged(ctx, vrc, "rotation");
+                return;
+            }
+            // From the live pose (VRChat's solver output): the field assumes both engines share a space,
+            // which differently oriented bones break. World rotations survive re-parenting.
+            var driven = DrivenBy(ctx, vrc);
+            var rotSources = ReadSources(vrc);
+            bool rotMeasured = Get(vrc, "IsActive", true)
+                && Mathf.Approximately(Get(vrc, "GlobalWeight", 1f), 1f)
+                && rotSources.Count == 1 && rotSources[0].Weight >= 0.999f
+                && rotSources[0].Transform != null
+                && vrc.gameObject.activeInHierarchy;
+            unity.rotationOffset = rotMeasured
+                ? (Quaternion.Inverse(rotSources[0].Transform.rotation) * driven.rotation).eulerAngles
+                : Get(vrc, "RotationOffset", Vector3.zero);
+            // A bone AlignLocalSpaceRelays moved has a new parent, so authored RotationAtRest is stale;
+            // the move kept world rotation. A relocated constraint reads the target's rest likewise.
+            unity.rotationAtRest = reparented.Contains(driven) || driven != vrc.transform
+                ? driven.localEulerAngles
+                : Get(vrc, "RotationAtRest", vrc.transform.localEulerAngles);
+            unity.rotationAxis = AxesFrom(ctx, vrc, "AffectsRotationX", "AffectsRotationY", "AffectsRotationZ");
+            WarnIfUnsupported(ctx, vrc, vrc);
+            ApplyCommon(vrc, unity);
+            ctx.Report.Converted(Category, ctx.PathInTarget(vrc.transform),
+                rotMeasured
+                    ? "Rotation constraint: offset measured from the pose VRChat's own solver left in the scene"
+                    : "Rotation constraint");
+        }
+
+        static void ConvertScale(BridgeContext ctx, Component vrc)
+        {
+            var unity = GetOrAdd<ScaleConstraint>(ctx, vrc, out bool existed);
+            foreach (var s in ReadSources(vrc))
+            {
+                AddSource(ctx, vrc, unity, s);
+            }
+            if (existed)
+            {
+                ReportMerged(ctx, vrc, "scale");
+                return;
+            }
+            unity.scaleOffset = Get(vrc, "ScaleOffset", Vector3.one);
+            var scaleDriven = DrivenBy(ctx, vrc);
+            unity.scaleAtRest = scaleDriven != vrc.transform
+                ? scaleDriven.localScale
+                : Get(vrc, "ScaleAtRest", vrc.transform.localScale);
+            unity.scalingAxis = AxesFrom(ctx, vrc, "AffectsScaleX", "AffectsScaleY", "AffectsScaleZ");
+            WarnIfUnsupported(ctx, vrc, vrc);
+            ApplyCommon(vrc, unity);
+            ctx.Report.Converted(Category, ctx.PathInTarget(vrc.transform), "Scale constraint");
+        }
+
+        static void ConvertAim(BridgeContext ctx, Component vrc)
+        {
+            var unity = GetOrAdd<AimConstraint>(ctx, vrc, out bool existed);
+            foreach (var s in ReadSources(vrc))
+            {
+                AddSource(ctx, vrc, unity, s);
+            }
+            if (existed)
+            {
+                ReportMerged(ctx, vrc, "aim");
+                return;
+            }
+            var aimDriven = DrivenBy(ctx, vrc);
+            unity.aimVector = Get(vrc, "AimAxis", Vector3.forward);
+            unity.upVector = Get(vrc, "UpAxis", Vector3.up);
+            unity.rotationAtRest = aimDriven != vrc.transform
+                ? aimDriven.localEulerAngles
+                : Get(vrc, "RotationAtRest", vrc.transform.localEulerAngles);
+            unity.rotationOffset = Get(vrc, "RotationOffset", Vector3.zero);
+            ctx.Report.Approximated(Category, ctx.PathInTarget(vrc.transform),
+                "Aim constraint: world-up mode settings are not transferred; verify behaviour.");
+            WarnIfUnsupported(ctx, vrc, vrc);
+            ApplyCommon(vrc, unity);
+        }
+
+        static void ConvertLookAt(BridgeContext ctx, Component vrc)
+        {
+            var unity = GetOrAdd<LookAtConstraint>(ctx, vrc, out bool existed);
+            foreach (var s in ReadSources(vrc))
+            {
+                AddSource(ctx, vrc, unity, s);
+            }
+            if (existed)
+            {
+                ReportMerged(ctx, vrc, "look-at");
+                return;
+            }
+            unity.roll = Get(vrc, "Roll", 0f);
+            var upTransform = Get<Transform>(vrc, "WorldUpTransform", null);
+            if (upTransform != null)
+            {
+                unity.worldUpObject = upTransform;
+                unity.useUpObject = Get(vrc, "UseUpTransform", true);
+            }
+            var lookDriven = DrivenBy(ctx, vrc);
+            unity.rotationAtRest = lookDriven != vrc.transform
+                ? lookDriven.localEulerAngles
+                : Get(vrc, "RotationAtRest", vrc.transform.localEulerAngles);
+            unity.rotationOffset = Get(vrc, "RotationOffset", Vector3.zero);
+            WarnIfUnsupported(ctx, vrc, vrc);
+            ApplyCommon(vrc, unity);
+            ctx.Report.Converted(Category, ctx.PathInTarget(vrc.transform), "LookAt constraint");
+        }
+
+        // ---------------------------------------------------------------- helpers ----
+
+        static GameObject HostFor(BridgeContext ctx, Component vrc)
+        {
+            var target = Get<Transform>(vrc, "TargetTransform", null);
+            if (target == null || target == vrc.transform)
+            {
+                return vrc.gameObject;
+            }
+            if (ctx.Target != null && !target.IsChildOf(ctx.Target.transform))
+            {
+                return vrc.gameObject;
+            }
+            if (ctx.Target != null)
+            {
+                // Recorded before the component is destroyed, while both paths still resolve.
+                relocated[ctx.PathInTarget(vrc.transform)] = ctx.PathInTarget(target);
+            }
+            return target.gameObject;
+        }
+
+        // The transform the converted constraint drives. With VRC's
+        // Target Transform that is the target, not the object the
+        // component sat on, and every rest value must describe it.
+        static Transform DrivenBy(BridgeContext ctx, Component vrc)
+        {
+            var host = HostFor(ctx, vrc);
+            return host != null ? host.transform : vrc.transform;
+        }
+
+        static T GetOrAdd<T>(BridgeContext ctx, Component vrc, out bool existed) where T : Component
+        {
+            var host = HostFor(ctx, vrc);
+            var existing = host.GetComponent<T>();
+            existed = existing != null;
+            return existed ? existing : host.AddComponent<T>();
+        }
+
+        static void ReportMerged(BridgeContext ctx, Component vrc, string kind)
+        {
+            ctx.Report.Approximated(Category, ctx.PathInTarget(vrc.transform),
+                $"Object had multiple {kind} constraints; Unity and ChilloutVR allow only one {kind} " +
+                $"constraint per object, so this one's sources were merged into the existing constraint " +
+                $"(the first constraint's offsets and rest values are kept).");
+        }
+
+        static string TopFrame(Exception e)
+        {
+            if (string.IsNullOrEmpty(e.StackTrace))
+            {
+                return "no stack";
+            }
+            foreach (var raw in e.StackTrace.Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.StartsWith("at AvatarBridge."))
+                {
+                    return line.Substring(3); // drop the leading "at "
+                }
+            }
+            return e.StackTrace.Split('\n')[0].Trim();
+        }
+
+        // Axis flags fall back to true so the constraint still drives something, but then a
+        // renamed field silently frees frozen axes. So an unresolved member is reported.
+        static Axis AxesFrom(BridgeContext ctx, object vrc, string x, string y, string z)
+        {
+            Axis axes = Axis.None;
+            if (Get(vrc, x, true)) axes |= Axis.X;
+            if (Get(vrc, y, true)) axes |= Axis.Y;
+            if (Get(vrc, z, true)) axes |= Axis.Z;
+            foreach (var name in new[] { x, y, z })
+            {
+                if (Has(vrc, name) || !missingAxisMembers.Add(name))
+                {
+                    continue;
+                }
+                ctx.Report.Warning(Category, $"\"{name}\" is not on this VRChat SDK's constraints",
+                    "The SDK renamed the field, so a frozen axis will move. Update the SDK, or report the version.");
+            }
+            return axes;
+        }
+
+        // Reported once per name, not once per constraint.
+        static readonly HashSet<string> missingAxisMembers = new HashSet<string>();
+
+        static bool Has(object target, string memberName)
+        {
+            if (target == null)
+            {
+                return false;
+            }
+            var type = target.GetType();
+            return type.GetProperty(memberName, BindingFlags.Public | BindingFlags.Instance) != null
+                || type.GetField(memberName, BindingFlags.Public | BindingFlags.Instance) != null;
+        }
+
+        static T Get<T>(object target, string memberName, T fallback)
+        {
+            if (target == null)
+            {
+                return fallback;
+            }
+            var type = target.GetType();
+            try
+            {
+                var property = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.Instance);
+                if (property != null && typeof(T).IsAssignableFrom(property.PropertyType))
+                {
+                    return (T)property.GetValue(target);
+                }
+                var field = type.GetField(memberName, BindingFlags.Public | BindingFlags.Instance);
+                if (field != null && typeof(T).IsAssignableFrom(field.FieldType))
+                {
+                    return (T)field.GetValue(target);
+                }
+            }
+            catch
+            {
+                // fall through to fallback
+            }
+            return fallback;
+        }
+    }
+}
+#endif

@@ -1,0 +1,33 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../../UIElementsSchema/UIElements.xsd" editor-extension-mode="False">
+    <Style src="project://database/Assets/CVR.CCK/Editor/ControlPanel/Resources/CCKControlPanel/UI/ControlPanelStyles.uss?fileID=7433441132597879392&amp;guid=1ddb0f4cf43313e49bfe30377cfbffdb&amp;type=3#ControlPanelStyles" />
+    <ui:VisualElement name="Body" style="flex-grow: 1;">
+        <ui:VisualElement name="Header" style="margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; flex-shrink: 0;">
+            <ui:VisualElement name="SearchContainer" style="flex-direction: row; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 5px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0;">
+                <ui:Label text="Search:" display-tooltip-when-elided="true" style="-unity-text-align: middle-left; -unity-font-style: bold;" />
+                <ui:TextField picking-mode="Ignore" name="SearchField" style="flex-grow: 1; margin-right: 0;" />
+                <ui:DropdownField index="-1" choices="System.Collections.Generic.List`1[System.String]" name="SortOrderDropdown" style="width: 100px; margin-top: 1px; margin-right: 5px; margin-bottom: 1px; margin-left: 5px;" />
+                <ui:DropdownField index="-1" choices="System.Collections.Generic.List`1[System.String]" name="SortByDropdown" style="margin-left: 0; margin-right: 0; margin-top: 1px; margin-bottom: 1px; width: 60px;" />
+            </ui:VisualElement>
+            <ui:VisualElement name="Tabs" style="flex-direction: row; flex-grow: 0; height: 30px; padding-left: 2px; padding-right: 2px; padding-top: 2px; padding-bottom: 2px; justify-content: space-around; align-items: stretch; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; margin-bottom: 0;">
+                <ui:VisualElement name="btn-avatars" class="cck-tab" style="align-items: center; justify-content: center; flex-grow: 1; width: 100px; flex-direction: row;">
+                    <ui:VisualElement class="cck-tab-icon" style="width: 15px; height: 15px; background-image: resource(&apos;CCKControlPanel/Icons/man&apos;); margin-right: 5px;" />
+                    <ui:Label text="Avatars" display-tooltip-when-elided="true" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-text-align: middle-center;" />
+                </ui:VisualElement>
+                <ui:VisualElement name="separator" style="width: 1px; flex-shrink: 0; background-color: rgb(0, 0, 0); margin-bottom: 2px; margin-top: 2px;" />
+                <ui:VisualElement name="btn-props" class="cck-tab" style="align-items: center; justify-content: center; flex-grow: 1; width: 100px; flex-direction: row;">
+                    <ui:VisualElement class="cck-tab-icon" style="width: 15px; height: 15px; background-image: resource(&apos;CCKControlPanel/Icons/rubik&apos;); margin-right: 5px;" />
+                    <ui:Label text="Props" display-tooltip-when-elided="true" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-text-align: middle-center;" />
+                </ui:VisualElement>
+                <ui:VisualElement name="separator" style="width: 1px; flex-shrink: 0; background-color: rgb(0, 0, 0); margin-bottom: 2px; margin-top: 2px;" />
+                <ui:VisualElement name="btn-worlds" class="cck-tab" style="align-items: center; justify-content: center; flex-grow: 1; width: 100px; flex-direction: row;">
+                    <ui:VisualElement class="cck-tab-icon" style="width: 15px; height: 15px; background-image: resource(&apos;CCKControlPanel/Icons/earth-grid&apos;); margin-right: 5px;" />
+                    <ui:Label text="Worlds" display-tooltip-when-elided="true" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-text-align: middle-center;" />
+                </ui:VisualElement>
+            </ui:VisualElement>
+        </ui:VisualElement>
+        <ui:ScrollView name="Body" style="flex-grow: 1; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; flex-shrink: 1;">
+            <ui:Label text="No Content :(" display-tooltip-when-elided="true" name="BodyFallbackLabel" style="flex-grow: 1; -unity-text-align: middle-center; font-size: 36px; display: none;" />
+            <ui:Label text="Showing 0 of 0 Items" display-tooltip-when-elided="true" name="SearchResultsLabel" style="flex-grow: 0; -unity-text-align: upper-left; -unity-font-style: bold; font-size: 14px; display: flex; margin-top: 3px;" />
+        </ui:ScrollView>
+    </ui:VisualElement>
+</ui:UXML>

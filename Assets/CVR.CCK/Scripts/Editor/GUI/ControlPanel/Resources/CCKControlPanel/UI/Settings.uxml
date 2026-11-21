@@ -1,0 +1,63 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../../UIElementsSchema/UIElements.xsd" editor-extension-mode="True">
+    <Style src="project://database/Assets/CVR.CCK/Scripts/Editor/GUI/ControlPanel/Resources/CCKControlPanel/UI/ControlPanelStyles.uss?fileID=7433441132597879392&amp;guid=1ddb0f4cf43313e49bfe30377cfbffdb&amp;type=3#ControlPanelStyles" />
+    <ui:VisualElement name="Body">
+        <ui:VisualElement name="BuildAndUpload" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; flex-shrink: 0;">
+            <FoldoutHeader style="align-items: center;">
+                <ui:Label text="Build &amp; Upload" display-tooltip-when-elided="true" name="label-upload" enable-rich-text="false" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+            </FoldoutHeader>
+            <ui:VisualElement name="Seperator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+            <FoldoutBody>
+                <ui:DropdownField label="Preferred upload region" index="0" choices="Europe, United States" name="dropdown-upload-region" style="margin-left: 5px; margin-right: 5px; margin-top: 2px; margin-bottom: 2px; flex-direction: row;" />
+                <ui:VisualElement name="ding-on-complete" style="flex-direction: row; margin-top: 2px; margin-right: 5px; margin-bottom: 2px; margin-left: 5px;">
+                    <ui:Toggle label="Ding on complete" name="toggle-ding-on-complete" style="margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; flex-direction: row; flex-grow: 1;" />
+                    <ui:Button text="Test" display-tooltip-when-elided="true" name="button-ding-on-complete-test" style="flex-shrink: 1; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0;" />
+                </ui:VisualElement>
+                <ui:Toggle label="Bigger Send Buffer (EXP)" name="toggle-bigger-send-buffer" style="margin-left: 5px; margin-right: 5px; margin-top: 2px; margin-bottom: 2px; flex-direction: row; flex-grow: 1;" />
+            </FoldoutBody>
+        </ui:VisualElement>
+        <ui:VisualElement name="Warnings" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; flex-shrink: 0;">
+            <FoldoutHeader style="align-items: center;">
+                <ui:Label text="Editor" display-tooltip-when-elided="true" name="label-upload" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+            </FoldoutHeader>
+            <ui:VisualElement name="Seperator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+            <FoldoutBody>
+                <ui:Toggle label="Partial editor localization" name="toggle-partial-localization-warning" style="margin-left: 5px; margin-right: 5px; margin-top: 2px; margin-bottom: 2px; flex-direction: row; flex-shrink: 0; flex-grow: 1;" />
+                <ui:Toggle label="Use Dev Wasm Module" name="toggle-use-dev-wasm-module" style="margin-left: 5px; margin-right: 5px; margin-top: 2px; margin-bottom: 2px; flex-direction: row; flex-shrink: 0; flex-grow: 1;" />
+                <ui:Toggle label="Verbose Wasm Build" name="toggle-wasm-verbose-build" style="margin-left: 5px; margin-right: 5px; margin-top: 2px; margin-bottom: 2px; flex-direction: row; flex-shrink: 0; flex-grow: 1;" />
+            </FoldoutBody>
+        </ui:VisualElement>
+        <ui:VisualElement name="PlayMode" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; flex-shrink: 0; display: none;">
+            <FoldoutHeader style="align-items: center;">
+                <ui:Label text="Play Mode" display-tooltip-when-elided="true" name="label-upload" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+            </FoldoutHeader>
+            <ui:VisualElement name="Seperator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+            <FoldoutBody />
+        </ui:VisualElement>
+        <ui:VisualElement name="Advanced" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; display: none;">
+            <FoldoutHeader style="align-items: center;">
+                <ui:Label text="Advanced" display-tooltip-when-elided="true" name="label-advanced" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+            </FoldoutHeader>
+            <ui:VisualElement name="Seperator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+            <FoldoutBody>
+                <ui:VisualElement name="BuildProcessorContainer" style="flex-direction: column; margin-left: 5px; margin-right: 5px; margin-top: 2px; margin-bottom: 2px;">
+                    <ui:HelpBox focusable="false" text="Adjusting the registered build processors should only be done when debugging or solving conflicts. Be mindful if adjusting them." message-type="Warning" name="helpbox-warning" />
+                    <ui:VisualElement name="BuildProcessorHeader" style="flex-direction: row;">
+                        <ui:Label text="Build Processors:" display-tooltip-when-elided="true" name="label-build-processors" style="margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; width: 152px; flex-grow: 1; -unity-text-align: middle-left;" />
+                        <ui:Button text="Reset" display-tooltip-when-elided="true" name="btn-reset" style="display: none;" />
+                    </ui:VisualElement>
+                    <ui:ListView focusable="true" reorderable="true" show-add-remove-footer="false" show-foldout-header="false" reorder-mode="Animated" show-border="true" show-bound-collection-size="false" name="Meow" style="margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; flex-grow: 1; min-height: 15px;" />
+                </ui:VisualElement>
+            </FoldoutBody>
+        </ui:VisualElement>
+    </ui:VisualElement>
+    <ui:VisualElement name="Spacer" style="justify-content: space-between; flex-direction: column-reverse; align-items: center; flex-grow: 1; flex-shrink: 0; flex-wrap: nowrap;">
+        <ui:VisualElement name="AttributionFooter" style="justify-content: center; align-items: center; flex-direction: column;">
+            <ui:Label text="Uicons by Flaticon" style="-unity-text-align: middle-center;" />
+            <ui:Label text="Planet icons created by designvector10 - Flaticon" />
+            <ui:Label text="Pictogram icons created by Prosymbols Premium - Flaticon" />
+            <ui:Label text="Rubix icons created by msidiqf - Flaticon" />
+            <ui:Label text="Notification Beep by Universfield - Pixabay" />
+            <ui:Label text="Build Panel GUI by Exterrata ♡" style="margin-top: 2px;" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

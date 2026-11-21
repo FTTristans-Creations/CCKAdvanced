@@ -1,0 +1,235 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../../UIElementsSchema/UIElements.xsd" editor-extension-mode="True">
+    <ui:Template name="ValidationItem" src="project://database/Assets/CVR.CCK/Scripts/Editor/GUI/ControlPanel/Resources/CCKControlPanel/UI/Elements/ValidationItem.uxml?fileID=9197481963319205126&amp;guid=12c80f009d43e8646b3f179ca392d72d&amp;type=3#ValidationItem" />
+    <Style src="project://database/Assets/CVR.CCK/Scripts/Editor/GUI/ControlPanel/Resources/CCKControlPanel/UI/ControlPanelStyles.uss?fileID=7433441132597879392&amp;guid=1ddb0f4cf43313e49bfe30377cfbffdb&amp;type=3#ControlPanelStyles" />
+    <ui:VisualElement name="NoContent" style="margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; display: none; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px; border-top-width: 1px; border-right-width: 1px; border-bottom-width: 1px; border-left-width: 1px; border-top-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-bottom-left-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0);">
+        <ui:Label text="NO_CONTENT_FOUND" display-tooltip-when-elided="true" style="-unity-text-align: middle-center; -unity-font-style: bold; font-size: 18px; margin-bottom: 5px; margin-top: 5px; margin-right: 5px; margin-left: 5px; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px;" />
+        <ui:VisualElement name="Helpbox" class="unity-help-box" style="flex-direction: column; align-items: stretch; margin-top: 5px; margin-right: 5px; margin-bottom: 5px; margin-left: 5px; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-top-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-bottom-left-radius: 5px; border-top-width: 1px; border-right-width: 1px; border-bottom-width: 1px; border-left-width: 1px;">
+            <ui:Label text="GET_STARTED_TEXT" style="white-space: normal;" />
+            <ui:Label text="AVATARS_DESCRIPTION" style="white-space: normal;" />
+            <ui:Label text="PROPS_DESCRIPTION" style="white-space: normal;" />
+            <ui:Label text="WORLDS_DESCRIPTION" style="white-space: normal;" />
+        </ui:VisualElement>
+        <ui:VisualElement name="QuickCreateGroup" style="flex-direction: row; justify-content: space-between; margin-top: 5px; margin-right: 5px; margin-bottom: 5px; margin-left: 5px; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-top-width: 1px; border-right-width: 1px; border-bottom-width: 1px; border-left-width: 1px; border-top-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-bottom-left-radius: 5px; display: none;">
+            <ui:Label text="QUICK_CREATE" display-tooltip-when-elided="true" name="Label" style="-unity-font-style: bold; padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-top: 5px; margin-right: 5px; margin-bottom: 5px; margin-left: 5px;" />
+            <ui:Button text="AVATAR" display-tooltip-when-elided="true" name="btn-create-avatar" class="quick-create-button" style="margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; max-width: 100px; flex-shrink: 1; flex-grow: 1;" />
+            <ui:Button text="PROP" display-tooltip-when-elided="true" name="btn-create-prop" class="quick-create-button" style="margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; max-width: 100px; flex-shrink: 1; flex-grow: 1;" />
+            <ui:Button text="WORLD" display-tooltip-when-elided="true" name="btn-create-world" class="quick-create-button" style="margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; max-width: 100px; flex-shrink: 1; flex-grow: 1;" />
+        </ui:VisualElement>
+        <ui:Button text="LEARN_MORE_CONTENT_CREATION" display-tooltip-when-elided="true" name="btn-learn-more" style="margin-top: 5px; margin-right: 5px; margin-bottom: 5px; margin-left: 5px; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px;" />
+    </ui:VisualElement>
+    <ui:VisualElement name="HasContent" style="flex-grow: 1; display: flex;">
+        <ui:ScrollView name="Content" horizontal-scroller-visibility="Hidden" horizontal-page-size="0" style="flex-grow: 1;">
+            <ui:VisualElement name="Content" style="margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0);">
+                <FoldoutHeader style="align-items: center;">
+                    <ui:Label text="SELECTED_CONTENT" display-tooltip-when-elided="true" style="-unity-font-style: bold; width: 123px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-text-align: middle-left; margin-right: 5px;" />
+                    <ui:DropdownField name="ContentSelector" style="flex-grow: 1; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; -unity-font-style: normal; flex-shrink: 1;" />
+                    <ui:Button display-tooltip-when-elided="true" name="button-content-utility" style="padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 3px; width: 20px; height: 20px; justify-content: space-around; align-items: center; white-space: nowrap; -unity-text-align: middle-center; flex-direction: column;">
+                        <ui:VisualElement name="VisualElement" class="unity-base-popup-field__arrow" style="flex-shrink: 0; width: 12px; height: 12px; overflow: visible; -unity-text-align: middle-center; flex-direction: column; align-items: center; justify-content: center;" />
+                    </ui:Button>
+                </FoldoutHeader>
+                <FoldoutBody>
+                    <ui:VisualElement name="ContentDetails" style="flex-direction: row; margin-top: 2px; display: flex;">
+                        <ui:VisualElement name="Thumbnail" style="height: 140px; width: 140px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 3px; border-bottom-left-radius: 3px; border-top-right-radius: 3px; border-bottom-right-radius: 3px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); flex-shrink: 0; margin-right: 5px;">
+                            <ui:Label tabindex="-1" text="NO_IMAGE" parse-escape-sequences="true" display-tooltip-when-elided="true" name="ThumbnailLabel" style="position: absolute; width: 100%; height: 100%; -unity-text-align: middle-center; font-size: 20px; -unity-font-style: normal; display: flex;" />
+                            <ui:VisualElement name="HoverOverlay" style="flex-grow: 1; background-color: rgba(0, 0, 0, 0.5); display: none;">
+                                <ui:Label text="SELECT_IMAGE" display-tooltip-when-elided="true" name="btn-select-image" style="flex-grow: 1; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-text-align: middle-center; transition-property: all; transition-duration: 0s; transition-timing-function: ease; transition-delay: 0s; font-size: 14px;" />
+                                <ui:VisualElement name="Seperator" style="height: 1px; margin-right: 3px; margin-left: 3px; margin-top: 0; background-color: rgb(0, 0, 0);" />
+                                <ui:Label text="CAPTURE_IMAGE" display-tooltip-when-elided="true" name="btn-capture-image" style="flex-grow: 1; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-text-align: middle-center; font-size: 14px;" />
+                            </ui:VisualElement>
+                        </ui:VisualElement>
+                        <ui:VisualElement name="Content" style="flex-grow: 1; height: 140px; display: flex;">
+                            <ui:Label text="NAME" display-tooltip-when-elided="true" name="label-name" style="-unity-font-style: bold;" />
+                            <ui:TextField picking-mode="Ignore" name="input-name" max-length="45" style="flex-direction: column; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0;" />
+                            <ui:Label text="DESCRIPTION" display-tooltip-when-elided="true" name="label-description" style="margin-top: 10px; -unity-font-style: bold;" />
+                            <ui:TextField picking-mode="Ignore" name="input-description" multiline="true" max-length="256" style="flex-direction: column; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; flex-grow: 1; max-height: 82px; flex-shrink: 1;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="Capture" style="flex-grow: 1; padding-left: 5px; opacity: 1; border-top-width: 1px; border-right-width: 1px; border-bottom-width: 1px; border-left-width: 1px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-top-left-radius: 3px; border-top-right-radius: 3px; border-bottom-right-radius: 3px; border-bottom-left-radius: 3px; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; display: none;">
+                            <ui:VisualElement name="CaptureFromContainer" style="flex-grow: 0; flex-direction: row; flex-shrink: 0;">
+                                <ui:Label tabindex="-1" text="Capture From" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-capture-from" style="-unity-text-align: middle-left; flex-grow: 1; flex-shrink: 1; overflow: hidden; flex-basis: 3px; padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0;" />
+                                <ui:DropdownField choices="Scene View, Custom Camera" index="0" name="dropdown-capture-from" style="-unity-font-style: normal; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; flex-shrink: 1; flex-basis: 1px; flex-grow: 1; max-width: 100px;" />
+                            </ui:VisualElement>
+                            <ui:VisualElement name="Seperator" class="cck-separator" style="flex-shrink: 0;" />
+                            <ui:VisualElement name="CaptureFromScene" style="display: none; opacity: 1; flex-direction: column;">
+                                <ui:VisualElement name="BackgroundContainer" style="max-width: 150px; align-self: center;">
+                                    <ui:VisualElement name="BackgroundColorContainer" style="flex-grow: 1; flex-direction: row; margin-bottom: 3px; align-self: center;">
+                                        <ui:Label tabindex="-1" text="Background Color: " parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-use-background-color" style="padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; flex-shrink: 1; flex-grow: 1; overflow: hidden;" />
+                                        <ui:Toggle name="toggle-use-background-color" style="align-self: center; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0;" />
+                                    </ui:VisualElement>
+                                    <uie:ColorField value="RGBA(0.000, 1.000, 1.000, 1.000)" name="color-field-background" style="flex-shrink: 1; align-items: center; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; border-top-left-radius: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; border-bottom-left-radius: 0; min-width: 50px;" />
+                                </ui:VisualElement>
+                            </ui:VisualElement>
+                            <ui:VisualElement name="CaptureFromCustom" style="display: flex; align-items: center;">
+                                <ui:VisualElement name="CustomCameraContainer" style="flex-direction: row; max-width: 230px; flex-grow: 1;">
+                                    <ui:Label tabindex="-1" text="Custom Camera" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-custom-camera" style="flex-grow: 1; flex-shrink: 1; -unity-text-align: middle-left; overflow: hidden;" />
+                                    <uie:ObjectField name="object-field-custom-camera" style="margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; flex-shrink: 1;" />
+                                </ui:VisualElement>
+                            </ui:VisualElement>
+                            <ui:VisualElement name="CaptureButtons" style="flex-grow: 1; flex-direction: row; align-items: flex-end;">
+                                <ui:Button text="Capture Thumbnail" display-tooltip-when-elided="true" name="button-capture" style="flex-grow: 1; flex-shrink: 1;" />
+                                <ui:Button text="Cancel" display-tooltip-when-elided="true" name="button-cancel" style="flex-shrink: 1;" />
+                            </ui:VisualElement>
+                        </ui:VisualElement>
+                    </ui:VisualElement>
+                    <ui:VisualElement name="ContentErrorDetails" style="display: none;">
+                        <ui:HelpBox message-type="Error" text="The selected content is not owned by the currently authenticated account. You must switch to that account or unassign the attached GUID to upload this content." name="helpbox-error-info" style="padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-right: 0; margin-left: 0;" />
+                        <ui:Button text="Detatch Asset GUID" display-tooltip-when-elided="true" name="button-detach-guid" style="margin-right: 0; margin-left: 0;" />
+                    </ui:VisualElement>
+                </FoldoutBody>
+            </ui:VisualElement>
+            <ui:VisualElement name="WorldPanoramic" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; display: none;">
+                <FoldoutHeader folded="true" style="align-items: center;">
+                    <ui:Label text="Portal Panoramic Preview" display-tooltip-when-elided="true" name="label-portal-pano-preview" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+                </FoldoutHeader>
+                <ui:VisualElement name="Seperator" class="cck-separator" style="flex-shrink: 0;" />
+                <FoldoutBody>
+                    <ui:HelpBox message-type="Info" text="The panoramic image is taken towards the end of the content building process. This is what users will see when looking at Portals dropped to your world." style="padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-top: 2px; margin-right: 0; margin-bottom: 2px; margin-left: 0;" />
+                    <StereoPanoramicPreview texture-path="Assets/Testing/5c3d60e5-fc45-477d-8c77-196c83a89845_pano_1024.png" eye-side="0" style="flex-grow: 1; flex-shrink: 0;" />
+                </FoldoutBody>
+            </ui:VisualElement>
+            <ui:VisualElement name="ContentInfo" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; display: none;">
+                <FoldoutHeader style="align-items: center;">
+                    <ui:Label text="CONTENT_DETAILS" display-tooltip-when-elided="true" name="label-build-info" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+                </FoldoutHeader>
+                <ui:VisualElement name="Seperator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+                <FoldoutBody style="align-items: center; justify-content: center;">
+                    <ui:VisualElement style="flex-grow: 1; flex-direction: row;">
+                        <ui:VisualElement style="flex-grow: 1; max-width: 142px;">
+                            <ui:Label tabindex="-1" text="UPLOADED_PLATFORMS" parse-escape-sequences="true" display-tooltip-when-elided="true" enable-rich-text="true" />
+                            <ui:Label tabindex="-1" text="PUBLISHED" parse-escape-sequences="true" display-tooltip-when-elided="true" enable-rich-text="true" />
+                        </ui:VisualElement>
+                        <ui:VisualElement style="flex-grow: 1;">
+                            <ui:Label tabindex="-1" text="PC_ANDROID" parse-escape-sequences="true" display-tooltip-when-elided="true" enable-rich-text="true" />
+                            <ui:Label tabindex="-1" text="TRUE" parse-escape-sequences="true" display-tooltip-when-elided="true" enable-rich-text="true" />
+                        </ui:VisualElement>
+                    </ui:VisualElement>
+                </FoldoutBody>
+            </ui:VisualElement>
+            <ui:VisualElement name="Tags" style="margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); flex-direction: column;">
+                <FoldoutHeader style="align-items: center;">
+                    <ui:Label text="CONTENT_TAGS" display-tooltip-when-elided="true" name="label-content-tags" style="-unity-text-align: middle-left; flex-grow: 1; -unity-font-style: bold;" />
+                    <ui:Button text="LEARN_MORE" display-tooltip-when-elided="true" name="btn-content-tags" />
+                </FoldoutHeader>
+                <ui:VisualElement name="Seperator" class="cck-separator" style="flex-shrink: 0;" />
+                <FoldoutBody style="justify-content: space-around; flex-direction: row;">
+                    <ui:VisualElement name="DisruptiveExperience" style="flex-grow: 1; max-width: 125px;">
+                        <ui:Label text="DISRUPTIVE_EXPERIENCE" display-tooltip-when-elided="true" name="label-visual-experience" style="-unity-text-align: upper-center; max-width: 170px; margin-bottom: 2px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; margin-top: 2px; overflow: hidden;" />
+                        <ui:Toggle label="SCREEN_EFFECTS" name="btn-screen-effects" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                        <ui:Toggle label="FLASHING_EFFECTS" name="btn-flashing-effects" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                        <ui:Toggle label="JUMPSCARE" name="btn-jumpscare" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="MatureThemes" style="flex-grow: 1; max-width: 125px;">
+                        <ui:Label text="MATURE_THEMES" display-tooltip-when-elided="true" name="label-mature-themes" style="-unity-text-align: upper-center; max-width: 160px; margin-bottom: 2px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; margin-top: 2px; overflow: hidden;" />
+                        <ui:Toggle label="SUGGESTIVE" name="btn-suggestive" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                        <ui:Toggle label="VIOLENCE" name="btn-violence" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                        <ui:Toggle label="HORROR" name="btn-horror" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="ContentGating" style="flex-grow: 1; max-width: 125px;">
+                        <ui:Label text="CONTENT_GATING" display-tooltip-when-elided="true" name="label-content-gating" style="-unity-text-align: upper-center; max-width: 160px; margin-bottom: 2px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; margin-top: 2px; overflow: hidden;" />
+                        <ui:Toggle label="GORE" name="btn-gore" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                        <ui:Toggle label="EXPLICIT" name="btn-explicit" class="cck-content-tag" style="flex-direction: row-reverse;" />
+                    </ui:VisualElement>
+                </FoldoutBody>
+            </ui:VisualElement>
+            <ui:VisualElement name="Validations" class="cck-foldout-root">
+                <FoldoutHeader style="align-items: center;">
+                    <ui:Label text="VALIDATIONS" display-tooltip-when-elided="true" name="label-validations" style="-unity-text-align: middle-left; flex-grow: 1; -unity-font-style: bold;" />
+                    <ui:VisualElement name="Infos" style="flex-direction: row; background-image: none; height: 22px; width: 45px; flex-grow: 0;">
+                        <ui:VisualElement class="unity-help-box__icon--info" style="height: 20px; width: 20px; flex-shrink: 0;" />
+                        <ui:Label text="0" display-tooltip-when-elided="true" name="label-info-count" style="-unity-text-align: middle-left; padding-left: 1px; padding-right: 0; padding-top: 0; padding-bottom: 0;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="Warnings" style="flex-direction: row; background-image: none; width: 45px; height: 22px;">
+                        <ui:VisualElement class="unity-help-box__icon--warning" style="width: 20px; height: 20px; flex-shrink: 0;" />
+                        <ui:Label text="1" display-tooltip-when-elided="true" name="label-warning-count" style="-unity-text-align: middle-left; padding-left: 1px; padding-right: 0; padding-top: 0; padding-bottom: 0;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="Errors" style="flex-direction: row; width: 45px; height: 22px;">
+                        <ui:VisualElement class="unity-help-box__icon--error" style="width: 22px; height: 22px; flex-shrink: 0;" />
+                        <ui:Label text="1" display-tooltip-when-elided="true" name="label-error-count" style="-unity-text-align: middle-left; padding-left: 1px; padding-right: 0; padding-top: 0; padding-bottom: 0;" />
+                    </ui:VisualElement>
+                    <ui:Button text="VALIDATIONS_REFRESH" display-tooltip-when-elided="true" name="btn-validations-refresh" />
+                </FoldoutHeader>
+                <ui:VisualElement name="Seperator" class="cck-separator" style="flex-shrink: 0;" />
+                <FoldoutBody name="FoldoutBody">
+                    <ui:Instance template="ValidationItem" name="ValidationItem">
+                        <AttributeOverrides element-name="validationHelpBox" text="VALIDATION_ERROR_TEXT" />
+                    </ui:Instance>
+                </FoldoutBody>
+            </ui:VisualElement>
+            <ui:VisualElement name="BuildInfo" style="flex-grow: 0; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; display: flex;">
+                <FoldoutHeader style="align-items: center;">
+                    <ui:Label text="LAST_BUILD_INFO" display-tooltip-when-elided="true" name="label-build-info" style="-unity-text-align: middle-left; flex-grow: 0; -unity-font-style: bold;" />
+                </FoldoutHeader>
+                <ui:VisualElement name="Seperator" class="cck-separator" style="flex-shrink: 0;" />
+                <FoldoutBody style="align-items: center; justify-content: center;">
+                    <ui:VisualElement style="flex-grow: 1; flex-direction: row; justify-content: center; align-items: auto;">
+                        <ui:VisualElement style="flex-grow: 1; flex-direction: column;">
+                            <ui:Label tabindex="-1" text="FILE_SIZE" parse-escape-sequences="true" display-tooltip-when-elided="true" />
+                            <ui:Label tabindex="-1" text="START_TIME" parse-escape-sequences="true" display-tooltip-when-elided="true" />
+                            <ui:Label tabindex="-1" text="DURATION" parse-escape-sequences="true" display-tooltip-when-elided="true" />
+                            <ui:Label tabindex="-1" text="PLATFORM" parse-escape-sequences="true" display-tooltip-when-elided="true" />
+                            <ui:Label tabindex="-1" text="BUILD_ACTION" parse-escape-sequences="true" display-tooltip-when-elided="true" />
+                        </ui:VisualElement>
+                        <ui:VisualElement style="flex-grow: 1; align-items: auto; justify-content: flex-start;">
+                            <ui:Label tabindex="-1" text="96 MB" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-build-size" />
+                            <ui:Label tabindex="-1" text="10:21 PM" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-build-time" />
+                            <ui:Label tabindex="-1" text="300 Minutes" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-build-duration" />
+                            <ui:Label tabindex="-1" text="Windows" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-build-platform" />
+                            <ui:Label tabindex="-1" text="Online Publish" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-build-action" />
+                        </ui:VisualElement>
+                    </ui:VisualElement>
+                    <ui:Label tabindex="-1" text="BUILD_SUCCEEDED" parse-escape-sequences="true" display-tooltip-when-elided="true" name="label-build-result" style="color: rgb(0, 255, 20); -unity-text-align: upper-center;" />
+                </FoldoutBody>
+            </ui:VisualElement>
+        </ui:ScrollView>
+        <ui:VisualElement name="ProgressContainer" style="flex-shrink: 0; padding-top: 5px;">
+            <ui:VisualElement name="Seperator" class="cck-separator" />
+            <ui:VisualElement name="ProgressContainer" style="flex-direction: row; width: 100%;">
+                <ui:ProgressBar value="22" title="my-progress" name="UploadProgress" style="flex-grow: 1; flex-shrink: 1;" />
+                <ui:Button text="DISMISS" display-tooltip-when-elided="true" name="btn-dismiss" style="flex-grow: 1; max-width: 80px;" />
+            </ui:VisualElement>
+            <ui:VisualElement name="Seperator" class="cck-separator" />
+        </ui:VisualElement>
+        <ui:VisualElement name="Build" style="flex-direction: column; margin-bottom: 5px; margin-left: 5px; margin-right: 5px; margin-top: 5px; min-width: 265px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; flex-shrink: 0; overflow: hidden; flex-grow: 0; height: 80px;">
+            <ui:VisualElement name="SlideContainer" style="flex-shrink: 0; align-items: auto; justify-content: flex-start; align-self: auto; height: 100%; width: 200%; flex-grow: 0; flex-direction: row; translate: 0 0;">
+                <ui:VisualElement name="BuildPage" style="flex-grow: 0; margin-top: 5px; flex-shrink: 0; display: flex; width: 50%; align-items: stretch;">
+                    <ui:VisualElement style="padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; margin-bottom: 5px; flex-direction: row;">
+                        <ui:VisualElement name="info-upload" style="flex-grow: 1; display: flex;">
+                            <ui:Label text="UPLOAD_YOUR_CONTENT" display-tooltip-when-elided="true" name="label-upload" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-font-style: bold; flex-shrink: 1;" />
+                            <ui:Label text="UPLOAD_DESCRIPTION" display-tooltip-when-elided="true" name="label" style="margin-left: 0; margin-right: 0; margin-top: 3px; margin-bottom: 0; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; flex-shrink: 1;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="info-test" style="flex-grow: 1; display: none;">
+                            <ui:Label text="LOCALTEST_YOUR_CONTENT" display-tooltip-when-elided="true" name="label-test" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; -unity-font-style: bold; flex-shrink: 1;" />
+                            <ui:Label text="LOCALTEST_DESCRIPTION" display-tooltip-when-elided="true" name="label" style="margin-left: 0; margin-right: 0; margin-top: 3px; margin-bottom: 0; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; flex-shrink: 1;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="btn-target-build-platform" class="cck-build-platform-windows" style="width: 33px; height: 33px; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; align-items: center; justify-content: center;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="BuildButtonContainer" class="unity-button" style="flex-direction: row; height: 30px; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0;">
+                        <ui:Label text="BUILD_UPLOAD" display-tooltip-when-elided="true" name="btn-build" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; flex-grow: 1;" />
+                        <ui:VisualElement name="separator" class="cck-button-separator" style="width: 1px;" />
+                        <ui:VisualElement name="selector-build" class="cck-build-selector" style="width: 18px; height: 18px; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px;" />
+                    </ui:VisualElement>
+                </ui:VisualElement>
+                <ui:VisualElement name="UploadPage" style="flex-shrink: 0; width: 50%; flex-direction: column; align-items: stretch; justify-content: flex-start;">
+                    <ui:VisualElement name="UploadContainer" style="padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; flex-shrink: 0;">
+                        <ui:Label text="CONTENT_CHANGELOG" display-tooltip-when-elided="true" name="label-content-changelog" style="-unity-font-style: bold;" />
+                        <ui:TextField picking-mode="Ignore" name="field-content-changelog" multiline="true" max-length="256" style="flex-direction: column; height: 80px; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 3px;" />
+                        <ui:Label text="LEGAL_ASSURANCE" name="label-legal-assurance" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; margin-bottom: 3px; -unity-font-style: bold;" />
+                        <ui:VisualElement name="btn-legal1" class="unity-help-box legal-assurance-helpbox" style="flex-direction: row; align-items: center; overflow: hidden; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 3px; flex-shrink: 0;">
+                            <ui:Toggle name="cck-legal-toggle-1" style="flex-grow: 0; flex-shrink: 1; align-items: center;">
+                                <ui:Label text="I hereby certify that my uploaded content belongs to or is licensed to me. I know that uploading copyrighted content without the author&apos;s permission can get my account restricted and/or have legal consequences. I know that I have to fully adhere to any and all content creation rules mentioned in the terms of service of ChilloutVR." style="white-space: normal; flex-grow: 0; font-size: 10px; padding-left: 5px; flex-shrink: 1; padding-right: 2px; padding-top: 0;" />
+                            </ui:Toggle>
+                        </ui:VisualElement>
+                        <ui:VisualElement name="btn-legal2" class="unity-help-box legal-assurance-helpbox" style="flex-direction: row; align-items: center; overflow: hidden; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; flex-shrink: 0;">
+                            <ui:Toggle name="cck-legal-toggle-2" style="flex-grow: 0; flex-shrink: 1; align-items: center;">
+                                <ui:Label text="I hereby certify that the tags are set correctly and fit to the uploaded content. I know that knowingly setting the wrong tags is a serious offense. I know that my account will be punished if I continuously set the wrong tags." style="white-space: normal; font-size: 10px; padding-left: 5px; padding-right: 2px; padding-top: 0; flex-shrink: 1;" />
+                            </ui:Toggle>
+                        </ui:VisualElement>
+                    </ui:VisualElement>
+                    <ui:VisualElement name="Upload" style="flex-direction: row; flex-grow: 1; padding-top: 5px; flex-shrink: 0;">
+                        <ui:Button text="BACK" display-tooltip-when-elided="true" name="btn-back" style="padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; margin-left: 0; margin-right: 3px; margin-top: 0; margin-bottom: 0; flex-grow: 1; height: 30px;" />
+                        <ui:Button text="UPLOAD" display-tooltip-when-elided="true" name="btn-upload" style="flex-grow: 1; margin-left: 3px; margin-right: 0; margin-top: 0; margin-bottom: 0; padding-left: 0; padding-right: 0; padding-top: 0; padding-bottom: 0; height: 30px;" />
+                    </ui:VisualElement>
+                </ui:VisualElement>
+            </ui:VisualElement>
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

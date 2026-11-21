@@ -1,0 +1,217 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS && AVATARBRIDGE_MAGICA
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+using VRC.SDK3.Dynamics.PhysBone.Components;
+
+namespace AvatarBridge
+{
+    // Here, not at the top: MagicaCloth 1's global namespace MagicaCloth beats a file-level using.
+    using MagicaCloth2;
+
+    // Optional: hands each cloth the avatar's own converted colliders it could reach, beyond
+    // the per-chain lists copied from the source.
+    // Trap: a chain given a collider it rests inside gets ejected (thigh jiggle sits inside the
+    // hip capsule), so a collider is offered only when every bone starts outside it.
+    // Measured against the collider as MagicaCloth2 reads it, since mesh fitting can move it.
+    public static class MagicaColliderAutoAssign
+    {
+        const string Category = "PhysBones -> MagicaCloth2";
+
+
+        public static void Run(BridgeContext ctx,
+            List<(PhysBoneChainData Data, MagicaCloth Cloth)> cloths,
+            Dictionary<VRCPhysBoneCollider, ColliderComponent> colliderCache)
+        {
+            if (!ctx.Settings.autoAssignNearbyColliders || cloths.Count == 0 || colliderCache.Count == 0)
+            {
+                return;
+            }
+
+            int assignments = 0, chainsTouched = 0;
+            foreach (var (data, cloth) in cloths)
+            {
+                if (cloth == null)
+                {
+                    continue;
+                }
+                // One list per root: a merged group is independent chains in one cloth,
+                // and a collider any one of them starts inside would eject that chain.
+                var strands = data.AllRoots.Select(root => CollectChainBones(data, root))
+                    .Where(bones => bones.Count >= 2).ToList();
+                if (strands.Count == 0)
+                {
+                    continue;
+                }
+
+                var sdata = cloth.SerializeData;
+                var added = new List<string>();
+
+                foreach (var pair in colliderCache)
+                {
+                    var pbCollider = pair.Key;
+                    var magica = pair.Value;
+                    if (pbCollider == null || magica == null ||
+                        sdata.colliderCollisionConstraint.colliderList.Contains(magica))
+                    {
+                        continue; // already assigned, or unconvertible
+                    }
+
+                    // A plane is unbounded, so "near" is meaningless and everything would match.
+                    if (pbCollider.shapeType.ToString().Contains("Plane"))
+                    {
+                        continue;
+                    }
+                    // A collider riding on this chain's own bones travels with it.
+                    var owner = pbCollider.rootTransform != null ? pbCollider.rootTransform : pbCollider.transform;
+                    if (owner == null || strands.Any(bones => bones.Contains(owner))
+                        || data.AllRoots.Any(root => IsDescendantOf(owner, root)))
+                    {
+                        continue;
+                    }
+
+                    if (TryReachAny(magica, strands, out float clearance))
+                    {
+                        if (sdata.colliderCollisionConstraint.colliderList.Count == 0)
+                        {
+                            sdata.colliderCollisionConstraint.mode = ColliderCollisionConstraint.Mode.Edge;   // as the writer: whole bones, like VRChat
+                        }
+                        sdata.colliderCollisionConstraint.colliderList.Add(magica);
+                        added.Add($"{owner.name} ({clearance * 100f:0.#} cm)");
+                        assignments++;
+                    }
+                }
+
+                if (added.Count > 0)
+                {
+                    chainsTouched++;
+                    ctx.Report.Approximated(Category, data.Label,
+                        $"Auto-assigned {BridgeElements.Count(added.Count, "nearby collider", "nearby colliders")}: {string.Join(", ", added)}. " +
+                        "The original PhysBone didn't list these, so this is a deliberate improvement on the " +
+                        "source rather than a faithful copy: remove any that make the chain behave oddly.");
+                }
+            }
+
+            if (assignments > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Auto-assigned {BridgeElements.Count(assignments, "collider", "colliders")} across {BridgeElements.Count(chainsTouched, "chain", "chains")}",
+                    "Each chain was given the avatar's own colliders that it starts clear of and could swing " +
+                    "into. Colliders a chain begins inside are skipped, since those would push it out.");
+            }
+        }
+
+        // Every strand must start outside the collider; one strand within reach is enough.
+        static bool TryReachAny(ColliderComponent collider, List<List<Transform>> strands, out float clearance)
+        {
+            clearance = float.MaxValue;
+            bool reachable = false;
+            foreach (var bones in strands)
+            {
+                bool reached = TryReach(collider, bones, out float distance);
+                clearance = Mathf.Min(clearance, distance);
+                if (reached)
+                {
+                    reachable = true;
+                }
+                else if (distance < 0f)
+                {
+                    return false;
+                }
+            }
+            return reachable;
+        }
+
+        static bool TryReach(ColliderComponent collider, List<Transform> bones, out float clearance)
+        {
+            clearance = float.MaxValue;
+            bool reachable = false;
+            Vector3 origin = bones[0].position; // the chain root, which stays put
+
+            for (int i = 0; i < bones.Count; i++)
+            {
+                float distance = SurfaceDistance(collider, bones[i].position);
+                if (distance < 0f)
+                {
+                    // This bone starts inside the collider; assigning it would eject the chain.
+                    clearance = distance;
+                    return false;
+                }
+                clearance = Mathf.Min(clearance, distance);
+
+                // Hard bound: a bone never leaves this sphere around the fixed root. Per-bone
+                // parent distance understates it, since every joint above rotates too.
+                if (distance <= Vector3.Distance(bones[i].position, origin))
+                {
+                    reachable = true;
+                }
+            }
+            return reachable;
+        }
+
+        // MagicaCloth2's own reading of the shape: a sphere scales by X, a capsule by
+        // the scale along its axis, and its length is the full span, each end's sphere
+        // inset by that end's radius.
+        static float SurfaceDistance(ColliderComponent collider, Vector3 point)
+        {
+            var t = collider.transform;
+            Vector3 size = collider.GetSize();
+            Vector3 centre = t.TransformPoint(collider.center);
+
+            if (collider is MagicaCapsuleCollider capsule)
+            {
+                Vector3 local = capsule.GetLocalDir();
+                float scale = Mathf.Abs(Vector3.Dot(t.lossyScale, local));
+                Vector3 axis = t.TransformDirection(local);
+                float startRadius = size.x * scale, endRadius = size.y * scale, half = size.z * scale * 0.5f;
+                Vector3 a = centre + axis * Mathf.Max(half - startRadius, 0f);
+                Vector3 b = centre - axis * Mathf.Max(half - endRadius, 0f);
+                float along = ClosestOnSegment(point, a, b);
+                return Vector3.Distance(point, Vector3.Lerp(a, b, along))
+                       - Mathf.Lerp(startRadius, endRadius, along);
+            }
+            return Vector3.Distance(point, centre) - size.x * Mathf.Abs(t.lossyScale.x);
+        }
+
+        static float ClosestOnSegment(Vector3 point, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float lengthSq = ab.sqrMagnitude;
+            return lengthSq < 1e-8f ? 0f : Mathf.Clamp01(Vector3.Dot(point - a, ab) / lengthSq);
+        }
+
+        static List<Transform> CollectChainBones(PhysBoneChainData data, Transform root)
+        {
+            var bones = new List<Transform>();
+            void Walk(Transform t)
+            {
+                if (t == null || data.Ignores.Contains(t))
+                {
+                    return; // ignored transforms take their children with them
+                }
+                bones.Add(t);
+                for (int i = 0; i < t.childCount; i++)
+                {
+                    Walk(t.GetChild(i));
+                }
+            }
+            Walk(root);
+            return bones;
+        }
+
+        static bool IsDescendantOf(Transform candidate, Transform root)
+        {
+            var current = candidate;
+            while (current != null)
+            {
+                if (current == root)
+                {
+                    return true;
+                }
+                current = current.parent;
+            }
+            return false;
+        }
+    }
+}
+#endif

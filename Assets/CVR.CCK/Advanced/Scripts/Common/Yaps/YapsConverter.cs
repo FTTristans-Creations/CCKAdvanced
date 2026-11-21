@@ -1,0 +1,1650 @@
+// YAPS: the pipeline pass. Turns VRCFury's baked SPS rig into something
+// ChilloutVR can run. Inspired by VRCFury's SPS, no SPS code is used.
+// See docs/YAPS-CLEAN-ROOM.md.
+//
+// VRCFury leaves a "BakedSpsPlug" per plug and a "BakedSpsSocket" per
+// socket, with contact senders and two protocol lights. Its screen-space
+// atlas transport is VRChat-only and is deleted.
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System.Collections.Generic;
+using System;
+using System.Linq;
+using ABI.CCK.Components;
+using AvatarBridge.Yaps;
+using UnityEditor;
+using UnityEngine;
+
+namespace AvatarBridge
+{
+    public static class YapsConverter
+    {
+        const string Category = "YAPS";
+
+        static readonly string[] AtlasJunk = { "SpsResolver", "SpsScreenMarker", "SpsAtlas" };
+
+        // Contains: it sees through Fury's ID prefix.
+        static bool IsAtlasJunk(string name) => AtlasJunk.Any(hint => name.Contains(hint));
+
+        // Plug slots whose swapped-in variants are baked once the clips are
+        // this conversion's own. Per conversion, cleared on every Run.
+        static readonly List<(Renderer renderer, int slot, YapsBaker.Result result, Material[] known)>
+            PendingVariants = new List<(Renderer, int, YapsBaker.Result, Material[])>();
+
+        // Plug materials already warned about VRCFury's deform, once each per conversion.
+        static readonly HashSet<Material> PrebuiltSps = new HashSet<Material>();
+
+        // DPS or TPS, upgraded once the avatar is finished. Beside SPS the upgrade takes only
+        // what the SPS route left.
+        static bool LegacyPending;
+        static bool SpsConverted;
+
+        public static void Run(BridgeContext ctx)
+        {
+            PendingVariants.Clear();
+            PrebuiltSps.Clear();
+            LegacyPending = false;
+            SpsConverted = false;
+            if (!ctx.Settings.convertYapsSystems)
+            {
+                return;
+            }
+
+            var plugRoots = Named(ctx, "BakedSpsPlug");
+            var socketRoots = Named(ctx, "BakedSpsSocket");
+            // Always: an avatar can carry SPS and leftover DPS or TPS parts.
+            LegacyPending = true;
+            if (plugRoots.Count == 0 && socketRoots.Count == 0)
+            {
+                return;
+            }
+            SpsConverted = true;
+
+            RemoveAtlasJunk(ctx);
+            YapsLock.Animate(ctx.Target.transform, ctx.MergedController?.animationClips);
+            // Sockets on this avatar: its own plugs check ownership first.
+            float selfFlag = socketRoots.Count > 0 ? 1f : -1f;
+
+            // The rebuild reads kind and channel off Fury's rig, then strips
+            // it, so everything after here works on a bare socket.
+            var rebuild = YapsSocketRebuilder.ReadAndStrip(ctx, socketRoots);
+            CarryTags(ctx, rebuild);
+            YapsSocketRebuilder.Wake(ctx, socketRoots);
+
+            // Plug half of CarryTags' report: a miss falls to defaults silently.
+            // Converted plugs only (a failed one already warned), matched by
+            // count since the record's Root can sit below plugRoot.
+            var untraced = new List<string>();
+            foreach (var plugRoot in plugRoots)
+            {
+                int before = ctx.YapsPlugs.Count;
+                ConvertPlug(ctx, plugRoot);
+                if (ctx.YapsPlugs.Count > before && AuthoredKey(ctx, plugRoot) == null)
+                {
+                    untraced.Add(ctx.PathInTarget(plugRoot.parent != null ? plugRoot.parent : plugRoot));
+                }
+            }
+            if (untraced.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(untraced.Count, "plug takes", "plugs take")} the default tag and overrun settings",
+                    "The SPS plug each was baked from could not be found, so its own settings are unknown. Each " +
+                    "answers any socket and may pass through one, which is what an SPS plug does unless its " +
+                    "author changed it: " + string.Join(", ", untraced));
+            }
+            foreach (var plug in ctx.YapsPlugs)
+            {
+                // Every material: with the flag on one, half the plug reads the
+                // atlas and half the lights, which looks right until lights go out.
+                foreach (var material in plug.Materials)
+                {
+                    if (material == null) { continue; }
+                    material.SetFloat("_YAPS_SelfTag", selfFlag);
+                    // The atlas is a material flag so a plug can be built
+                    // without it. Converted plugs always read it.
+                    material.SetFloat("_YAPS_UseAtlas", 1f);
+                }
+            }
+            // Two plugs on one mesh each get animated values of their own, once
+            // every plug on it is patched and before anything copies its packs.
+            var shared = ctx.YapsPlugs.Select(p => p.Renderer)
+                .Concat(ctx.YapsPlugs.SelectMany(p => p.Extras.Select(e => e.Renderer))).Where(r => r != null).Distinct();
+            foreach (var renderer in shared)
+            {
+                int dropped = YapsBaker.ShareRenderer(renderer);
+                if (dropped > 0)
+                    ctx.Report.Warning(Category, $"\"{renderer.name}\": {BridgeElements.Count(dropped, "shape", "shapes")} of its second plug left out",
+                        $"Two plugs on one mesh share {YapsBaker.MaxShapes} shape slots, and the first took the rest. " +
+                        "The second's later shapes do not bend it.");
+            }
+            // Readouts last: a plug measured over another's readout counts it as plug.
+            foreach (var renderer in ctx.YapsPlugs.Select(p => p.Renderer).Distinct())
+            {
+                YapsDebugOverlayBuilder.Build(renderer, ctx.Report);
+            }
+
+            ConvertSockets(ctx, socketRoots);
+            YapsSocketRebuilder.Finish(ctx, rebuild);
+            WireSocketToggles(ctx, socketRoots);
+            YapsSocketRebuilder.Lighthouse(ctx);
+
+            // The tag chooser, as the toolkit builds it: its words live on the
+            // plug component.
+            string chooser = YapsTagMenu.Build(ctx.CvrAvatar, ctx.MergedController);
+            if (chooser != null)
+            {
+                ctx.Report.Converted(Category, "A plug built for several places gets a dropdown",
+                    "The wearer picks one of the places it answers, or Anything, from its own menu " +
+                    "row. It starts on what you built. (" + chooser + ")");
+            }
+
+            string readout = YapsDebugOverlayBuilder.Menu(ctx.CvrAvatar, ctx.MergedController);
+            if (readout != null)
+            {
+                ctx.Report.Converted(Category, "One menu toggle shows every plug's and socket's readout",
+                    "Off by default. It syncs, so someone helping sees each plug and socket as the wearer's " +
+                    "own game resolves it. (" + readout + ")");
+            }
+
+            // After every plug material and socket writer exists: it wires
+            // whatever renderer can hold the id.
+            string owner = YapsOwner.Wire(ctx.Target, ctx.MergedController);
+            if (owner != null)
+            {
+                ctx.Report.Converted(Category, "Plugs and sockets carry the wearer's owner id",
+                    "A plug tells the wearer's sockets from anyone else's at any distance. One synced " +
+                    "parameter, 32 bits. (" + owner + ")");
+            }
+
+            // The surface every socket writer publishes to, once per avatar.
+            if (YapsAtlas.AddClear(ctx.Target.transform) != null
+                && YapsAtlas.AddGrab(ctx.Target.transform) != null)
+            {
+                ctx.Report.Converted(Category, "Added the screen surface plugs read each other through",
+                    "Lets plugs find sockets through the screen, with no light slot, contact or sync bit. " +
+                    "Invisible.");
+            }
+
+            if (socketRoots.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Kept the depth reactions on {BridgeElements.Count(socketRoots.Count, "socket", "sockets")}",
+                    "Pointed at each rebuilt socket's depth trigger. Local, so only you see them, unless " +
+                    "\"Show the avatar's OWN depth animations to other players\" is on (32 bits a socket).");
+            }
+
+            if (plugRoots.Count > 0 && ctx.YapsPlugs.Count == 0)
+            {
+                ctx.Report.Warning(Category, "No plug could be converted",
+                    "The objects are here but nothing usable came out of them; the entries above " +
+                    "say why for each. The avatar is otherwise unaffected.");
+            }
+        }
+
+        // --- the plug --------------------------------------------------
+
+        static void ConvertPlug(BridgeContext ctx, Transform plugRoot)
+        {
+            string where = ctx.PathInTarget(plugRoot);
+
+            var renderer = FindPlugRenderer(ctx, plugRoot, out int plugVertices, out var chainLevel);
+            if (renderer == null)
+            {
+                ctx.Report.Warning(Category, $"No mesh found for the plug at {where}",
+                    "No skinned renderer on this avatar has vertices weighted to the plug's bones, " +
+                    "so there is nothing to bend. A plug built as a separate unskinned object is " +
+                    "not supported yet.");
+                return;
+            }
+
+            // The chain must be its own: if the first bones above are the
+            // wearer's (Hips, Spine, a leg), "the plug" is the body. Length
+            // proves nothing: a hyper plug outgrows its wearer.
+            string bodyBone = HumanoidBoneName(ctx, chainLevel);
+            if (bodyBone != null)
+            {
+                ctx.Report.Warning(Category, $"The plug at {where} was left alone",
+                    $"Its chain is the body's own ({bodyBone}), so it would bend the whole avatar. Put the " +
+                    "SPS Plug on the plug's root bone and convert again.");
+                return;
+            }
+
+            // A source built by the toolkit with readouts on wears their mesh;
+            // the bake wants the one underneath, and no readout slot to patch.
+            YapsDebugOverlayBuilder.Restore(plugRoot.GetComponent<YapsPlug>());
+            YapsDebugOverlayBuilder.Restore(renderer);
+            var sizeBones = SizeBones(ctx, ChainRootOf(renderer as SkinnedMeshRenderer, chainLevel, plugRoot));
+            var rest = YapsRestPose.Apply(ctx.Target.transform, ctx.MergedController, sizeBones);
+            if (rest == null)
+            {
+                ctx.Report.Warning(Category, $"The plug at {where} was baked at the size the scene shows",
+                    "The size its slider starts at could not be read. If this plug has a size slider, check it at rest in game.");
+            }
+            else if (rest.Count > 0)
+            {
+                ctx.Report.Converted(Category, $"The plug at {where} was baked at the size its slider starts at",
+                    $"{string.Join(", ", rest)}. The scene held it at another size; in game it loads at this one, " +
+                    "so the bake and the length other sockets read now match it.");
+            }
+            float size = YapsBaker.LargestSize(YapsCurveMirror.ClipsOf(ctx.MergedController), sizeBones);
+            // A plain mesh moves onto a bounds copy in the bake; Remove needs the original.
+            var filter = renderer.GetComponent<MeshFilter>();
+            var unbounded = filter != null ? filter.sharedMesh : null;
+            var result = YapsBaker.Bake(renderer, plugRoot, ctx.OutputDir + "/YAPS", ctx.Report,
+                out string bakeFailure, sizeScale: size);
+            if (result == null)
+            {
+                ctx.Report.Warning(Category, $"Could not bake the plug at {where}", bakeFailure);
+                return;
+            }
+
+            // Every slot the plug uses: an unpatched tip slot hangs in the air.
+            // result.Root, not plugRoot: the bake may have descended to the shaft.
+            var split = new HashSet<int>();
+            var slots = SplitShared(ctx, where, renderer, result.Root, MaterialSlotsOf(renderer, result.Root), split);
+            var patchedSlots = new List<string>();
+            var patchedMaterials = new List<Material>();
+            var patchedSlotIndices = new List<int>();
+            int primarySlot = -1;
+            Material primaryMaterial = null;
+            int skippedShadowPasses = 0;
+            foreach (int slot in slots)
+            {
+                var slotMaterial = PatchPlugSlot(ctx, where, renderer, result.Root, slot, result,
+                    out int skipped, split.Contains(slot) ? YapsBaker.PlaceKey(result.Root) : null);
+                if (slotMaterial == null)
+                {
+                    continue;
+                }
+                patchedSlots.Add($"{slot} (\"{slotMaterial.name}\")");
+                patchedMaterials.Add(slotMaterial);
+                patchedSlotIndices.Add(slot);
+                if (primarySlot < 0)
+                {
+                    primarySlot = slot;
+                    primaryMaterial = slotMaterial;
+                    skippedShadowPasses = skipped;
+                }
+            }
+            if (primarySlot < 0)
+            {
+                return;
+            }
+
+            // Every OTHER plug mesh (tip, ring, harness) on this frame and length,
+            // so they bend as one. Not the body touching the base;
+            // YapsBaker.RidesPlug draws the line.
+            var extras = new List<BridgeContext.YapsPlugMesh>();
+            var extraMaterials = new List<Material>();
+            var others = result.FromSkinnedMesh
+                ? ctx.Target.GetComponentsInChildren<SkinnedMeshRenderer>(true)
+                : new SkinnedMeshRenderer[0];
+            foreach (var skin in others)
+            {
+                if (skin == renderer || skin.sharedMesh == null) continue;
+                if (!YapsBaker.RidesPlug(skin, result.Root))
+                {
+                    if (YapsBaker.CountVerticesUnder(skin, result.Root) > 0)
+                        ctx.Report.Skipped(Category, $"\"{skin.name}\" left out of the plug at {where}",
+                            "It meets the plug only at the plug's root bone, so it is taken for the body " +
+                            "the plug grows from and stays as it is. A part that should bend with the " +
+                            "shaft needs weights on the shaft's own bones.");
+                    continue;
+                }
+                if (ctx.YapsPlugs.Any(p => p.Renderer == skin || p.Extras.Any(e => e.Renderer == skin))) continue;
+                var extra = YapsBaker.Bake(skin, result.Root, ctx.OutputDir + "/YAPS", ctx.Report,
+                    out string extraFailure, shareFrameWith: result, sizeScale: size);
+                if (extra == null)
+                {
+                    ctx.Report.Warning(Category, $"\"{skin.name}\" could not join the plug at {where}",
+                        $"Most of it rides the plug's bones, but it could not be baked ({extraFailure}), so it stays rigid.");
+                    continue;
+                }
+                var mesh = new BridgeContext.YapsPlugMesh { Renderer = skin, Shapes = extra.Shapes, MovingShapes = extra.MovingShapes };
+                foreach (int slot in MaterialSlotsOf(skin, result.Root))
+                {
+                    var slotMaterial = PatchPlugSlot(ctx, where, skin, result.Root, slot, extra, out _);
+                    if (slotMaterial == null) continue;
+                    mesh.Slots.Add(slot);
+                    extraMaterials.Add(slotMaterial);
+                }
+                if (mesh.Slots.Count > 0) extras.Add(mesh);
+            }
+
+            // A plain mesh bakes in its own units; the record and the markers
+            // are metres, the same conversion the toolkit's bake makes.
+            float toMetres = result.FromSkinnedMesh ? 1f : Mathf.Abs(renderer.transform.lossyScale.z);
+
+            ctx.YapsPlugs.Add(new BridgeContext.YapsPlug
+            {
+                Root = result.Root,
+                Renderer = renderer,
+                Material = primaryMaterial,
+                MaterialSlot = primarySlot,
+                Materials = patchedMaterials.Concat(extraMaterials).ToList(),
+                MaterialSlots = patchedSlotIndices,
+                Extras = extras,
+                Length = result.Length * toMetres,
+                Radius = result.Radius * toMetres,
+                Shapes = result.Shapes,
+                MovingShapes = result.MovingShapes,
+                ChainRoot = ChainRootOf(renderer as SkinnedMeshRenderer, chainLevel, result.Root),
+                Origin = result.Origin,
+                Rotation = result.Rotation,
+            });
+
+            // The toolkit's markers on the measured frame. Fury's rig goes first,
+            // or its tracker doubles and its pointers win the dedupe. Toy mod
+            // length on unless an existing plug turned it off.
+            YapsSocketRebuilder.StripPlugRig(plugRoot);
+            var had = plugRoot.GetComponent<YapsPlug>();
+            YapsNativeBuilder.AnnouncePlug(plugRoot, result.Origin, result.Rotation,
+                result.Length * toMetres, result.Radius * toMetres, tipLight: true, pointers: true,
+                toyLengthDir: had == null || had.toyModLength ? ctx.OutputDir + "/YAPS" : null);
+
+            // Read back off the patched material so a re-bake writes the same.
+            // No slot named: a named slot bakes that one alone.
+            YapsNativeBuilder.AdoptPlug(plugRoot, renderer, -1, primaryMaterial, null);
+
+            var adopted = plugRoot.GetComponent<YapsPlug>();
+            if (adopted != null)
+            {
+                // In words: the material holds hashes, so a re-bake from empty
+                // lists made the plug answer every socket.
+                string authored = AuthoredKey(ctx, plugRoot);
+                if (authored != null)
+                {
+                    if (YapsBakePrep.AuthoredAnswers.TryGetValue(authored, out var answers))
+                        adopted.answers = new List<string>(answers);
+                    if (YapsBakePrep.AuthoredRefuses.TryGetValue(authored, out var refuses))
+                        adopted.refuses = new List<string>(refuses);
+                }
+                // Every slot baked here, primary first, so a re-bake, the
+                // own-socket ticks and Remove reach the same ones.
+                adopted.converted = true;
+                if (filter != null && filter.sharedMesh != unbounded) adopted.boundsFrom = unbounded;
+                void Record(Renderer on, int slot)
+                {
+                    if (adopted.bakedSlots.Any(b => b != null && b.slot == slot && b.renderer == on)) return;
+                    ctx.YapsMaterialSwaps.TryGetValue((on, slot), out var swap);
+                    adopted.bakedSlots.Add(new YapsPlug.BakedSlot { slot = slot, was = swap.from, renderer = on });
+                }
+                foreach (int slot in patchedSlotIndices) Record(renderer, slot);
+                // The primary's knobs for all, or the seam opens.
+                foreach (var mesh in extras)
+                {
+                    var mats = mesh.Renderer.sharedMaterials;
+                    foreach (int slot in mesh.Slots)
+                    {
+                        YapsNativeBuilder.WriteKnobs(adopted, mats[slot]);
+                        Record(mesh.Renderer, slot);
+                    }
+                }
+            }
+            // Built once every plug is measured, hidden until the menu shows it.
+            YapsDebugOverlayBuilder.Record(adopted, result, primaryMaterial, renderer.name, ctx.Report);
+
+            ctx.Report.Converted(Category, $"Plug converted at {where}",
+                $"\"{renderer.name}\" material{(patchedSlots.Count > 1 ? "s" : "")} " +
+                $"{string.Join(" and ", patchedSlots)}, " +
+                $"{plugVertices} vertices on the plug's bones, {result.Length * toMetres:0.###} m long, on a private shader copy." +
+                (extras.Count > 0
+                    ? $" Also {string.Join(", ", extras.Select(e => $"\"{e.Renderer.name}\""))}, on the same frame."
+                    : "") +
+                (skippedShadowPasses > 0 ? $" {BridgeElements.Count(skippedShadowPasses, "shadow pass cannot be patched and stays", "shadow passes cannot be patched and stay")} straight." : ""));
+        }
+
+        // Null: the slot could not take the deform, and has said why.
+        static Material PatchPlugSlot(BridgeContext ctx, string where, Renderer renderer,
+            Transform plugRoot, int slot, YapsBaker.Result result, out int skippedShadowPasses, string key = null)
+        {
+            skippedShadowPasses = 0;
+            var materials = renderer.sharedMaterials;
+            if (slot < 0 || slot >= materials.Length || materials[slot] == null)
+            {
+                ctx.Report.Warning(Category, $"No material to patch for the plug at {where}",
+                    "The renderer's material list does not cover the plug's triangles.");
+                return null;
+            }
+
+            // The old deform must not run beside YAPS: TPS, SPS and Poiyomi's DPS
+            // are switched off, Raliv's DPS (no switch) moves to Simple Lit.
+            var source = materials[slot];
+            // Repatched from what it replaced: patching the patched copy was
+            // refused and fell back to Simple Lit, losing the shaft's look.
+            if (ctx.YapsMaterialSwaps.TryGetValue((renderer, slot), out var prior)
+                && prior.to == source && prior.from != null)
+            {
+                source = prior.from;
+            }
+            var legacy = YapsLegacyMap.Detect(source, out _);
+            // The bake is asked not to patch plug shaders, so this is a built copy or a VRCFury
+            // that could not be asked. With a switch, SwitchOffLegacyDeform below turns it off.
+            if (legacy == YapsLegacyMap.Origin.SPS && !source.HasProperty("_SPS_Enabled") && PrebuiltSps.Add(source))
+            {
+                ctx.Report.Warning(Category, $"\"{source.name}\" already carries VRCFury's own deform", YapsLegacyMap.SpsPrebuilt);
+            }
+            var patchSource = source;
+            Shader shader = null;
+            string refusal = null;
+            bool simpleLit = legacy == YapsLegacyMap.Origin.DPS && !YapsNativeBuilder.HasDpsSwitch(source);
+            if (simpleLit)
+            {
+                var plain = YapsNativeBuilder.OnSimpleLit(source, out string why);
+                if (plain == null)
+                {
+                    refusal = why;
+                }
+                else
+                {
+                    shader = YapsShaderPatcher.Patch(plain, ctx.Report,
+                        out refusal, out skippedShadowPasses, roles: YapsShaderPatcher.Roles.Plug);
+                    if (shader != null)
+                    {
+                        patchSource = plain;
+                        ctx.Report.Approximated(Category, $"\"{source.name}\" wears YAPS Simple Lit now",
+                            "A DPS shader has no switch for its own deform, so both would have bent the " +
+                            "plug. Its colour, albedo, normal map, metallic and smoothness were carried " +
+                            "over; the original material is untouched.");
+                    }
+                }
+            }
+            else
+            {
+                shader = YapsShaderPatcher.Patch(source, ctx.Report, out refusal, out skippedShadowPasses,
+                    allowSps: legacy == YapsLegacyMap.Origin.SPS, roles: YapsShaderPatcher.Roles.Plug);
+            }
+
+            // A refusing shader falls back to YAPS Standard or Simple Lit with the
+            // look carried over. Raliv's DPS already tried Simple Lit.
+            if (shader == null && !simpleLit)
+            {
+                shader = PatchOnFallback(ctx, source, ref refusal, out var plain, out skippedShadowPasses,
+                    YapsShaderPatcher.Roles.Plug);
+                if (shader != null)
+                {
+                    patchSource = plain;
+                }
+            }
+            if (shader == null)
+            {
+                ctx.Report.Warning(Category, $"Could not add the deform to \"{source.name}\"",
+                    $"{refusal}. The plug converts as an ordinary mesh: it will look right and " +
+                    "simply will not bend.");
+                return null;
+            }
+
+            // Read the author's values off the original material before the
+            // patch repoints it; a Poiyomi material loses its TPS properties there.
+            var patched = YapsBaker.Apply(result, patchSource, shader, ctx.OutputDir + "/YAPS",
+                result.FromSkinnedMesh, key);
+            var unmapped = new List<string>();
+            var carried = YapsLegacyMap.Carry(source, patched, unmapped, result.Length, result.Radius);
+            if (legacy != YapsLegacyMap.Origin.None && legacy != YapsLegacyMap.Origin.YAPS)
+            {
+                YapsNativeBuilder.SwitchOffLegacyDeform(patched, legacy);
+            }
+            // Swapped-in materials need the bake too, or the plug goes rigid on
+            // that toggle. Done later in RepointSwappedMaterials: the clips here
+            // are not yet this conversion's copies.
+            PendingVariants.Add((renderer, slot, result, new[] { source, patchSource, patched }));
+            if (carried.Count > 0)
+            {
+                var system = legacy;
+                ctx.Report.Converted(Category,
+                    $"Carried {carried.Count} {system} {(carried.Count == 1 ? "setting" : "settings")} onto the YAPS plug",
+                    string.Join(", ", carried.ConvertAll(c => $"{c.From} → {c.To}")) +
+                    (unmapped.Count > 0
+                        ? $". No YAPS counterpart for: {string.Join(", ", unmapped)}"
+                        : ""));
+            }
+
+            // The plug component's overrun choice wins over the material's,
+            // since the component is what SPS's own tools edit.
+            string plugObject = AuthoredKey(ctx, plugRoot);
+            bool overrun = plugObject != null
+                           && YapsBakePrep.AuthoredOverrun.TryGetValue(plugObject, out bool authored)
+                ? authored
+                : true;
+            patched.SetFloat("_YAPS_Overrun", overrun ? 1f : 0f);
+
+            // In words, read before the bake hashes them.
+            if (plugObject != null && YapsBakePrep.AuthoredAnswers.TryGetValue(plugObject, out var answers))
+            {
+                patched.SetVector("_YAPS_TagInclude", YapsTags.Patterns(answers));
+                // Where the second plug on a shared mesh reads them.
+                patched.SetVector("_YAPS_TagInclude2", YapsTags.Patterns(answers));
+            }
+            if (plugObject != null && YapsBakePrep.AuthoredRefuses.TryGetValue(plugObject, out var refuses))
+            {
+                patched.SetVector("_YAPS_TagExclude", YapsTags.Patterns(refuses));
+            }
+            // The rules the author aimed at their OWN sockets, kept by name for
+            // the own-socket ticks, which are worked out once sockets exist.
+            if (plugObject != null)
+            {
+                YapsBakePrep.AuthoredSelfAnswers.TryGetValue(plugObject, out var selfAnswers);
+                YapsBakePrep.AuthoredSelfRefuses.TryGetValue(plugObject, out var selfRefuses);
+                YapsOwner.KeepSelfRules(patched, selfAnswers, selfRefuses,
+                    YapsBakePrep.AuthoredEntersOwnHips.Contains(plugObject));
+            }
+            // Keyed on the original, so a later plug on the slot finds it too.
+            ctx.YapsMaterialSwaps[(renderer, slot)] = (source, patched);
+            materials[slot] = patched;
+            renderer.sharedMaterials = materials;
+            return patched;
+        }
+
+        // A shader the patcher takes, for a material whose own will not, with the look carried
+        // over: the toolkit's rule for a plug and for a socket that is its own mesh. Null when that
+        // one refuses too, and refusal then says so.
+        static Shader PatchOnFallback(BridgeContext ctx, Material source, ref string refusal,
+            out Material plain, out int skippedShadowPasses, YapsShaderPatcher.Roles roles)
+        {
+            skippedShadowPasses = 0;
+            plain = YapsNativeBuilder.OnFallback(source, out string why);
+            if (plain == null)
+            {
+                refusal += "; and " + why;
+                return null;
+            }
+            string host = plain.shader.name.Replace('/', ' ');
+            var shader = YapsShaderPatcher.Patch(plain, ctx.Report,
+                out string plainRefusal, out skippedShadowPasses, roles: roles);
+            if (shader == null)
+            {
+                refusal += $"; and {host} refused too: " + plainRefusal;
+                return null;
+            }
+            // Unity's own source draws as Standard did, so only Simple Lit is an approximation.
+            if (plain.shader.name == YapsNativeBuilder.StandardName)
+                ctx.Report.Converted(Category, $"\"{source.name}\" wears YAPS Standard now",
+                    "Unity's Standard has no source to patch. YAPS Standard is the same shader from Unity's " +
+                    "published source, every setting carried over.");
+            else
+                ctx.Report.Approximated(Category, $"\"{source.name}\" wears YAPS Simple Lit now",
+                    $"Its shader could not take the deform ({refusal}). Colour, albedo, normal, metallic and " +
+                    "smoothness carried over.");
+            return shader;
+        }
+
+        // What YapsBakePrep keyed the author's own values by: the object the
+        // SPS component sat on, which survives as the parent of BakedSpsPlug.
+        static string AuthoredKey(BridgeContext ctx, Transform plugRoot) =>
+            plugRoot != null ? YapsBakePrep.PlugKey(plugRoot.parent, ctx.Target.transform) : null;
+
+        // The socket half of the tag carry. It travels in the spec because
+        // the rebuild runs later, on the ChilloutVR side of the defines. Keyed
+        // by the socket component's object, the parent of BakedSpsSocket.
+        static void CarryTags(BridgeContext ctx, Dictionary<Transform, YapsSocketRebuilder.Spec> specs)
+        {
+            int tagged = 0;
+            var words = new List<string>();
+            var unmatched = new List<string>();
+            foreach (var pair in specs)
+            {
+                if (pair.Key == null) continue;
+                string key = YapsBakePrep.SocketKey(pair.Key.parent, ctx.Target.transform);
+                if (key == null)
+                {
+                    // Unmatched: the component's default, never empty, which
+                    // every plug on the shared tag would refuse.
+                    pair.Value.Tags = new List<string> { YapsTags.Shared };
+                    unmatched.Add(ctx.PathInTarget(pair.Key.parent != null ? pair.Key.parent : pair.Key));
+                    continue;
+                }
+                if (!YapsBakePrep.AuthoredSocketTags.TryGetValue(key, out var tags)) continue;
+                pair.Value.Tags = new List<string>(tags);
+                tagged++;
+                foreach (string tag in tags) if (!words.Contains(tag)) words.Add(tag);
+            }
+            if (unmatched.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(unmatched.Count, "socket carries", "sockets carry")} only the shared tag",
+                    "The SPS socket each was baked from could not be found, so its own tags are unknown. The " +
+                    "shared tag is what an SPS socket has unless its author turned it off, so a plug that " +
+                    "answered anything still answers these: " + string.Join(", ", unmatched));
+            }
+            int plugs = YapsBakePrep.AuthoredAnswers.Count + YapsBakePrep.AuthoredRefuses.Count;
+            if (tagged == 0 && plugs == 0) return;
+
+            // The bake holds four per list; a dropped fifth must be reported.
+            int over = 0;
+            foreach (var list in YapsBakePrep.AuthoredAnswers.Values) over += YapsTags.Dropped(list);
+            foreach (var list in YapsBakePrep.AuthoredRefuses.Values) over += YapsTags.Dropped(list);
+            if (over > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(over, "tag", "tags")} past the first {YapsTags.PlugSlots} on a list were not carried",
+                    $"Only {YapsTags.PlugSlots} fit per list; sockets past that are treated as unlisted. Shorten "
+                    + "the list, or share one word across those sockets.");
+            }
+            ctx.Report.Converted(Category,
+                $"Carried the tags on {BridgeElements.Count(tagged, "socket", "sockets")} and {BridgeElements.Count(plugs, "plug rule list", "plug rule lists")}",
+                "Words as written: " + (words.Count == 0 ? "none on the sockets here" : string.Join(", ", words))
+                + ". Tags match by fingerprint, so two names can rarely read as one.");
+        }
+
+        static Renderer FindPlugRenderer(BridgeContext ctx, Transform plugRoot, out int plugVertices,
+            out Transform chainLevel)
+        {
+            Renderer best = null;
+            plugVertices = 0;
+            chainLevel = null;
+
+            // VRCFury's first rule: a renderer on the plug's object is the plug.
+            // Scoring by bone weight from there climbs to the hips.
+            var owner = plugRoot.parent;
+            if (owner != null && owner != ctx.Target.transform)
+            {
+                var onObject = owner.GetComponent<SkinnedMeshRenderer>();
+                if (onObject != null && onObject.sharedMesh != null)
+                {
+                    plugVertices = onObject.sharedMesh.vertexCount;
+                    // Set the level, or the body guard asks about null and a
+                    // component on the BODY's mesh object bakes the whole avatar.
+                    // A plug mesh object is not a humanoid bone, so it passes.
+                    chainLevel = owner;
+                    return onObject;
+                }
+            }
+
+            // VRCFury's second rule: climb ONCE, and at the first level where any
+            // mesh has vertices, take the mesh with most. Climbing per mesh let
+            // the body reach the hips and win by count; ten avatars baked whole.
+            var renderers = ctx.Target.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            for (var level = plugRoot; level != null && level != ctx.Target.transform.parent; level = level.parent)
+            {
+                foreach (var renderer in renderers)
+                {
+                    int count = YapsBaker.CountVerticesUnder(renderer, level);
+                    if (count > plugVertices)
+                    {
+                        plugVertices = count;
+                        best = renderer;
+                    }
+                }
+                if (best != null)
+                {
+                    chainLevel = level;
+                    return best;
+                }
+            }
+            return best;
+        }
+
+        // The bone whose scale is the plug's scale: the level the mesh was
+        // found at when that is one of the mesh's bones, else the topmost
+        // bone of the mesh beneath it, else the plug object's first bone
+        // ancestor. Null when the mesh has no bones there at all.
+        static Transform ChainRootOf(SkinnedMeshRenderer skin, Transform level, Transform plugRoot)
+        {
+            if (skin == null || skin.bones == null)
+            {
+                return null;
+            }
+            var bones = new HashSet<Transform>(skin.bones.Where(b => b != null));
+            if (level != null && bones.Contains(level))
+            {
+                return level;
+            }
+            if (level != null)
+            {
+                Transform top = null;
+                foreach (var b in bones)
+                {
+                    if (!b.IsChildOf(level))
+                    {
+                        continue;
+                    }
+                    // Topmost: no other bone of the mesh above it under the level.
+                    bool topmost = true;
+                    for (var at = b.parent; at != null && at != level; at = at.parent)
+                    {
+                        if (bones.Contains(at)) { topmost = false; break; }
+                    }
+                    if (topmost) { top = b; break; }
+                }
+                if (top != null)
+                {
+                    return top;
+                }
+            }
+            for (var at = plugRoot; at != null; at = at.parent)
+            {
+                if (bones.Contains(at))
+                {
+                    return at;
+                }
+            }
+            return null;
+        }
+
+        // The chain root and its bone children by path: a size slider scales
+        // one of them. The mirror reads it for the shader, the bake for its
+        // culling box.
+        static Dictionary<string, Transform> SizeBones(BridgeContext ctx, Transform chainRoot)
+        {
+            var bones = new Dictionary<string, Transform>();
+            void Bone(Transform t)
+            {
+                string bonePath = ctx.PathInTarget(t);
+                if (bonePath != null) bones[bonePath] = t;
+            }
+            if (chainRoot != null)
+            {
+                Bone(chainRoot);
+                for (int i = 0; i < chainRoot.childCount; i++)
+                {
+                    Bone(chainRoot.GetChild(i));
+                }
+            }
+            return bones;
+        }
+
+        // The humanoid bone an object IS, or null. The avatar root counts
+        // too: a chain found there is every bone the avatar has.
+        static string HumanoidBoneName(BridgeContext ctx, Transform level)
+        {
+            if (level == null)
+            {
+                return null;
+            }
+            if (level == ctx.Target.transform)
+            {
+                return "the avatar root";
+            }
+            var animator = ctx.TargetAnimator;
+            if (animator == null || !animator.isHuman)
+            {
+                return null;
+            }
+            for (var bone = HumanBodyBones.Hips; bone < HumanBodyBones.LastBone; bone++)
+            {
+                if (animator.GetBoneTransform(bone) == level)
+                {
+                    return bone.ToString();
+                }
+            }
+            return null;
+        }
+
+        // By plug vertices, never names (routinely "Body"). Every such submesh,
+        // biggest first: an unpatched tip slot stays rigid.
+        static List<int> MaterialSlotsOf(Renderer renderer, Transform plugRoot)
+        {
+            var found = new List<int>();
+            var skin = renderer as SkinnedMeshRenderer;
+            var mesh = skin != null ? skin.sharedMesh : null;
+            var plugVertex = mesh != null ? YapsSlotSplit.Mask(skin, plugRoot) : null;
+            if (plugVertex == null)
+            {
+                found.Add(0);
+                return found;
+            }
+
+            var hitsBySlot = new List<KeyValuePair<int, int>>();
+            for (int sub = 0; sub < mesh.subMeshCount; sub++)
+            {
+                var indices = mesh.GetTriangles(sub);
+                int hits = 0;
+                for (int i = 0; i < indices.Length; i++)
+                {
+                    if (indices[i] < plugVertex.Length && plugVertex[indices[i]])
+                    {
+                        hits++;
+                    }
+                }
+                if (hits > 0)
+                {
+                    hitsBySlot.Add(new KeyValuePair<int, int>(sub, hits));
+                }
+            }
+            hitsBySlot.Sort((a, b) => b.Value.CompareTo(a.Value));
+            foreach (var pair in hitsBySlot)
+            {
+                found.Add(pair.Key);
+            }
+            if (found.Count == 0)
+            {
+                found.Add(0);
+            }
+            return found;
+        }
+
+        static int MaterialSlotOf(Renderer renderer, Transform plugRoot) =>
+            MaterialSlotsOf(renderer, plugRoot)[0];
+
+        // A slot another shaft's plug already baked. One material holds one
+        // bend, so this plug gets its own slot on the original material.
+        static List<int> SplitShared(BridgeContext ctx, string where, Renderer renderer, Transform root,
+            List<int> slots, HashSet<int> split)
+        {
+            var skin = renderer as SkinnedMeshRenderer;
+            if (skin == null || skin.sharedMesh == null)
+            {
+                return slots;
+            }
+            var mine = YapsSlotSplit.Mask(skin, root);
+            var result = new List<int>();
+            foreach (int slot in slots)
+            {
+                bool shared = ctx.YapsPlugs.Any(p => p.Renderer == renderer && p.MaterialSlots.Contains(slot)
+                                                     && !YapsSlotSplit.SameShaft(mine, YapsSlotSplit.Mask(skin, p.Root)));
+                if (!shared)
+                {
+                    result.Add(slot);
+                    continue;
+                }
+                ctx.YapsMaterialSwaps.TryGetValue((renderer, slot), out var swap);
+                var original = swap.from != null ? swap.from : skin.sharedMaterials[slot];
+                int added = YapsSlotSplit.Split(skin, root, slot, mine, original, ctx.OutputDir + "/YAPS", out string why);
+                if (added < 0)
+                {
+                    ctx.Report.Warning(Category, $"The plug at {where} shares a material with another plug",
+                        $"Both are on \"{renderer.name}\" slot {slot}, on different shafts, and one material holds " +
+                        $"one plug's bend, so this one takes it over and the other will not bend. It could not " +
+                        $"be given a slot of its own: {why}.");
+                    result.Add(slot);
+                    continue;
+                }
+                ctx.Report.Converted(Category, $"The plug at {where} got a material slot of its own",
+                    $"It shared \"{renderer.name}\" slot {slot} with a plug on another shaft, and one material " +
+                    $"holds one plug's bend. Its triangles moved to slot {added} on a copy of the mesh, so both bend, " +
+                    "each with its own size animation and tag chooser.");
+                result.Add(added);
+                split.Add(added);
+            }
+            return result;
+        }
+
+        // --- the sockets -----------------------------------------------
+
+        // Fury's toggle drove the deleted atlas; pointing it at the socket keeps
+        // one entry. A socket a clip already switches is left alone.
+        static void WireSocketToggles(BridgeContext ctx, List<Transform> socketRoots)
+        {
+            // Only layers that can assert count as owning a path; Fury's
+            // weight-zero exclusivity layers do not.
+            var switchable = YapsSocketRebuilder.Switchable(ctx);
+
+            int wired = 0;
+            var unwired = new List<string>();
+            foreach (var socket in socketRoots)
+            {
+                if (socket == null) continue;
+                string path = ctx.PathInTarget(socket);
+                if (switchable.Contains(path)) continue;
+                string toggle = ToggleFor(ctx, socket);
+                if (toggle != null && AddLightToggle(ctx, toggle, new List<string> { path }))
+                {
+                    wired++;
+                }
+                else
+                {
+                    unwired.Add(socket.name);
+                }
+            }
+            if (wired > 0)
+            {
+                ctx.Report.Converted(Category, $"{BridgeElements.Count(wired, "socket menu toggle", "socket menu toggles")} wired to their sockets",
+                    "VRCFury's socket toggles drove its deleted atlas, so the menu looked right and " +
+                    "did nothing. Each is now wired to its whole socket, lights, pointers and depth " +
+                    "trigger together, so \"one socket at a time\" is the wearer's choice again.");
+            }
+            if (unwired.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(unwired.Count, "socket has no menu toggle and stays", "sockets have no menu toggle and stay")} on",
+                    string.Join(", ", unwired) + ". No menu entry matched them, so they are " +
+                    "always active. The marker light budget still caps how many carry lights.");
+            }
+        }
+
+        // The menu entry that toggles this socket.
+        static string ToggleFor(BridgeContext ctx, Transform socket)
+        {
+            var names = ctx.CvrAvatar.avatarSettings.settings
+                .Select(e => e.machineName)
+                .Where(n => !string.IsNullOrEmpty(n))
+                .ToList();
+
+            // The socket and its author object, no higher: climbing reached
+            // bones, and a "Head" accessory entry prefix-matched them. A bone
+            // parent means ArmatureLink merged the author's object away.
+            var owner = socket.parent;
+            foreach (var at in new[] { socket, owner })
+            {
+                if (at == null || (at == owner && HumanoidBoneName(ctx, at) != null)) continue;
+                string mine = Normalise(at.name);
+                if (mine.Length < 3)
+                {
+                    continue;
+                }
+                // Longest match first, so a name beats its own prefix.
+                string best = names
+                    .Where(n => mine.StartsWith(Normalise(n), StringComparison.Ordinal)
+                                && Normalise(n).Length >= 3)
+                    .OrderByDescending(n => Normalise(n).Length)
+                    .FirstOrDefault();
+                if (best != null)
+                {
+                    return best;
+                }
+            }
+            return null;
+        }
+
+        // "[VF958] Blowjob", "VF80_Blowjob" and "Handjob Left" must all meet
+        // "HandjobLeft". VRCFury's numbering is noise; "Target" is object-only.
+        static string Normalise(string name)
+        {
+            string clean = System.Text.RegularExpressions.Regex.Replace(name, @"\[VF\d+\]", "");
+            clean = System.Text.RegularExpressions.Regex.Replace(clean, @"^VF\d+_", "");
+            clean = clean.Replace("Target", "").Replace(" ", "").Replace("_", "");
+            return clean;
+        }
+
+        // Two states, not a blend tree: m_IsActive is a switch.
+        static bool AddLightToggle(BridgeContext ctx, string parameter, List<string> lightPaths)
+        {
+            var controller = ctx.MergedController;
+            var declared = controller.parameters.FirstOrDefault(p => p.name == parameter);
+            if (declared == null || lightPaths.Count == 0)
+            {
+                return false;
+            }
+
+            var on = ClipFor("YAPS lights on", lightPaths, 1f);
+            var off = ClipFor("YAPS lights off", lightPaths, 0f);
+            var machine = new UnityEditor.Animations.AnimatorStateMachine
+            {
+                name = parameter + " lights",
+                hideFlags = HideFlags.HideInHierarchy,
+            };
+
+            string path = AssetDatabase.GetAssetPath(controller);
+            if (!string.IsNullOrEmpty(path))
+            {
+                // Built in memory; it must join the asset or Unity drops it on save.
+                AssetDatabase.AddObjectToAsset(machine, controller);
+                AssetDatabase.AddObjectToAsset(on, controller);
+                AssetDatabase.AddObjectToAsset(off, controller);
+            }
+
+            // Starts On, as the socket was before its entry reached it.
+            var onState = machine.AddState("On");
+            onState.writeDefaultValues = false;
+            onState.motion = on;
+            var offState = machine.AddState("Off");
+            offState.writeDefaultValues = false;
+            offState.motion = off;
+            machine.defaultState = onState;
+
+            var toOn = offState.AddTransition(onState);
+            var toOff = onState.AddTransition(offState);
+            foreach (var t in new[] { toOn, toOff })
+            {
+                t.hasExitTime = false;
+                t.duration = 0f;
+            }
+            if (declared.type == AnimatorControllerParameterType.Bool)
+            {
+                toOn.AddCondition(UnityEditor.Animations.AnimatorConditionMode.If, 0f, parameter);
+                toOff.AddCondition(UnityEditor.Animations.AnimatorConditionMode.IfNot, 0f, parameter);
+            }
+            else
+            {
+                toOn.AddCondition(UnityEditor.Animations.AnimatorConditionMode.Greater, 0.5f, parameter);
+                toOff.AddCondition(UnityEditor.Animations.AnimatorConditionMode.Less, 0.5f, parameter);
+            }
+
+            var layers = controller.layers.ToList();
+            layers.Add(new UnityEditor.Animations.AnimatorControllerLayer
+            {
+                name = "YAPS " + parameter + " lights",
+                defaultWeight = 1f,
+                stateMachine = machine,
+            });
+            controller.layers = layers.ToArray();
+            return true;
+        }
+
+        static AnimationClip ClipFor(string name, List<string> paths, float active)
+        {
+            var clip = new AnimationClip { name = name };
+            foreach (string path in paths)
+            {
+                // The object, for every link in the chain; the Light
+                // components are already enabled.
+                clip.SetCurve(path, typeof(GameObject), "m_IsActive",
+                    AnimationCurve.Constant(0f, 1f / 60f, active));
+            }
+            return clip;
+        }
+
+        // A socket nothing can find: no pointer carrying a socket tag and no
+        // marker light. One with either is finished as far as a plug cares.
+        //
+        // Socket deform. A shape driven by both animator and shader applies
+        // twice, so with no published depth (-1) the shader reads a light.
+        static void ConvertSockets(BridgeContext ctx, List<Transform> socketRoots)
+        {
+            if (socketRoots.Count == 0)
+            {
+                return;
+            }
+
+            int deformed = 0, alreadyAnimated = 0, noShapes = 0, onBody = 0;
+            var failures = new List<string>();
+
+            foreach (var socketRoot in socketRoots)
+            {
+                var renderer = SocketRenderer(socketRoot);
+                if (renderer == null || MeshOf(renderer) == null
+                    || MeshOf(renderer).blendShapeCount == 0)
+                {
+                    // No shapes to open with, but still a socket to retune.
+                    YapsNativeBuilder.AdoptSocket(socketRoot, renderer, null, null);
+                    noShapes++;
+                    continue;
+                }
+
+                // Depth is measured from the mesh origin, so only a mesh whose
+                // origin IS the socket opens right. Body meshes keep reactions.
+                if (!YapsNativeBuilder.MeshIsTheSocket(renderer, socketRoot))
+                {
+                    YapsNativeBuilder.AdoptSocket(socketRoot, renderer, null, null);
+                    onBody++;
+                    continue;
+                }
+
+                bool animatorDrivesIt = AnimatorDrivesShapes(ctx, renderer);
+                int slot = MaterialSlotOf(renderer, socketRoot);
+
+                // Socket and plug on the same renderer and slot share the
+                // material; the shader carries both deforms behind their own enables.
+                var shared = ctx.YapsPlugs.FirstOrDefault(
+                    p => p.Renderer == renderer && p.MaterialSlot == slot);
+
+                Material material;
+                List<string> bakedShapes;
+                var already = renderer.sharedMaterials.Length > slot ? renderer.sharedMaterials[slot] : null;
+                if (shared != null)
+                {
+                    material = shared.Material;
+                    bakedShapes = shared.Shapes;
+                    // _YAPS_Enabled stays 1: this material is a working plug too.
+                }
+                else if (already != null && already.HasProperty("_YAPS_Bake"))
+                {
+                    // A second socket on a mesh the first already baked:
+                    // one material, one set of stages, shared.
+                    material = already;
+                    bakedShapes = null;
+                }
+                else
+                {
+                    var result = YapsBaker.Bake(renderer, socketRoot, ctx.OutputDir + "/YAPS",
+                        null, out string failure, objectFrame: true);
+                    if (result == null)
+                    {
+                        failures.Add($"{socketRoot.name}: {failure}");
+                        continue;
+                    }
+                    bakedShapes = result.Shapes;
+
+                    var materials = renderer.sharedMaterials;
+                    if (slot < 0 || slot >= materials.Length || materials[slot] == null)
+                    {
+                        failures.Add($"{socketRoot.name}: its mesh has no material on the socket's slot");
+                        continue;
+                    }
+                    var patchSource = materials[slot];
+                    var patched = YapsShaderPatcher.Patch(patchSource, ctx.Report, out string refusal, out _,
+                        roles: YapsShaderPatcher.Roles.Socket);
+                    // The mesh is the socket's own, so the fallback repaints only the
+                    // socket, as the toolkit does. A body never reaches here.
+                    if (patched == null)
+                    {
+                        patched = PatchOnFallback(ctx, materials[slot], ref refusal, out var plain, out _,
+                            YapsShaderPatcher.Roles.Socket);
+                        patchSource = plain;
+                    }
+                    if (patched == null)
+                    {
+                        failures.Add($"{socketRoot.name}: {refusal}");
+                        continue;
+                    }
+
+                    material = YapsBaker.Apply(result, patchSource, patched,
+                        ctx.OutputDir + "/YAPS", renderer is SkinnedMeshRenderer);
+                    // No plug on this mesh: the plug half stays asleep.
+                    material.SetFloat("_YAPS_Enabled", 0f);
+
+                    ctx.YapsMaterialSwaps[(renderer, slot)] = (materials[slot], material);
+                    materials[slot] = material;
+                    renderer.sharedMaterials = materials;
+                }
+
+                material.SetFloat("_YAPS_SocketPower", 1f);
+                // -1, never 0. Zero is "a plug is here, not yet in"; -1 is
+                // "nothing told me", which lets the shader fall back to lights.
+                material.SetFloat("_YAPS_SocketDepth", -1f);
+                // Self-exclusion only where the wearer's plug rests on the socket
+                // (the crotch case). Elsewhere it judges ownership by the nearest
+                // hip, which can be a stranger's.
+                bool ownPlugRests = ctx.YapsPlugs.Any(
+                    p => Vector3.Distance(p.Origin, socketRoot.position) <= p.Length + 0.1f);
+                // The conversion pose is one pose: a limb socket near the wearer's
+                // plug at conversion would refuse a stranger's plug in their lap.
+                // The toolkit bake refuses this case too.
+                // Every mesh here is the socket's own; the body ones left above.
+                bool undecidable = YapsNativeBuilder.RidesAMovingLimb(socketRoot);
+                material.SetFloat("_YAPS_SocketNoSelfExclude",
+                    ownPlugRests && !undecidable ? 0f : 1f);
+
+                // The authoring component, filled in from what was just built.
+                YapsNativeBuilder.AdoptSocket(socketRoot, renderer, material, bakedShapes);
+
+                deformed++;
+                if (animatorDrivesIt)
+                {
+                    alreadyAnimated++;
+                }
+            }
+
+            if (deformed > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(deformed, "socket", "sockets")} can now deform around a plug",
+                    "Blendshapes staged by depth in the socket's shader, so DPS plugs open them too. " +
+                    (alreadyAnimated > 0 ? $"{alreadyAnimated} keep their contact as well." : ""));
+            }
+            if (onBody > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(onBody, "socket keeps its", "sockets keep their")} reactions on the animator",
+                    "Their mesh is the body, so they keep their contact-driven shapes, made local.");
+            }
+            if (noShapes > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(noShapes, "socket has", "sockets have")} no blendshapes to deform",
+                    "Nothing was changed for these. A socket deform reshapes the author's own " +
+                    "blendshapes, so a socket built without any has nothing to open with; its " +
+                    "contacts and marker lights work exactly as before.");
+            }
+            if (failures.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(failures.Count, "socket", "sockets")} could not be given a deform",
+                    "Everything else about them is untouched and they still work as sockets: " +
+                    "they simply will not reshape around a plug. " + string.Join("; ", failures));
+            }
+        }
+
+        // The renderer wearing this socket's mesh, usually a parent: authors
+        // hang the socket off the body they want reshaped.
+        static Renderer SocketRenderer(Transform socketRoot)
+        {
+            var own = socketRoot.GetComponentInChildren<Renderer>(true);
+            if (own != null && MeshOf(own) != null && MeshOf(own).blendShapeCount > 0)
+            {
+                return own;
+            }
+            for (var at = socketRoot.parent; at != null; at = at.parent)
+            {
+                var renderer = at.GetComponent<Renderer>();
+                if (renderer != null && MeshOf(renderer) != null
+                    && MeshOf(renderer).blendShapeCount > 0)
+                {
+                    return renderer;
+                }
+            }
+            return null;
+        }
+
+        static Mesh MeshOf(Renderer renderer)
+        {
+            if (renderer is SkinnedMeshRenderer skin)
+            {
+                return skin.sharedMesh;
+            }
+            var filter = renderer.GetComponent<MeshFilter>();
+            return filter != null ? filter.sharedMesh : null;
+        }
+
+        // Informational only: the shader stands down on depth, not on this.
+        static bool AnimatorDrivesShapes(BridgeContext ctx, Renderer renderer)
+        {
+            if (ctx.MergedController == null)
+            {
+                return false;
+            }
+            string path = ctx.PathInTarget(renderer.transform);
+            foreach (var clip in ctx.MergedController.animationClips)
+            {
+                if (clip == null)
+                {
+                    continue;
+                }
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.path == path
+                        && binding.propertyName.StartsWith("blendShape.",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // DPS and TPS through the YAPS window's own Build, so a reconvert keeps
+        // the window's upgrade.
+        public static void UpgradeLegacy(BridgeContext ctx)
+        {
+            if (!LegacyPending) return;
+            LegacyPending = false;
+            var scan = YapsScanner.Scan(ctx.Target);
+            var legacy = scan.Plugs.Concat(scan.Sockets).Where(f => !f.IsYapsAlready).ToList();
+            if (legacy.Count == 0) return;
+            // Beside SPS, only what it left. Build rebuilds every plug and socket, which would
+            // rename the SPS sockets and remake reactions they keep exactly as authored.
+            var only = SpsConverted ? legacy.Where(f => f.Root != null).Select(f => f.Root).ToList() : null;
+            var lines = YapsNativeBuilder.BuildAvatar(ctx.Target, out string headline, only);
+            var bad = lines.Where(l => l.StartsWith("✗") || l.Contains("⚠")).ToList();
+            var good = lines.Except(bad).Select(l => l.TrimStart('✓', ' ')).ToList();
+            ctx.Report.Converted(Category, "Upgraded this avatar's older penetration setup to YAPS",
+                headline + (good.Count > 0 ? " " + string.Join("; ", good) : ""));
+            foreach (var line in bad)
+            {
+                ctx.Report.Warning(Category, "Part of the YAPS upgrade did not finish", line.TrimStart('✗', '⚠', ' '));
+            }
+        }
+
+        // A curve that binds to nothing does nothing in game, silently.
+        public static void CheckCurveBindings(BridgeContext ctx)
+        {
+            var dead = YapsToggles.DeadBindings(ctx.Target, ctx.MergedController);
+            if (dead.Count == 0) return;
+            ctx.Report.Warning(Category, $"{BridgeElements.Count(dead.Count, "penetration animation curve changes", "penetration animation curves change")} nothing",
+                "Unity cannot attach them to anything on the avatar, so the menu rows or size changes they " +
+                "belong to do nothing in game. Please report this with the conversion report. " +
+                string.Join("; ", dead.Take(10)) + (dead.Count > 10 ? $"; and {dead.Count - 10} more" : ""));
+        }
+
+        // --- the atlas's animation ----------------------------------------
+
+        // RemoveAtlasJunk deletes the atlas objects early, before the merge.
+        // The curves that animated them go late, once the clips are copies.
+        public static void StripAtlasCurves(BridgeContext ctx)
+        {
+            if (!ctx.Settings.convertYapsSystems || ctx.MergedController == null)
+            {
+                return;
+            }
+
+            int removed = 0;
+            var seen = new HashSet<AnimationClip>();
+            foreach (var clip in ctx.MergedController.animationClips)
+            {
+                if (clip == null || !seen.Add(clip))
+                {
+                    continue;
+                }
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (AddressesAtlas(binding.path))
+                    {
+                        AnimationUtility.SetEditorCurve(clip, binding, null);
+                        removed++;
+                    }
+                }
+                foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                {
+                    if (AddressesAtlas(binding.path))
+                    {
+                        AnimationUtility.SetObjectReferenceCurve(clip, binding, null);
+                        removed++;
+                    }
+                }
+            }
+
+            if (removed > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Removed {BridgeElements.Count(removed, "animation curve", "animation curves")} that drove the screen atlas",
+                    "The socket toggles also wrote each socket's identity, tags and shape into the " +
+                    "atlas marker's material, so VRChat's shader could read them back off the " +
+                    "screen. The marker is gone and those writes went to nothing.");
+            }
+        }
+
+        // A TOGGLE THAT SWAPS THE MATERIAL PUTS THE ORIGINAL BACK, with no
+        // deform or bake: the plug straightens in play mode. Scoped to the
+        // renderer and slot repointed, since other meshes wearing the original
+        // would bend wrongly.
+        public static void RepointSwappedMaterials(BridgeContext ctx)
+        {
+            if (ctx.MergedController == null
+                || (ctx.YapsMaterialSwaps.Count == 0 && PendingVariants.Count == 0))
+            {
+                return;
+            }
+
+            // Keyed by the ORIGINAL material, not slot: swap clips move
+            // materials between slots, and slot matching left the part rigid.
+            // Still per RENDERER, where moving between its own slots is safe.
+            var bySlot = new Dictionary<string, Dictionary<int, (Material from, Material to)>>();
+            var byMaterial = new Dictionary<string, Dictionary<Material, Material>>();
+            foreach (var pair in ctx.YapsMaterialSwaps)
+            {
+                var renderer = pair.Key.renderer;
+                if (renderer == null || pair.Value.from == null || pair.Value.to == null)
+                {
+                    continue;
+                }
+                string path = AnimationUtility.CalculateTransformPath(
+                    renderer.transform, ctx.Target.transform);
+                if (!bySlot.TryGetValue(path, out var slots))
+                {
+                    bySlot[path] = slots = new Dictionary<int, (Material, Material)>();
+                    byMaterial[path] = new Dictionary<Material, Material>();
+                }
+                slots[pair.Key.slot] = pair.Value;
+
+                // Baked twice on one mesh is ambiguous: null, and the slot route answers.
+                var mats = byMaterial[path];
+                mats[pair.Value.from] = mats.TryGetValue(pair.Value.from, out var had)
+                                        && had != pair.Value.to
+                    ? null
+                    : pair.Value.to;
+            }
+
+            int repointed = 0;
+            var seen = new HashSet<AnimationClip>();
+            foreach (var clip in ctx.MergedController.animationClips)
+            {
+                if (clip == null || !seen.Add(clip))
+                {
+                    continue;
+                }
+                foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                {
+                    if (!bySlot.TryGetValue(binding.path, out var slots))
+                    {
+                        continue;
+                    }
+                    int slot = Yaps.YapsSwapFollow.SlotIndex(binding.propertyName);
+                    if (slot < 0)
+                    {
+                        continue;
+                    }
+                    var swaps = byMaterial[binding.path];
+                    var keys = AnimationUtility.GetObjectReferenceCurve(clip, binding);
+                    if (keys == null)
+                    {
+                        continue;
+                    }
+                    bool touched = false;
+                    for (int i = 0; i < keys.Length; i++)
+                    {
+                        var was = keys[i].value as Material;
+                        if (was == null)
+                        {
+                            continue;
+                        }
+                        // The slot the bake touched answers first and exactly. The material map
+                        // covers a clip that moves a material to another slot of the same mesh,
+                        // and stands down where one original was baked more than once here.
+                        Material to = null;
+                        if (slots.TryGetValue(slot, out var swap) && swap.from == was)
+                        {
+                            to = swap.to;
+                        }
+                        else if (swaps.TryGetValue(was, out var wide))
+                        {
+                            to = wide;
+                        }
+                        if (to == null)
+                        {
+                            continue;
+                        }
+                        keys[i].value = to;
+                        touched = true;
+                        repointed++;
+                    }
+                    if (touched)
+                    {
+                        AnimationUtility.SetObjectReferenceCurve(clip, binding, keys);
+                    }
+                }
+            }
+
+            // Repointed as baked, so no key is baked twice. Each copies its
+            // slot's finished material (flags, ticks, tags, knobs), then is
+            // remembered on the plug so later builds keep it current.
+            int variantKeys = 0;
+            var plugs = ctx.Target.GetComponentsInChildren<YapsPlug>(true);
+            foreach (var (renderer, slot, result, known) in PendingVariants)
+            {
+                if (renderer == null) continue;
+                string path = AnimationUtility.CalculateTransformPath(renderer.transform, ctx.Target.transform);
+                var primary = ctx.YapsMaterialSwaps.TryGetValue((renderer, slot), out var swap) ? swap.to : null;
+                var owner = primary != null ? plugs.FirstOrDefault(p => YapsOwner.MaterialsOf(p).Contains(primary)) : null;
+                foreach (var (variant, baked) in Yaps.YapsSwapFollow.BakeVariants(renderer, slot, result,
+                             ctx.OutputDir + "/YAPS", ctx.MergedController.animationClips, ctx.Report, primary, known))
+                {
+                    ctx.YapsVariantSwaps.Add((renderer, slot, variant, baked));
+                    variantKeys += Yaps.YapsSwapFollow.RepointInClips(ctx.MergedController.animationClips,
+                        path, slot, variant, baked);
+                    Yaps.YapsSwapFollow.Remember(owner, renderer, slot, baked);
+                }
+            }
+            PendingVariants.Clear();
+
+            if (repointed > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Pointed {BridgeElements.Count(repointed, "material swap", "material swaps")} at the baked material",
+                    "Otherwise they would swap the unbaked material back in and the plug would straighten.");
+            }
+            if (variantKeys > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Baked {BridgeElements.Count(ctx.YapsVariantSwaps.Count, "alternate material", "alternate materials")} the animator swaps in",
+                    "So the plug still bends while an alternate skin is on.");
+            }
+        }
+
+        // The deletion's own test, so a curve goes exactly when its object or
+        // an ancestor was deleted. No hint holds a slash, so the whole path
+        // contains one only where a segment does.
+        static bool AddressesAtlas(string path) => !string.IsNullOrEmpty(path) && IsAtlasJunk(path);
+
+        // --- auto socket mode --------------------------------------------
+
+        // VRCFury's auto mode switches on Current - Active > 0, no hysteresis.
+        // Proximity is 0..1 over a 1 m sphere, so 0.05 is 5 cm of preference.
+        const float AutoModeMargin = 0.05f;
+
+        public static void SteadyAutoMode(BridgeContext ctx)
+        {
+            if (!ctx.Settings.convertYapsSystems || ctx.MergedController == null)
+            {
+                return;
+            }
+
+            int changed = 0;
+            foreach (var layer in ctx.MergedController.layers)
+            {
+                if (layer.stateMachine == null)
+                {
+                    continue;
+                }
+                foreach (var child in layer.stateMachine.states)
+                {
+                    var state = child.state;
+                    if (state == null)
+                    {
+                        continue;
+                    }
+                    foreach (var transition in state.transitions)
+                    {
+                        if (transition == null || transition.destinationState == null
+                            || !transition.destinationState.name.StartsWith("Switch To ", StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+                        // The condition is VRCFury's "Current - Active" DBT
+                        // subtraction; match on shape rather than on a Fury id.
+                        var conditions = transition.conditions;
+                        bool touched = false;
+                        for (int i = 0; i < conditions.Length; i++)
+                        {
+                            var c = conditions[i];
+                            if (c.mode == UnityEditor.Animations.AnimatorConditionMode.Greater
+                                && Mathf.Approximately(c.threshold, 0f)
+                                && c.parameter.Contains("AutoCurrentDist")
+                                && c.parameter.Contains("AutoActiveDist"))
+                            {
+                                c.threshold = AutoModeMargin;
+                                conditions[i] = c;
+                                touched = true;
+                            }
+                        }
+                        if (touched)
+                        {
+                            transition.conditions = conditions;
+                            changed++;
+                        }
+                    }
+                }
+            }
+
+            if (changed > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Auto socket mode switches only for a clearly nearer socket ({BridgeElements.Count(changed, "transition", "transitions")})",
+                    $"A socket must be about {AutoModeMargin * 100:0} cm nearer to take over, so close sockets " +
+                    "no longer flicker.");
+            }
+        }
+
+        // --- shape curves, atlas objects ---------------------------------
+
+        // A vertex shader cannot read a blendshape weight or a bone's scale,
+        // so each plug shape curve is mirrored onto the material, and the
+        // chain root's scale curve onto the bake scale. Late, on owned copies.
+        public static void MirrorShapeCurves(BridgeContext ctx)
+        {
+            if (!ctx.Settings.convertYapsSystems || ctx.YapsPlugs.Count == 0
+                || ctx.MergedController == null)
+            {
+                return;
+            }
+
+            int written = 0, scaled = 0;
+            var missed = new SortedSet<string>(StableSampleOrder.Instance);
+            var clips = YapsCurveMirror.ClipsOf(ctx.MergedController).ToList();
+            foreach (var plug in ctx.YapsPlugs)
+            {
+                var bones = SizeBones(ctx, plug.ChainRoot);
+
+                // Every mesh of the plug, or a resized plug tears where one
+                // mesh's deform took the new size and the other's did not.
+                // The lane and shape count this plug's material on that mesh was given.
+                void Mirror(Renderer renderer, Material mine, List<string> shapes, List<string> moving)
+                {
+                    string path = ctx.PathInTarget(renderer.transform);
+                    int lane = YapsBaker.LaneOf(mine);
+                    if (lane > 0 && mine != null)
+                        shapes = shapes.Take(Mathf.RoundToInt(mine.GetFloat("_YAPS_ShapeCount"))).ToList();
+                    if (shapes.Count > 0)
+                    {
+                        written += YapsCurveMirror.MirrorShapes(clips, path, renderer, shapes, moving, missed, lane);
+                    }
+                    if (bones.Count > 0)
+                    {
+                        scaled += YapsCurveMirror.MirrorBoneScale(clips, bones, path, renderer, plug.Rotation, lane);
+                    }
+                }
+                Mirror(plug.Renderer, plug.Material, plug.Shapes, plug.MovingShapes);
+                foreach (var mesh in plug.Extras)
+                {
+                    var slots = mesh.Renderer != null ? mesh.Renderer.sharedMaterials : new Material[0];
+                    var mine = mesh.Slots.Where(i => i >= 0 && i < slots.Length).Select(i => slots[i]).FirstOrDefault(m => m != null);
+                    Mirror(mesh.Renderer, mine, mesh.Shapes, mesh.MovingShapes);
+                }
+            }
+
+            if (written > 0)
+            {
+                ctx.Report.Converted(Category, $"Mirrored {BridgeElements.Count(written, "blendshape curve", "blendshape curves")} onto the plug",
+                    "So the deform follows the plug's shapes, such as a size slider.");
+            }
+            if (scaled > 0)
+            {
+                ctx.Report.Converted(Category, $"Mirrored {BridgeElements.Count(scaled, "bone scale curve", "bone scale curves")} onto the plug",
+                    "So a size or hyper toggle that scales the bone scales the bend too.");
+            }
+            if (missed.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(missed.Count, "animated plug blendshape is", "animated plug blendshapes are")} not in the bake",
+                    $"{string.Join(", ", missed.Take(8))}{(missed.Count > 8 ? ", …" : "")}: past the " +
+                    $"{YapsBaker.MaxShapes} that move it most. The bend is slightly off while they are raised.");
+            }
+        }
+
+        static void RemoveAtlasJunk(BridgeContext ctx)
+        {
+            var doomed = ctx.Target.GetComponentsInChildren<Transform>(true)
+                .Where(t => t != null && t != ctx.Target.transform
+                            && IsAtlasJunk(t.name))
+                .OrderBy(Depth)
+                .ToList();
+            if (doomed.Count == 0)
+            {
+                return;
+            }
+
+            int removed = 0;
+            foreach (var transform in doomed)
+            {
+                if (transform != null)
+                {
+                    UnityEngine.Object.DestroyImmediate(transform.gameObject);
+                    removed++;
+                }
+            }
+            ctx.Report.Converted(Category, $"Removed {BridgeElements.Count(removed, "screen-atlas object", "screen-atlas objects")}",
+                "VRChat's version, which nothing here reads; left in, they draw into the view.");
+        }
+
+        static int Depth(Transform t)
+        {
+            int depth = 0;
+            while (t.parent != null)
+            {
+                depth++;
+                t = t.parent;
+            }
+            return depth;
+        }
+
+        // StartsWith, never Contains: the first-person exclusion object is
+        // named "FPRExclusion_BakedSpsSocket" and is not a socket.
+        //
+        // Through Fury's ID prefix: ArmatureLink renames a moved socket
+        // "[VF724] BakedSpsSocket".
+        static List<Transform> Named(BridgeContext ctx, string needle) =>
+            ctx.Target.GetComponentsInChildren<Transform>(true)
+                .Where(t => t != null && YapsScanner.NameStarts(t.name, needle))
+                .ToList();
+    }
+}
+#endif

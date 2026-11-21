@@ -1,0 +1,1242 @@
+#if UNITY_EDITOR && VRC_SDK_VRCSDK3
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using VRC.SDK3.Avatars.Components;
+using VRC.SDK3.Avatars.ScriptableObjects;
+using ABI.CCK.Components;
+using ABI.CCK.Scripts;
+
+namespace CVR.CCKEditor.Tools
+{
+    public class VRCAvatarToCVRConverter : EditorWindow
+    {
+        private GameObject targetAvatar;
+        private bool convertViewVoice = true;
+        private bool convertEyeLook = true;
+        private bool convertLipSync = true;
+        private bool convertParameters = true;
+        private bool convertPhysBones = true;
+        private bool convertAnimator = true;
+        private bool convertLocomotion = true;
+
+        [MenuItem("ChilloutVR CCK/Utilities/VRChat to CVR Avatar Converter", false, 300)]
+        public static void ShowWindow()
+        {
+            var window = GetWindow<VRCAvatarToCVRConverter>("VRC to CVR Converter");
+            window.titleContent = new GUIContent("VRC to CVR Converter");
+            window.minSize = new Vector2(450, 400);
+            window.Show();
+        }
+
+        private void OnGUI()
+        {
+            // Title
+            EditorGUILayout.BeginVertical(EditorStyles.inspectorDefaultMargins);
+            EditorGUILayout.Space();
+            
+            var titleStyle = new GUIStyle(EditorStyles.boldLabel)
+            {
+                fontSize = 16,
+                alignment = TextAnchor.MiddleCenter
+            };
+            GUILayout.Label("VRChat to CVR Avatar Converter", titleStyle);
+            EditorGUILayout.Space();
+
+            EditorGUILayout.HelpBox(
+                "This utility helps you automatically transfer your VRChat avatar settings " +
+                "(view position, eye look, blinking, lip sync, expression parameters, and PhysBones) " +
+                "to ChilloutVR CCK components.",
+                MessageType.Info
+            );
+
+            EditorGUILayout.Space();
+
+            // Avatar Selection
+            GUILayout.Label("Avatar Selection", EditorStyles.boldLabel);
+            EditorGUI.BeginChangeCheck();
+            targetAvatar = (GameObject)EditorGUILayout.ObjectField(
+                "Target Avatar",
+                targetAvatar,
+                typeof(GameObject),
+                true
+            );
+            if (EditorGUI.EndChangeCheck() && targetAvatar != null)
+            {
+                // Auto-select based on scene selection if possible
+                if (targetAvatar.GetComponent<VRCAvatarDescriptor>() == null)
+                {
+                    var parentDescriptor = targetAvatar.GetComponentInParent<VRCAvatarDescriptor>();
+                    if (parentDescriptor != null)
+                    {
+                        targetAvatar = parentDescriptor.gameObject;
+                    }
+                }
+            }
+
+            if (targetAvatar == null)
+            {
+                // Try to auto-populate from current selection
+                if (Selection.activeGameObject != null)
+                {
+                    var descriptor = Selection.activeGameObject.GetComponentInParent<VRCAvatarDescriptor>();
+                    if (descriptor != null)
+                    {
+                        targetAvatar = descriptor.gameObject;
+                    }
+                }
+            }
+
+            if (targetAvatar != null)
+            {
+                var descriptor = targetAvatar.GetComponent<VRCAvatarDescriptor>();
+                if (descriptor == null)
+                {
+                    EditorGUILayout.HelpBox("The selected GameObject does not have a VRCAvatarDescriptor!", MessageType.Error);
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox($"Ready to convert avatar: '{targetAvatar.name}'", MessageType.Info);
+                }
+            }
+            else
+            {
+                EditorGUILayout.HelpBox("Select a GameObject with a VRCAvatarDescriptor in the hierarchy.", MessageType.Warning);
+            }
+
+            EditorGUILayout.Space();
+
+            // Conversion Options
+            GUILayout.Label("Conversion Options", EditorStyles.boldLabel);
+            convertViewVoice = EditorGUILayout.ToggleLeft(" Convert View & Voice Positions", convertViewVoice);
+            convertEyeLook = EditorGUILayout.ToggleLeft(" Convert Eye Look & Blinking Settings", convertEyeLook);
+            convertLipSync = EditorGUILayout.ToggleLeft(" Convert Lip Sync / Visemes", convertLipSync);
+            convertParameters = EditorGUILayout.ToggleLeft(" Convert Expression Parameters to AAS Settings", convertParameters);
+            convertPhysBones = EditorGUILayout.ToggleLeft(" Convert PhysBones to DynamicBones (Requires DynamicBones asset)", convertPhysBones);
+            convertAnimator = EditorGUILayout.ToggleLeft(" Clean & Copy Animator (Removes illegal VRC Behaviours)", convertAnimator);
+            convertLocomotion = EditorGUILayout.ToggleLeft(" Use CVR Default Locomotion Animator", convertLocomotion);
+
+            EditorGUILayout.Space();
+            EditorGUILayout.Space();
+
+            // Convert Button
+            EditorGUI.BeginDisabledGroup(targetAvatar == null || targetAvatar.GetComponent<VRCAvatarDescriptor>() == null);
+            if (GUILayout.Button("CONVERT AVATAR", GUILayout.Height(45)))
+            {
+                VRCAvatarDescriptor vrcDesc = targetAvatar.GetComponent<VRCAvatarDescriptor>();
+                if (vrcDesc != null)
+                {
+                    ConvertAvatar(vrcDesc);
+                }
+            }
+            EditorGUI.EndDisabledGroup();
+
+            EditorGUILayout.EndVertical();
+        }
+
+        private void ConvertAvatar(VRCAvatarDescriptor vrcDesc)
+        {
+            string avatarName = vrcDesc.gameObject.name;
+            Debug.Log($"[VRC-CVR] Starting conversion for avatar: {avatarName}");
+
+            // Ensure a folder exists for generated assets
+            string folderPath = "Assets/Generated_CVR_Assets";
+            if (!AssetDatabase.IsValidFolder(folderPath))
+            {
+                AssetDatabase.CreateFolder("Assets", "Generated_CVR_Assets");
+            }
+            string avatarFolderPath = $"{folderPath}/{avatarName}";
+            if (!AssetDatabase.IsValidFolder(avatarFolderPath))
+            {
+                AssetDatabase.CreateFolder(folderPath, avatarName);
+            }
+
+            // Register undo for the GameObject
+            Undo.RegisterCompleteObjectUndo(vrcDesc.gameObject, "VRChat to CVR Conversion");
+
+            // Ensure CVRAvatar exists
+            CVRAvatar cvrAvatar = vrcDesc.gameObject.GetComponent<CVRAvatar>();
+            if (cvrAvatar == null)
+            {
+                cvrAvatar = Undo.AddComponent<CVRAvatar>(vrcDesc.gameObject);
+                Debug.Log("[VRC-CVR] Added CVRAvatar component.");
+            }
+
+            // Ensure CVRAssetInfo exists and is configured as Avatar
+            CVRAssetInfo assetInfo = vrcDesc.gameObject.GetComponent<CVRAssetInfo>();
+            if (assetInfo == null)
+            {
+                assetInfo = Undo.AddComponent<CVRAssetInfo>(vrcDesc.gameObject);
+            }
+            assetInfo.type = CVRAssetInfo.AssetType.Avatar;
+            EditorUtility.SetDirty(assetInfo);
+
+            // 1. Convert View & Voice Positions
+            if (convertViewVoice)
+            {
+                cvrAvatar.viewPosition = vrcDesc.ViewPosition;
+                // Place voice slightly lower and forward from view position (mouth location)
+                cvrAvatar.voicePosition = vrcDesc.ViewPosition + new Vector3(0f, -0.06f, 0.05f);
+                cvrAvatar.voiceParent = CVRAvatar.CVRAvatarVoiceParent.Head;
+                Debug.Log($"[VRC-CVR] View position set to {cvrAvatar.viewPosition}, Voice position set to {cvrAvatar.voicePosition}.");
+            }
+
+            // 2. Convert Lip Sync
+            if (convertLipSync)
+            {
+                cvrAvatar.useVisemeLipsync = true;
+                cvrAvatar.bodyMesh = vrcDesc.VisemeSkinnedMesh;
+
+                if (vrcDesc.lipSync == VRC.SDKBase.VRC_AvatarDescriptor.LipSyncStyle.VisemeBlendShape)
+                {
+                    cvrAvatar.visemeMode = CVRAvatar.CVRAvatarVisemeMode.Visemes;
+                    if (vrcDesc.VisemeBlendShapes != null)
+                    {
+                        cvrAvatar.visemeBlendshapes = new string[15];
+                        int copyLen = Math.Min(vrcDesc.VisemeBlendShapes.Length, 15);
+                        for (int i = 0; i < copyLen; i++)
+                        {
+                            cvrAvatar.visemeBlendshapes[i] = vrcDesc.VisemeBlendShapes[i];
+                        }
+                    }
+                    Debug.Log("[VRC-CVR] Lip Sync converted as Viseme Blend Shapes.");
+                }
+                else if (vrcDesc.lipSync == VRC.SDKBase.VRC_AvatarDescriptor.LipSyncStyle.JawFlapBlendShape)
+                {
+                    cvrAvatar.visemeMode = CVRAvatar.CVRAvatarVisemeMode.SingleBlendshape;
+                    cvrAvatar.visemeBlendshapes = new string[15];
+                    cvrAvatar.visemeBlendshapes[0] = vrcDesc.MouthOpenBlendShapeName;
+                    Debug.Log($"[VRC-CVR] Lip Sync converted as Single Jaw Flap Blend Shape: '{vrcDesc.MouthOpenBlendShapeName}'.");
+                }
+                else if (vrcDesc.lipSync == VRC.SDKBase.VRC_AvatarDescriptor.LipSyncStyle.JawFlapBone)
+                {
+                    cvrAvatar.visemeMode = CVRAvatar.CVRAvatarVisemeMode.JawBone;
+                    Debug.Log("[VRC-CVR] Lip Sync converted as Jaw Bone.");
+                }
+                else
+                {
+                    cvrAvatar.useVisemeLipsync = false;
+                }
+            }
+
+            // 3. Convert Eye Look & Blinking Settings
+            if (convertEyeLook)
+            {
+                cvrAvatar.useEyeMovement = vrcDesc.enableEyeLook;
+
+                if (vrcDesc.enableEyeLook)
+                {
+                    var vrcEyes = vrcDesc.customEyeLookSettings;
+                    if (vrcEyes.leftEye != null && vrcEyes.rightEye != null)
+                    {
+                        cvrAvatar.eyeMovementInfo.type = CVRAvatar.CVRAvatarEyeLookMode.Transform;
+
+                        var leftEyeInfo = new CVRAvatar.EyeMovementInfoEye
+                        {
+                            isLeft = true,
+                            eyeTransform = vrcEyes.leftEye,
+                            eyeSkinnedMeshRenderer = vrcEyes.eyelidsSkinnedMesh != null ? vrcEyes.eyelidsSkinnedMesh : cvrAvatar.bodyMesh
+                        };
+
+                        var rightEyeInfo = new CVRAvatar.EyeMovementInfoEye
+                        {
+                            isLeft = false,
+                            eyeTransform = vrcEyes.rightEye,
+                            eyeSkinnedMeshRenderer = vrcEyes.eyelidsSkinnedMesh != null ? vrcEyes.eyelidsSkinnedMesh : cvrAvatar.bodyMesh
+                        };
+
+                        // Calculate look angles in degrees relative to looking straight
+                        leftEyeInfo.eyeAngleLimitUp = Quaternion.Angle(vrcEyes.eyesLookingStraight.left, vrcEyes.eyesLookingUp.left);
+                        leftEyeInfo.eyeAngleLimitDown = -Quaternion.Angle(vrcEyes.eyesLookingStraight.left, vrcEyes.eyesLookingDown.left);
+                        leftEyeInfo.eyeAngleLimitIn = -Quaternion.Angle(vrcEyes.eyesLookingStraight.left, vrcEyes.eyesLookingRight.left); // Rightwards is inwards
+                        leftEyeInfo.eyeAngleLimitOut = Quaternion.Angle(vrcEyes.eyesLookingStraight.left, vrcEyes.eyesLookingLeft.left);   // Leftwards is outwards
+
+                        rightEyeInfo.eyeAngleLimitUp = Quaternion.Angle(vrcEyes.eyesLookingStraight.right, vrcEyes.eyesLookingUp.right);
+                        rightEyeInfo.eyeAngleLimitDown = -Quaternion.Angle(vrcEyes.eyesLookingStraight.right, vrcEyes.eyesLookingDown.right);
+                        rightEyeInfo.eyeAngleLimitIn = -Quaternion.Angle(vrcEyes.eyesLookingStraight.right, vrcEyes.eyesLookingLeft.right);  // Leftwards is inwards
+                        rightEyeInfo.eyeAngleLimitOut = Quaternion.Angle(vrcEyes.eyesLookingStraight.right, vrcEyes.eyesLookingRight.right); // Rightwards is outwards
+
+                        // Set default fallback limits if calculated limits are uninitialized / near-zero
+                        if (Mathf.Abs(leftEyeInfo.eyeAngleLimitUp) < 0.1f) leftEyeInfo.eyeAngleLimitUp = 15f;
+                        if (Mathf.Abs(leftEyeInfo.eyeAngleLimitDown) < 0.1f) leftEyeInfo.eyeAngleLimitDown = -10f;
+                        if (Mathf.Abs(leftEyeInfo.eyeAngleLimitIn) < 0.1f) leftEyeInfo.eyeAngleLimitIn = -20f;
+                        if (Mathf.Abs(leftEyeInfo.eyeAngleLimitOut) < 0.1f) leftEyeInfo.eyeAngleLimitOut = 20f;
+
+                        if (Mathf.Abs(rightEyeInfo.eyeAngleLimitUp) < 0.1f) rightEyeInfo.eyeAngleLimitUp = 15f;
+                        if (Mathf.Abs(rightEyeInfo.eyeAngleLimitDown) < 0.1f) rightEyeInfo.eyeAngleLimitDown = -10f;
+                        if (Mathf.Abs(rightEyeInfo.eyeAngleLimitIn) < 0.1f) rightEyeInfo.eyeAngleLimitIn = -20f;
+                        if (Mathf.Abs(rightEyeInfo.eyeAngleLimitOut) < 0.1f) rightEyeInfo.eyeAngleLimitOut = 20f;
+
+                        cvrAvatar.eyeMovementInfo.eyes = new CVRAvatar.EyeMovementInfoEye[] { leftEyeInfo, rightEyeInfo };
+                        Debug.Log("[VRC-CVR] Eye movement transforms and limit rotations mapped.");
+                    }
+                    else
+                    {
+                        cvrAvatar.eyeMovementInfo.type = CVRAvatar.CVRAvatarEyeLookMode.Muscle;
+                        Debug.Log("[VRC-CVR] Eye movement set to Muscle mode (VRC custom eye bones missing).");
+                    }
+
+                    // Convert Blinking Eyelids
+                    if (vrcEyes.eyelidType == VRCAvatarDescriptor.EyelidType.Blendshapes && vrcEyes.eyelidsSkinnedMesh != null)
+                    {
+                        cvrAvatar.useBlinkBlendshapes = true;
+                        cvrAvatar.blinkMode = CVRAvatar.CVRAvatarEyeBlinkMode.Separate;
+
+                        if (vrcEyes.eyelidsBlendshapes != null && vrcEyes.eyelidsBlendshapes.Length > 0)
+                        {
+                            int blinkIndex = vrcEyes.eyelidsBlendshapes[0];
+                            if (blinkIndex >= 0 && blinkIndex < vrcEyes.eyelidsSkinnedMesh.sharedMesh.blendShapeCount)
+                            {
+                                string blinkShapeName = vrcEyes.eyelidsSkinnedMesh.sharedMesh.GetBlendShapeName(blinkIndex);
+                                string leftBlink = blinkShapeName;
+                                string rightBlink = blinkShapeName;
+
+                                // Separate eye blink matching logic
+                                string lowerName = blinkShapeName.ToLower();
+                                if (lowerName.Contains("left") || lowerName.Contains("_l"))
+                                {
+                                    string expectedRightName = string.Empty;
+                                    if (lowerName.Contains("left")) expectedRightName = blinkShapeName.Replace("Left", "Right").Replace("left", "right").Replace("LEFT", "RIGHT");
+                                    else expectedRightName = blinkShapeName.Replace("_l", "_r").Replace("_L", "_R");
+
+                                    if (vrcEyes.eyelidsSkinnedMesh.sharedMesh.GetBlendShapeIndex(expectedRightName) >= 0)
+                                    {
+                                        rightBlink = expectedRightName;
+                                    }
+                                }
+                                else if (lowerName.Contains("right") || lowerName.Contains("_r"))
+                                {
+                                    string expectedLeftName = string.Empty;
+                                    if (lowerName.Contains("right")) expectedLeftName = blinkShapeName.Replace("Right", "Left").Replace("right", "left").Replace("RIGHT", "LEFT");
+                                    else expectedLeftName = blinkShapeName.Replace("_r", "_l").Replace("_R", "_L");
+
+                                    if (vrcEyes.eyelidsSkinnedMesh.sharedMesh.GetBlendShapeIndex(expectedLeftName) >= 0)
+                                    {
+                                        leftBlink = expectedLeftName;
+                                    }
+                                }
+
+                                cvrAvatar.blinkBlendshape = new string[4];
+                                cvrAvatar.blinkBlendshape[0] = leftBlink;
+                                cvrAvatar.blinkBlendshape[1] = rightBlink;
+                                Debug.Log($"[VRC-CVR] Blink blendshapes mapped: Left = '{leftBlink}', Right = '{rightBlink}'.");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Convert Expression Parameters
+            if (convertParameters && vrcDesc.expressionParameters != null)
+            {
+                if (cvrAvatar.avatarSettings == null)
+                {
+                    cvrAvatar.avatarSettings = new CVRAdvancedAvatarSettings();
+                }
+
+                cvrAvatar.avatarSettings.settings ??= new List<CVRAdvancedSettingsEntry>();
+                cvrAvatar.avatarSettings.initialized = true;
+
+                var ignoredParams = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "IsLocal", "InStation", "Viseme", "GestureLeft", "GestureRight",
+                    "GestureLeftWeight", "GestureRightWeight", "VelocityX", "VelocityY", "VelocityZ",
+                    "Upright", "Grounded", "Seated", "AFK", "Expression1", "Expression2", "Expression3",
+                    "TrackingType", "VRMode", "MuteSelf", "AngularVelocityY", "ScaleFactor",
+                    "ScaleFactorInverse", "EyeHeightAsPercent", "EyeHeightAsMeters"
+                };
+
+                // Blacklist parameters starting with 'Go/' - these are internal CVR system parameters
+                if (vrcDesc.expressionParameters != null)
+                {
+                    foreach (var param in vrcDesc.expressionParameters.parameters)
+                    {
+                        if (!string.IsNullOrEmpty(param.name) && param.name.StartsWith("Go/", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ignoredParams.Add(param.name);
+                        }
+                    }
+                }
+
+                int newSettingsCount = 0;
+                foreach (var param in vrcDesc.expressionParameters.parameters)
+                {
+                    if (string.IsNullOrEmpty(param.name) || ignoredParams.Contains(param.name))
+                        continue;
+
+                    // Ensure no duplication
+                    bool exists = false;
+                    foreach (var s in cvrAvatar.avatarSettings.settings)
+                    {
+                        if (string.Equals(s.machineName, param.name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+
+                    if (exists) continue;
+
+                    var entry = new CVRAdvancedSettingsEntry
+                    {
+                        name = param.name,
+                        machineName = param.name
+                    };
+
+                    if (param.valueType == VRCExpressionParameters.ValueType.Bool)
+                    {
+                        entry.type = CVRAdvancedSettingsEntry.SettingsType.Toggle;
+                        entry.toggleSettings = new CVRAdvancesAvatarSettingGameObjectToggle
+                        {
+                            defaultValue = param.defaultValue != 0,
+                            usedType = CVRAdvancesAvatarSettingBase.ParameterType.Bool
+                        };
+                    }
+                    else if (param.valueType == VRCExpressionParameters.ValueType.Int)
+                    {
+                        entry.type = CVRAdvancedSettingsEntry.SettingsType.Dropdown;
+                        entry.dropDownSettings = new CVRAdvancesAvatarSettingGameObjectDropdown
+                        {
+                            defaultValue = (int)param.defaultValue,
+                            usedType = CVRAdvancesAvatarSettingBase.ParameterType.Int
+                        };
+                    }
+                    else if (param.valueType == VRCExpressionParameters.ValueType.Float)
+                    {
+                        entry.type = CVRAdvancedSettingsEntry.SettingsType.Slider;
+                        entry.sliderSettings = new CVRAdvancesAvatarSettingSlider
+                        {
+                            defaultValue = param.defaultValue,
+                            usedType = CVRAdvancesAvatarSettingBase.ParameterType.Float
+                        };
+                    }
+
+                    cvrAvatar.avatarSettings.settings.Add(entry);
+                    newSettingsCount++;
+                }
+
+                cvrAvatar.avatarUsesAdvancedSettings = cvrAvatar.avatarSettings.settings.Count > 0;
+                Debug.Log($"[VRC-CVR] Expression parameters converted: {newSettingsCount} new settings added. Total: {cvrAvatar.avatarSettings.settings.Count}");
+            }
+
+            // 5. Convert PhysBones to DynamicBones (via Reflection to keep it compile-safe in all projects)
+            if (convertPhysBones)
+            {
+                Type typeDynamicBone = GetTypeFromName("DynamicBone");
+                Type typeDynamicBoneCollider = GetTypeFromName("DynamicBoneCollider");
+
+                if (typeDynamicBone == null || typeDynamicBoneCollider == null)
+                {
+                    Debug.LogWarning("[VRC-CVR] DynamicBone asset is not imported in this project. Skipping PhysBone conversion.");
+                }
+                else
+                {
+                    // Use Reflection to fetch PhysBone and PhysBoneCollider instances to bypass direct reference issues
+                    Type typePhysBone = GetTypeFromName("VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone");
+                    Type typePhysBoneCollider = GetTypeFromName("VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBoneCollider");
+
+                    if (typePhysBone != null && typePhysBoneCollider != null)
+                    {
+                        var physBones = vrcDesc.gameObject.GetComponentsInChildren(typePhysBone, true);
+                        var physColliders = vrcDesc.gameObject.GetComponentsInChildren(typePhysBoneCollider, true);
+
+                        var colliderMap = new Dictionary<Component, Component>();
+
+                        foreach (var pbc in physColliders)
+                        {
+                            var dbCollider = Undo.AddComponent(pbc.gameObject, typeDynamicBoneCollider);
+                            colliderMap[pbc] = dbCollider;
+
+                            // Copy properties
+                            float radius = GetFieldValue<float>(pbc, "radius");
+                            float height = GetFieldValue<float>(pbc, "height");
+                            Vector3 position = GetFieldValue<Vector3>(pbc, "position");
+                            Quaternion rotation = GetFieldValue<Quaternion>(pbc, "rotation");
+                            bool insideBounds = GetFieldValue<bool>(pbc, "insideBounds");
+                            object shapeTypeObj = GetFieldValue<object>(pbc, "shapeType");
+
+                            typeDynamicBoneCollider.GetField("m_Radius").SetValue(dbCollider, radius);
+                            typeDynamicBoneCollider.GetField("m_Height").SetValue(dbCollider, height);
+                            typeDynamicBoneCollider.GetField("m_Center").SetValue(dbCollider, position);
+
+                            // Shape/Direction Mapping
+                            int direction = 1; // Default to Y-Axis
+                            if (shapeTypeObj != null && shapeTypeObj.ToString().Equals("Capsule", StringComparison.OrdinalIgnoreCase))
+                            {
+                                Vector3 dirVec = rotation * Vector3.up;
+                                if (Mathf.Abs(dirVec.x) > 0.8f) direction = 0;
+                                else if (Mathf.Abs(dirVec.z) > 0.8f) direction = 2;
+                            }
+                            typeDynamicBoneCollider.GetField("m_Direction").SetValue(dbCollider, direction);
+
+                            // Inside / Outside Bounds
+                            int bound = insideBounds ? 1 : 0;
+                            typeDynamicBoneCollider.GetField("m_Bound").SetValue(dbCollider, bound);
+                        }
+
+                        int convertedBoneCount = 0;
+                        foreach (var pb in physBones)
+                        {
+                            var db = Undo.AddComponent(pb.gameObject, typeDynamicBone);
+                            convertedBoneCount++;
+
+                            Transform rootTransform = GetFieldValue<Transform>(pb, "rootTransform");
+                            if (rootTransform == null) rootTransform = pb.transform;
+
+                            IList ignoreTransforms = GetFieldValue<IList>(pb, "ignoreTransforms");
+                            float pull = GetFieldValue<float>(pb, "pull");
+                            float spring = GetFieldValue<float>(pb, "spring");
+                            float stiffness = GetFieldValue<float>(pb, "stiffness");
+                            float immobile = GetFieldValue<float>(pb, "immobile");
+                            float radius = GetFieldValue<float>(pb, "radius");
+                            float gravityVal = GetFieldValue<float>(pb, "gravity");
+                            IList collidersList = GetFieldValue<IList>(pb, "colliders");
+
+                            typeDynamicBone.GetField("m_Root").SetValue(db, rootTransform);
+                            
+                            if (ignoreTransforms != null)
+                            {
+                                var dbExclusions = typeDynamicBone.GetField("m_Exclusions").GetValue(db) as IList;
+                                if (dbExclusions != null)
+                                {
+                                    dbExclusions.Clear();
+                                    foreach (var t in ignoreTransforms)
+                                    {
+                                        dbExclusions.Add(t);
+                                    }
+                                }
+                            }
+
+                            // Stiffness, Damping, Elasticity Mapping
+                            typeDynamicBone.GetField("m_Elasticity").SetValue(db, pull);
+                            typeDynamicBone.GetField("m_Damping").SetValue(db, spring);
+                            typeDynamicBone.GetField("m_Stiffness").SetValue(db, stiffness);
+                            typeDynamicBone.GetField("m_Inert").SetValue(db, immobile);
+                            typeDynamicBone.GetField("m_Radius").SetValue(db, radius);
+
+                            Vector3 gravityVec = new Vector3(0, -gravityVal, 0);
+                            typeDynamicBone.GetField("m_Gravity").SetValue(db, gravityVec);
+
+                            // Map Colliders List
+                            if (collidersList != null && collidersList.Count > 0)
+                            {
+                                var dbCollidersField = typeDynamicBone.GetField("m_Colliders");
+                                var dbCollidersList = dbCollidersField.GetValue(db) as IList;
+
+                                if (dbCollidersList != null)
+                                {
+                                    dbCollidersList.Clear();
+                                    foreach (var pbColliderObj in collidersList)
+                                    {
+                                        if (pbColliderObj is Component pbColliderComp && colliderMap.TryGetValue(pbColliderComp, out var dbColComp))
+                                        {
+                                            dbCollidersList.Add(dbColComp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Debug.Log($"[VRC-CVR] Successfully converted {physColliders.Length} PhysBoneColliders and {convertedBoneCount} PhysBones.");
+                    }
+                }
+            }
+
+            // 6. Convert Animator (Clean VRC Behaviours)
+            if (convertAnimator)
+            {
+                ProcessAnimator(vrcDesc, cvrAvatar, avatarFolderPath);
+            }
+
+            EditorUtility.SetDirty(cvrAvatar);
+            AssetDatabase.SaveAssets();
+
+            EditorUtility.DisplayDialog(
+                "Conversion Complete",
+                $"Avatar '{avatarName}' has been successfully converted to CVR CCK settings!\n\n" +
+                "Make sure to review your settings on the CVRAvatar component in the Inspector.",
+                "OK"
+            );
+        }
+
+        private void ProcessAnimator(VRCAvatarDescriptor vrcDesc, CVRAvatar cvrAvatar, string avatarFolderPath)
+        {
+            // 1. Determine Source Animator for FX Layer
+            AnimatorController vrcFXController = GetVRChatFXController(vrcDesc);
+
+            // 2. Determine Base Animator (for locomotion and basic setup)
+            AnimatorController baseCvrController = null;
+            if (convertLocomotion)
+            {
+                // Load CVR's default AvatarAnimator.controller
+                string cvrBaseAnimatorPath = "Assets/CVR.CCK/Assets/Avatar/Animations/AvatarAnimator.controller";
+                baseCvrController = AssetDatabase.LoadAssetAtPath<AnimatorController>(cvrBaseAnimatorPath);
+                if (baseCvrController == null)
+                {
+                    Debug.LogError("[VRC-CVR] CVR default AvatarAnimator.controller not found at " + cvrBaseAnimatorPath + ". Cannot convert locomotion.");
+                    convertLocomotion = false; // Disable locomotion conversion if base controller is missing
+                }
+            }
+
+            AnimatorController finalCvrController = null;
+            string newControllerPath = $"{avatarFolderPath}/{vrcDesc.name}_CVR_Animator.controller";
+
+            if (baseCvrController != null)
+            {
+                // Start with a copy of the CVR base controller
+                AssetDatabase.CopyAsset(AssetDatabase.GetAssetPath(baseCvrController), newControllerPath);
+                AssetDatabase.ImportAsset(newControllerPath);
+                finalCvrController = AssetDatabase.LoadAssetAtPath<AnimatorController>(newControllerPath);
+            }
+            else if (vrcFXController != null && convertAnimator)
+            {
+                // If no CVR base, and we are converting animator, start with a copy of the VRC FX controller
+                AssetDatabase.CopyAsset(AssetDatabase.GetAssetPath(vrcFXController), newControllerPath);
+                AssetDatabase.ImportAsset(newControllerPath);
+                finalCvrController = AssetDatabase.LoadAssetAtPath<AnimatorController>(newControllerPath);
+            }
+            
+            if (finalCvrController == null)
+            {
+                Debug.LogWarning("[VRC-CVR] No suitable base animator found or created for conversion. Skipping animator conversion.");
+                return;
+            }
+
+            // Clean the base controller (if it's from VRC, or if it's CVR and we're cleaning behaviours)
+            // If it's a fresh copy of CVR base, it should already be clean, but re-cleaning won't hurt.
+            CleanAnimator(finalCvrController);
+            
+            // If we are converting FX, we need to ensure parameters and layers are merged
+            if (convertAnimator && vrcFXController != null)
+            {
+                MergeVrcFxIntoCvrAnimator(vrcFXController, finalCvrController);
+            }
+            else if (convertAnimator && vrcFXController == null)
+            {
+                Debug.LogWarning("[VRC-CVR] 'Clean & Copy Animator' was enabled, but no VRChat FX controller was found to process.");
+            }
+
+            // 3. Add Expression Parameters to the Animator Controller
+            if (convertParameters && vrcDesc.expressionParameters != null)
+            {
+                AddExpressionParametersToAnimator(vrcDesc.expressionParameters, finalCvrController);
+            }
+
+            // 4. Sync AnimatorDriver behaviors to ensure AAS settings drive animator parameters
+            if (convertAnimator && vrcDesc.expressionParameters != null)
+            {
+                SetupParameterSyncingBehaviors(vrcDesc.expressionParameters, finalCvrController, vrcDesc.gameObject);
+            }
+            
+            // Assign to CVR Avatar
+            if (cvrAvatar.avatarSettings == null) cvrAvatar.avatarSettings = new CVRAdvancedAvatarSettings();
+            cvrAvatar.avatarSettings.baseController = finalCvrController;
+            cvrAvatar.avatarSettings.initialized = true;
+            
+            // Also update the animator component for immediate preview
+            var animator = vrcDesc.GetComponent<Animator>();
+            if (animator != null)
+            {
+                animator.runtimeAnimatorController = finalCvrController;
+            }
+
+            Debug.Log($"[VRC-CVR] Created/Updated animator for avatar at: {newControllerPath}");
+
+            // Save the modifications to the asset
+            EditorUtility.SetDirty(finalCvrController);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+        }
+
+        private AnimatorController GetVRChatFXController(VRCAvatarDescriptor vrcDesc)
+        {
+            RuntimeAnimatorController vrcFXController = null;
+            
+            // Access baseAnimationLayers via reflection
+            var baseLayersField = typeof(VRCAvatarDescriptor).GetField("baseAnimationLayers", BindingFlags.Public | BindingFlags.Instance);
+            if (baseLayersField != null)
+            {
+                var layers = baseLayersField.GetValue(vrcDesc) as IEnumerable;
+                if (layers != null)
+                {
+                    foreach (var layer in layers)
+                    {
+                        var typeField = layer.GetType().GetField("type");
+                        var controllerField = layer.GetType().GetField("animatorController");
+                        if (typeField != null && controllerField != null)
+                        {
+                            var type = typeField.GetValue(layer).ToString();
+                            if (type == "FX")
+                            {
+                                vrcFXController = controllerField.GetValue(layer) as RuntimeAnimatorController;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (vrcFXController == null)
+            {
+                // Fallback to the Animator component's controller if no FX layer found
+                var animator = vrcDesc.GetComponent<Animator>();
+                if (animator != null) vrcFXController = animator.runtimeAnimatorController;
+            }
+            return vrcFXController as AnimatorController;
+        }
+
+        private void AddExpressionParametersToAnimator(VRCExpressionParameters expressionParameters, AnimatorController controller)
+        {
+            if (expressionParameters == null || controller == null) return;
+
+            var ignoredParams = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "IsLocal", "InStation", "Viseme", "GestureLeft", "GestureRight",
+                "GestureLeftWeight", "GestureRightWeight", "VelocityX", "VelocityY", "VelocityZ",
+                "Upright", "Grounded", "Seated", "AFK", "Expression1", "Expression2", "Expression3",
+                "TrackingType", "VRMode", "MuteSelf", "AngularVelocityY", "ScaleFactor",
+                "ScaleFactorInverse", "EyeHeightAsPercent", "EyeHeightAsMeters"
+            };
+
+            // Blacklist parameters starting with 'Go/' - these are internal CVR system parameters
+            foreach (var param in expressionParameters.parameters)
+            {
+                if (!string.IsNullOrEmpty(param.name) && param.name.StartsWith("Go/", StringComparison.OrdinalIgnoreCase))
+                {
+                    ignoredParams.Add(param.name);
+                }
+            }
+
+            int addedCount = 0;
+            foreach (var param in expressionParameters.parameters)
+            {
+                if (string.IsNullOrEmpty(param.name) || ignoredParams.Contains(param.name))
+                    continue;
+
+                // Skip if parameter already exists
+                if (controller.parameters.Any(p => p.name == param.name))
+                    continue;
+
+                AnimatorControllerParameter animParam = new AnimatorControllerParameter
+                {
+                    name = param.name
+                };
+
+                // Map VRC parameter types to Animator parameter types
+                if (param.valueType == VRCExpressionParameters.ValueType.Bool)
+                {
+                    animParam.type = AnimatorControllerParameterType.Bool;
+                    animParam.defaultBool = param.defaultValue != 0;
+                }
+                else if (param.valueType == VRCExpressionParameters.ValueType.Int)
+                {
+                    animParam.type = AnimatorControllerParameterType.Int;
+                    animParam.defaultInt = (int)param.defaultValue;
+                }
+                else if (param.valueType == VRCExpressionParameters.ValueType.Float)
+                {
+                    animParam.type = AnimatorControllerParameterType.Float;
+                    animParam.defaultFloat = param.defaultValue;
+                }
+
+                controller.AddParameter(animParam);
+                addedCount++;
+            }
+
+            if (addedCount > 0)
+            {
+                Debug.Log($"[VRC-CVR] Added {addedCount} expression parameters to animator controller.");
+            }
+        }
+
+        private void SetupParameterSyncingBehaviors(VRCExpressionParameters expressionParameters, AnimatorController controller, GameObject avatarGameObject)
+        {
+            if (expressionParameters == null || controller == null || avatarGameObject == null) return;
+
+            // This method ensures animator parameters are synced with AAS settings
+            // We add AnimatorDriver entry tasks to maintain parameter values from AAS settings
+            
+            var ignoredParams = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "IsLocal", "InStation", "Viseme", "GestureLeft", "GestureRight",
+                "GestureLeftWeight", "GestureRightWeight", "VelocityX", "VelocityY", "VelocityZ",
+                "Upright", "Grounded", "Seated", "AFK", "Expression1", "Expression2", "Expression3",
+                "TrackingType", "VRMode", "MuteSelf", "AngularVelocityY", "ScaleFactor",
+                "ScaleFactorInverse", "EyeHeightAsPercent", "EyeHeightAsMeters"
+            };
+
+            // Blacklist parameters starting with 'Go/' - these are internal CVR system parameters
+            foreach (var param in expressionParameters.parameters)
+            {
+                if (!string.IsNullOrEmpty(param.name) && param.name.StartsWith("Go/", StringComparison.OrdinalIgnoreCase))
+                {
+                    ignoredParams.Add(param.name);
+                }
+            }
+
+            // Find the base/first layer to add sync logic
+            if (controller.layers.Length == 0)
+            {
+                Debug.LogWarning("[VRC-CVR] No animator layers found. Cannot setup parameter syncing.");
+                return;
+            }
+
+            AnimatorControllerLayer baseLayer = controller.layers[0];
+            if (baseLayer.stateMachine == null || baseLayer.stateMachine.states.Length == 0)
+            {
+                Debug.LogWarning("[VRC-CVR] Base animator layer has no states. Cannot setup parameter syncing.");
+                return;
+            }
+
+            // Add syncing behavior to the entry state or first state
+            AnimatorState syncState = baseLayer.stateMachine.states.FirstOrDefault().state;
+            if (syncState == null)
+                return;
+
+            // Check if we already have a driver
+            var existingDriver = syncState.behaviours.OfType<AnimatorDriver>().FirstOrDefault();
+            AnimatorDriver driver = existingDriver ?? syncState.AddStateMachineBehaviour<AnimatorDriver>();
+
+            if (driver == null)
+            {
+                Debug.LogWarning("[VRC-CVR] Failed to create AnimatorDriver for parameter syncing.");
+                return;
+            }
+
+            // Initialize entry tasks if needed
+            if (driver.EnterTasks == null)
+            {
+                driver.EnterTasks = new List<AnimatorDriverTask>();
+            }
+
+            int syncTasksAdded = 0;
+            foreach (var param in expressionParameters.parameters)
+            {
+                if (string.IsNullOrEmpty(param.name) || ignoredParams.Contains(param.name))
+                    continue;
+
+                // Skip if this parameter already has a sync task
+                if (driver.EnterTasks.Any(t => t.targetName == param.name))
+                    continue;
+
+                // Create a driver task to maintain the parameter value
+                var task = new AnimatorDriverTask
+                {
+                    targetName = param.name,
+                    op = AnimatorDriverTask.Operator.Set,
+                    aType = AnimatorDriverTask.SourceType.Static
+                };
+
+                // Set default value based on parameter type
+                if (param.valueType == VRCExpressionParameters.ValueType.Bool)
+                {
+                    task.aValue = param.defaultValue != 0 ? 1f : 0f;
+                }
+                else if (param.valueType == VRCExpressionParameters.ValueType.Int)
+                {
+                    task.aValue = (float)(int)param.defaultValue;
+                }
+                else if (param.valueType == VRCExpressionParameters.ValueType.Float)
+                {
+                    task.aValue = param.defaultValue;
+                }
+
+                driver.EnterTasks.Add(task);
+                syncTasksAdded++;
+            }
+
+            if (syncTasksAdded > 0)
+            {
+                Debug.Log($"[VRC-CVR] Added {syncTasksAdded} AnimatorDriver entry tasks to sync expression parameters.");
+                EditorUtility.SetDirty(driver);
+            }
+        }
+
+        private void MergeVrcFxIntoCvrAnimator(AnimatorController vrcFXController, AnimatorController finalCvrController)
+        {
+            // Add parameters from VRC FX controller to the CVR controller
+            foreach (AnimatorControllerParameter param in vrcFXController.parameters)
+            {
+                if (!finalCvrController.parameters.Any(p => p.name == param.name))
+                {
+                    finalCvrController.AddParameter(param);
+                }
+            }
+
+            // Copy layers from VRC FX controller into the CVR controller
+            foreach (AnimatorControllerLayer vrcLayer in vrcFXController.layers)
+            {
+                if (finalCvrController.layers.Any(l => l.name == vrcLayer.name))
+                {
+                    Debug.LogWarning($"[VRC-CVR] Skipping duplicate layer '{vrcLayer.name}' from VRChat FX controller during merge.");
+                    continue;
+                }
+
+                AnimatorControllerLayer newLayer = new AnimatorControllerLayer
+                {
+                    name = vrcLayer.name,
+                    stateMachine = new AnimatorStateMachine(),
+                    defaultWeight = vrcLayer.defaultWeight,
+                    avatarMask = vrcLayer.avatarMask,
+                    blendingMode = vrcLayer.blendingMode,
+                    syncedLayerIndex = vrcLayer.syncedLayerIndex,
+                    iKPass = vrcLayer.iKPass
+                };
+                
+                // Deep copy the StateMachine
+                CopyStateMachine(vrcLayer.stateMachine, newLayer.stateMachine, finalCvrController);
+                AssetDatabase.AddObjectToAsset(newLayer.stateMachine, finalCvrController); // Add state machine as sub-asset
+
+                finalCvrController.AddLayer(newLayer);
+            }
+        }
+
+        // Helper to deep copy a StateMachine and its contents
+        private void CopyStateMachine(AnimatorStateMachine source, AnimatorStateMachine destination, AnimatorController controller)
+        {
+            destination.name = source.name;
+            destination.anyStatePosition = source.anyStatePosition;
+            destination.entryPosition = source.entryPosition;
+            destination.exitPosition = source.exitPosition;
+            destination.parentStateMachinePosition = source.parentStateMachinePosition;
+            
+            // Create a mapping from source states to destination states
+            var stateMap = new Dictionary<AnimatorState, AnimatorState>();
+
+            // FIRST PASS: Create all states without transitions
+            foreach (ChildAnimatorState childState in source.states)
+            {
+                AnimatorState newState = destination.AddState(childState.state.name);
+                newState.motion = childState.state.motion;
+                newState.speed = childState.state.speed;
+                newState.cycleOffset = childState.state.cycleOffset;
+                newState.iKOnFeet = childState.state.iKOnFeet;
+                newState.mirror = childState.state.mirror;
+                newState.tag = childState.state.tag;
+                newState.writeDefaultValues = childState.state.writeDefaultValues;
+                newState.timeParameterActive = childState.state.timeParameterActive;
+                newState.timeParameter = childState.state.timeParameter;
+                newState.hideFlags = HideFlags.HideInHierarchy;
+
+                // Copy behaviours and clean them
+                CleanBehaviours(newState, controller);
+
+                AssetDatabase.AddObjectToAsset(newState, controller);
+                stateMap[childState.state] = newState;
+            }
+            
+            // SECOND PASS: Add transitions now that all states exist
+            foreach (ChildAnimatorState childState in source.states)
+            {
+                AnimatorState sourceState = childState.state;
+                AnimatorState newState = stateMap[sourceState];
+
+                // Copy transitions
+                foreach (AnimatorStateTransition transition in sourceState.transitions)
+                {
+                    AnimatorState destState = transition.destinationState;
+                    
+                    // Only add transition if the destination state exists in our mapping
+                    if (destState != null && stateMap.TryGetValue(destState, out AnimatorState newDestState))
+                    {
+                        AnimatorStateTransition newTransition = newState.AddTransition(newDestState);
+                        CopyTransitionProperties(transition, newTransition, controller);
+                    }
+                    else if (destState == null)
+                    {
+                        // Transition to exit state
+                        AnimatorStateTransition newTransition = newState.AddExitTransition();
+                        CopyTransitionProperties(transition, newTransition, controller);
+                    }
+                }
+            }
+            
+            // Copy transitions from Any State
+            foreach (AnimatorStateTransition transition in source.anyStateTransitions)
+            {
+                AnimatorState destState = transition.destinationState;
+                
+                if (destState != null && stateMap.TryGetValue(destState, out AnimatorState newDestState))
+                {
+                    AnimatorStateTransition newTransition = destination.AddAnyStateTransition(newDestState);
+                    CopyTransitionProperties(transition, newTransition, controller);
+                }
+            }
+
+            // Copy sub state machines recursively
+            foreach (ChildAnimatorStateMachine childStateMachine in source.stateMachines)
+            {
+                AnimatorStateMachine newSubStateMachine = new AnimatorStateMachine();
+                CopyStateMachine(childStateMachine.stateMachine, newSubStateMachine, controller); // Recursive call
+                destination.AddStateMachine(newSubStateMachine.name, childStateMachine.position);
+                AssetDatabase.AddObjectToAsset(newSubStateMachine, controller); // Add sub-state machine as sub-asset
+            }
+        }
+
+        private void CopyTransitionProperties(AnimatorStateTransition source, AnimatorStateTransition destination, AnimatorController controller)
+        {
+            if (source == null || destination == null) return;
+
+            destination.hasExitTime = source.hasExitTime;
+            destination.exitTime = source.exitTime;
+            destination.duration = source.duration;
+            destination.offset = source.offset;
+            destination.interruptionSource = source.interruptionSource;
+            destination.orderedInterruption = source.orderedInterruption;
+            destination.canTransitionToSelf = source.canTransitionToSelf;
+
+            // Copy conditions - only add those for parameters that exist in the animator
+            foreach (var condition in source.conditions)
+            {
+                // Check if parameter exists in the controller
+                bool paramExists = controller.parameters.Any(p => p.name == condition.parameter);
+                
+                if (paramExists)
+                {
+                    destination.AddCondition(condition.mode, condition.threshold, condition.parameter);
+                }
+                else
+                {
+                    Debug.LogWarning($"[VRC-CVR] Skipping transition condition for parameter '{condition.parameter}' - parameter not found in animator.");
+                }
+            }
+
+            EditorUtility.SetDirty(destination);
+        }
+
+        private void CleanAnimator(AnimatorController controller)
+        {
+            foreach (var layer in controller.layers)
+            {
+                ProcessStateMachine(layer.stateMachine, controller);
+            }
+        }
+
+        private void ProcessStateMachine(AnimatorStateMachine stateMachine, AnimatorController controller)
+        {
+            foreach (var state in stateMachine.states)
+            {
+                CleanBehaviours(state.state, controller);
+            }
+
+            foreach (var subMachine in stateMachine.stateMachines)
+            {
+                ProcessStateMachine(subMachine.stateMachine, controller);
+            }
+        }
+
+        private void CleanBehaviours(AnimatorState state, AnimatorController controller)
+        {
+            var behaviours = state.behaviours;
+            if (behaviours == null || behaviours.Length == 0) return;
+
+            var newBehaviours = new List<StateMachineBehaviour>();
+            bool changed = false;
+
+            foreach (var behaviour in behaviours)
+            {
+                // Unity's == null check catches broken PPtrs
+                if (behaviour == null)
+                {
+                    changed = true;
+                    Debug.LogWarning($"[VRC-CVR] Removed null/broken behaviour reference from state '{state.name}'");
+                    continue;
+                }
+
+                try
+                {
+                    Type bType = behaviour.GetType();
+                    string typeName = bType.FullName;
+
+                    // If it's a VRChat behaviour, we remove it or convert it
+                    if (string.IsNullOrEmpty(typeName) || typeName.Contains("VRC.SDK3.Avatars.Components") || 
+                        typeName.Contains("VRC.SDKBase") || typeName.StartsWith("VRC"))
+                    {
+                        changed = true;
+
+                        // Attempt to convert VRCAvatarParameterDriver to CVR AnimatorDriver
+                        if (typeName != null && typeName.Contains("VRCAvatarParameterDriver"))
+                        {
+                            var cvrDriver = state.AddStateMachineBehaviour<AnimatorDriver>();
+                            if (cvrDriver != null)
+                            {
+                                ConvertParameterDriver(behaviour, cvrDriver, controller);
+                                newBehaviours.Add(cvrDriver);
+                                EditorUtility.SetDirty(cvrDriver);
+                                Debug.Log($"[VRC-CVR] Converted VRCAvatarParameterDriver to CVR AnimatorDriver on state '{state.name}'");
+                            }
+                        }
+                        
+                        // Destroy the original VRC behaviour to remove its reference
+                        Debug.Log($"[VRC-CVR] Removing VRC behaviour of type '{typeName}' from state '{state.name}'");
+                        UnityEngine.Object.DestroyImmediate(behaviour, true);
+                        AssetDatabase.SaveAssets();
+                    }
+                    }
+                    else
+                    {
+                        newBehaviours.Add(behaviour);
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    // If GetType or other operations fail, it's a broken reference
+                    Debug.LogWarning($"[VRC-CVR] Error cleaning behaviour on state '{state.name}': {ex.Message}");
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                state.behaviours = newBehaviours.ToArray();
+                EditorUtility.SetDirty(state);
+            }
+        }
+
+        private void ConvertParameterDriver(StateMachineBehaviour vrcDriver, AnimatorDriver cvrDriver, AnimatorController controller)
+        {
+            if (vrcDriver == null || cvrDriver == null || controller == null) return;
+            
+            try
+            {
+                var vrcType = vrcDriver.GetType();
+                var parametersField = vrcType.GetField("parameters", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (parametersField == null) return;
+
+                var vrcParams = parametersField.GetValue(vrcDriver) as IEnumerable;
+                if (vrcParams == null) return;
+
+                foreach (var vrcParam in vrcParams)
+                {
+                    if (vrcParam == null) continue;
+                    var pType = vrcParam.GetType();
+                    
+                    var nameField = pType.GetField("name", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    var valueField = pType.GetField("value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    var typeField = pType.GetField("type", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                    if (nameField == null || valueField == null || typeField == null) continue;
+
+                    string paramName = nameField.GetValue(vrcParam) as string;
+                    if (string.IsNullOrEmpty(paramName)) continue;
+
+                    float paramValue = Convert.ToSingle(valueField.GetValue(vrcParam));
+                    int vrcOpType = (int)typeField.GetValue(vrcParam); // 0=Set, 1=Add, 2=Random, 3=Copy
+
+                    // Determine the target parameter type from the animator controller
+                    var targetParam = controller.parameters.FirstOrDefault(p => p.name == paramName);
+                    AnimatorDriverTask.ParameterType targetType = AnimatorDriverTask.ParameterType.Float;
+                    
+                    if (targetParam != null)
+                    {
+                        targetType = targetParam.type switch
+                        {
+                            AnimatorControllerParameterType.Bool => AnimatorDriverTask.ParameterType.Bool,
+                            AnimatorControllerParameterType.Int => AnimatorDriverTask.ParameterType.Int,
+                            AnimatorControllerParameterType.Float => AnimatorDriverTask.ParameterType.Float,
+                            AnimatorControllerParameterType.Trigger => AnimatorDriverTask.ParameterType.Trigger,
+                            _ => AnimatorDriverTask.ParameterType.Float
+                        };
+                    }
+
+                    var task = new AnimatorDriverTask
+                    {
+                        targetName = paramName,
+                        targetType = targetType,
+                        aType = AnimatorDriverTask.SourceType.Static,
+                        aValue = paramValue
+                    };
+
+                    // Map VRC Op Types to CVR AnimatorDriver Tasks
+                    switch (vrcOpType)
+                    {
+                        case 0: // Set
+                            task.op = AnimatorDriverTask.Operator.Set;
+                            break;
+                        case 1: // Add
+                            task.op = AnimatorDriverTask.Operator.Addition;
+                            break;
+                        case 2: // Random
+                            task.op = AnimatorDriverTask.Operator.Set;
+                            task.aType = AnimatorDriverTask.SourceType.Random;
+                            
+                            var minField = pType.GetField("valueMin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            var maxField = pType.GetField("valueMax", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            if (minField != null && maxField != null)
+                            {
+                                task.aValue = Convert.ToSingle(minField.GetValue(vrcParam));
+                                task.aMax = Convert.ToSingle(maxField.GetValue(vrcParam));
+                            }
+                            break;
+                        case 3: // Copy
+                            task.op = AnimatorDriverTask.Operator.Set;
+                            task.aType = AnimatorDriverTask.SourceType.Parameter;
+                            var sourceField = pType.GetField("source", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            if (sourceField != null)
+                            {
+                                task.aName = sourceField.GetValue(vrcParam) as string;
+                                // Set the source parameter type if we can find it
+                                var sourceParam = controller.parameters.FirstOrDefault(p => p.name == task.aName);
+                                if (sourceParam != null)
+                                {
+                                    task.aParamType = sourceParam.type switch
+                                    {
+                                        AnimatorControllerParameterType.Bool => AnimatorDriverTask.ParameterType.Bool,
+                                        AnimatorControllerParameterType.Int => AnimatorDriverTask.ParameterType.Int,
+                                        AnimatorControllerParameterType.Float => AnimatorDriverTask.ParameterType.Float,
+                                        AnimatorControllerParameterType.Trigger => AnimatorDriverTask.ParameterType.Trigger,
+                                        _ => AnimatorDriverTask.ParameterType.Float
+                                    };
+                                }
+                            }
+                            break;
+                    }
+
+                    cvrDriver.EnterTasks.Add(task);
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[VRC-CVR] Error converting ParameterDriver: {e.Message}");
+            }
+        }
+
+
+
+
+
+        private static Type GetTypeFromName(string typeName)
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type t = assembly.GetType(typeName);
+                if (t != null) return t;
+            }
+            return null;
+        }
+
+        private static T GetFieldValue<T>(object obj, string fieldName)
+        {
+            if (obj == null) return default;
+            var field = obj.GetType().GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field != null)
+            {
+                return (T)field.GetValue(obj);
+            }
+            // Try property if field fails
+            var prop = obj.GetType().GetProperty(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (prop != null)
+            {
+                return (T)prop.GetValue(obj);
+            }
+            return default;
+        }
+    }
+}
+#endif

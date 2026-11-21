@@ -1,0 +1,513 @@
+// Turns a YapsSocket into a socket every plug can find, and builds the
+// universal Hole and Ring prefabs from the same code. Marker lights at
+// VRCFury's ranges, SPS and TPS pointers, and a front a centimetre along
+// +Z. The children are named so a rebuild replaces rather than stacks.
+#if CVR_CCK_EXISTS
+using System.Linq;
+using ABI.CCK.Components;
+using AvatarBridge.Yaps;
+using UnityEditor;
+using UnityEngine;
+
+namespace AvatarBridge
+{
+    public static class YapsSocketBuilder
+    {
+        // DPS's digits, at VRCFury's exact trailing 6.
+        //
+        // A decoder reads range % 0.1 against 0.01 hole, 0.02 ring, 0.05 front,
+        // 0.09 plug tip. Raliv's shader accepts within 0.005, C# toy mods
+        // within 0.001; +0.0006 is inside both. An offset of +0.003 (outside
+        // the mods' window) once hid sockets from mods to stop bystander
+        // buzzing; the mod now bounds reach by the stated length instead.
+        //
+        // The trailing 6 is what VRCFury emits: a tied range loses slot fights
+        // by draw order. The shader loses about 0.0005 rebuilding range from
+        // attenuation, inside the mods' 0.001.
+        public const float HoleRange = 0.4106f;
+        public const float RingRange = 0.4206f;
+        public const float FrontRange = 0.4506f;
+        public const float FrontOffset = 0.01f;
+
+        // The self channel. A socket's own Self trigger listens for this
+        // suffix alone, so a tag without its twin is remote-only.
+        const string Twin = "_SelfNotOnHips";
+
+        public const string LightsName = "YAPS Lights";
+        const string AtlasName = "YAPS Atlas";
+        const string PointersName = "YAPS Pointers";
+        const string PrefabFolder = "Assets/YAPS/Prefabs";
+        public const string PlugPropPrefabPath = PrefabFolder + "/YAPS Plug Prop.prefab";
+
+        // --- the prefabs ------------------------------------------------
+
+        [MenuItem("ChilloutVR CCK/Advanced/Common/YAPS/Create universal socket prefabs")]
+        public static void CreatePrefabs()
+        {
+            EnsureFolder(PrefabFolder);
+            var hole = CreatePrefab("YAPS Hole", YapsSocket.SocketKind.Hole);
+            var ring = CreatePrefab("YAPS Ring", YapsSocket.SocketKind.Ring);
+            AssetDatabase.SaveAssets();
+            Selection.objects = new Object[] { hole, ring };
+            Debug.Log("[YAPS] Universal socket prefabs written to " + PrefabFolder + ". Drag one " +
+                      "under a bone, point its +Z the way a plug should enter, and it works for " +
+                      "DPS, TPS and SPS plugs and for converted ones. A socket with a mesh of its " +
+                      "own can open as a plug goes in: pick that mesh and its shapes on the " +
+                      "component, then bake from ChilloutVR CCK ▸ Advanced ▸ Common ▸ YAPS ▸ Setup.");
+        }
+
+        // A plug prop ready to upload, over the same file each time. An
+        // uploaded prop keeps the bake and shader it was built with.
+        [MenuItem("ChilloutVR CCK/Advanced/Common/YAPS/Create a plug prop prefab")]
+        public static void CreatePlugPropPrefab()
+        {
+            EnsureFolder(PrefabFolder);
+            // Its own mesh: the test plug's is overwritten by the next one
+            // spawned, which left the saved prefab with no mesh.
+            var root = YapsNativeBuilder.BuildTestPlug(null, select: false,
+                meshPath: PrefabFolder + "/YAPS Plug Prop Mesh.asset");
+            if (root == null)
+            {
+                Debug.LogError("[YAPS] Could not build the plug: YAPS Simple Lit is missing from the project.");
+                return;
+            }
+            root.name = "YAPS Plug Prop";
+            root.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+
+            var plug = root.GetComponent<YapsPlug>();
+            var baked = YapsNativeBuilder.Bake(plug);
+            if (!baked.Ok)
+            {
+                Object.DestroyImmediate(root);
+                Debug.LogError("[YAPS] Could not bake the plug prop: " + baked.Message);
+                return;
+            }
+            var prop = YapsPropBuilder.MakeProp(root);
+
+            string path = PlugPropPrefabPath;
+            var prefab = PrefabUtility.SaveAsPrefabAsset(root, path);
+            Object.DestroyImmediate(root);
+            AssetDatabase.SaveAssets();
+            Selection.activeObject = prefab;
+            EditorGUIUtility.PingObject(prefab);
+
+            Debug.Log("[YAPS] Plug prop prefab written to " + path + ". " + baked.Message + " " + prop.Message +
+                      (prop.Notes.Count > 0 ? " " + string.Join(" ", prop.Notes) : "") +
+                      " Upload it from the CCK as a prop. Run this again after updating AvatarBridge: a prop " +
+                      "already uploaded keeps the shader and bake it was built with.");
+        }
+
+        public const string SocketPropPrefabPath = PrefabFolder + "/YAPS Ring and Socket Prop.prefab";
+
+        // A ring and a hole on one spawnable body; the plug prop's other half.
+        [MenuItem("ChilloutVR CCK/Advanced/Common/YAPS/Create a ring-and-socket prop prefab")]
+        public static void CreateSocketPropPrefab()
+        {
+            EnsureFolder(PrefabFolder);
+            var root = new GameObject("YAPS Ring and Socket Prop");
+
+            // Something to see and grab.
+            var body = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            body.name = "Body";
+            body.transform.SetParent(root.transform, false);
+            body.transform.localScale = new Vector3(0.06f, 0.02f, 0.06f);
+            // Its own collider would fight the one MakeProp fits to the prop.
+            Object.DestroyImmediate(body.GetComponent<Collider>());
+
+            // Opposite facings, so the two never compete for one approach.
+            var ring = BuildPreviewSocket("Ring", YapsSocket.SocketKind.Ring);
+            ring.transform.SetParent(root.transform, false);
+            ring.transform.localPosition = new Vector3(0f, 0.03f, 0f);
+            ring.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
+
+            var hole = BuildPreviewSocket("Hole", YapsSocket.SocketKind.Hole);
+            hole.transform.SetParent(root.transform, false);
+            hole.transform.localPosition = new Vector3(0f, -0.03f, 0f);
+            hole.transform.localRotation = Quaternion.Euler(90f, 0f, 0f);
+
+            var prop = YapsPropBuilder.MakeProp(root);
+
+            string path = SocketPropPrefabPath;
+            var prefab = PrefabUtility.SaveAsPrefabAsset(root, path);
+            Object.DestroyImmediate(root);
+            AssetDatabase.SaveAssets();
+            Selection.activeObject = prefab;
+            EditorGUIUtility.PingObject(prefab);
+
+            Debug.Log("[YAPS] Ring-and-socket prop prefab written to " + path + ". " + prop.Message +
+                      (prop.Notes.Count > 0 ? " " + string.Join(" ", prop.Notes) : "") +
+                      " Upload it from the CCK as a prop. Both sockets carry marker lights, and a mesh has " +
+                      "four vertex light slots, so an old DPS toy sees one of them at a time; a YAPS plug " +
+                      "finds both through the screen atlas. Resize the body and move the sockets to taste " +
+                      "before uploading.");
+        }
+
+        // A scene socket for previewing, built like the prefabs. withLights
+        // false tests the atlas alone: the forgiving light path hides faults.
+        public static GameObject BuildPreviewSocket(string name, YapsSocket.SocketKind kind,
+            bool withLights = true)
+        {
+            var root = new GameObject(name);
+            var socket = root.AddComponent<YapsSocket>();
+            socket.kind = kind;
+            socket.emitLights = withLights;
+            Build(socket);
+            if (!withLights)
+            {
+                foreach (var light in root.GetComponentsInChildren<Light>(true))
+                {
+                    Object.DestroyImmediate(light);
+                }
+            }
+            return root;
+        }
+
+        static GameObject CreatePrefab(string name, YapsSocket.SocketKind kind)
+        {
+            var root = new GameObject(name);
+            var socket = root.AddComponent<YapsSocket>();
+            socket.kind = kind;
+            Build(socket);
+            // The same file each time: a prefab is a thing to update, not to number.
+            string path = PrefabFolder + "/" + name + ".prefab";
+            var prefab = PrefabUtility.SaveAsPrefabAsset(root, path);
+            Object.DestroyImmediate(root);
+            return prefab;
+        }
+
+        [MenuItem("GameObject/YAPS/Add a hole here", false, 10)]
+        static void AddHole(MenuCommand cmd) => AddSocket(cmd, YapsSocket.SocketKind.Hole);
+
+        [MenuItem("GameObject/YAPS/Add a ring here", false, 11)]
+        static void AddRing(MenuCommand cmd) => AddSocket(cmd, YapsSocket.SocketKind.Ring);
+
+        static void AddSocket(MenuCommand cmd, YapsSocket.SocketKind kind)
+        {
+            var parent = cmd.context as GameObject;
+            var go = new GameObject(kind == YapsSocket.SocketKind.Hole ? "YAPS Hole" : "YAPS Ring");
+            if (parent != null) go.transform.SetParent(parent.transform, false);
+            var socket = go.AddComponent<YapsSocket>();
+            socket.kind = kind;
+            Build(socket);
+            Undo.RegisterCreatedObjectUndo(go, "Add YAPS socket");
+            Selection.activeGameObject = go;
+        }
+
+        // Kind changed: lights, pointers, folders and a default name follow.
+        public static void ApplyKind(YapsSocket socket)
+        {
+            if (socket == null) return;
+            bool hole = socket.kind == YapsSocket.SocketKind.Hole;
+            var t = socket.transform;
+            foreach (var l in t.GetComponentsInChildren<Light>(true))
+            {
+                if (!YapsScanner.IsProtocolLight(l)) continue;
+                int d = YapsScanner.LightDigit(l);
+                if (d >= 1 && d <= 4)
+                {
+                    Undo.RecordObject(l, "YAPS socket kind");
+                    l.range = hole ? HoleRange : RingRange;
+                    EditorUtility.SetDirty(l);
+                }
+            }
+            foreach (var p in t.GetComponentsInChildren<CVRPointer>(true))
+            {
+                if (p == null || string.IsNullOrEmpty(p.type)) continue;
+                string from = hole ? "SPSLL_Socket_Ring" : "SPSLL_Socket_Hole";
+                string to = hole ? "SPSLL_Socket_Hole" : "SPSLL_Socket_Ring";
+                if (p.type.StartsWith(from))
+                {
+                    Undo.RecordObject(p, "YAPS socket kind");
+                    p.type = to + p.type.Substring(from.Length);
+                    EditorUtility.SetDirty(p);
+                }
+            }
+            Build(socket);
+            string was = hole ? "YAPS Ring" : "YAPS Hole";
+            if (t.name == was || t.name.StartsWith(was + " "))
+            {
+                Undo.RecordObject(t.gameObject, "YAPS socket kind");
+                t.name = (hole ? "YAPS Hole" : "YAPS Ring") + t.name.Substring(was.Length);
+            }
+        }
+
+        // --- the build ---------------------------------------------------
+
+        // Unity gives a mesh four vertex light slots per frame and a socket
+        // takes two, on every avatar nearby. Holes first, then rings, then
+        // hierarchy order, so a rebuild keeps the same ones.
+        public static bool WithinLightCap(YapsSocket socket)
+        {
+            if (socket == null) return false;
+            var lit = Lit(socket);
+            return lit.IndexOf(socket) < StartLit;
+        }
+
+        // One socket starts lit: a slot is held for the entering tracker, which
+        // belongs to someone else and cannot be counted at build. The
+        // lighthouse menu moves it. With two lit, the ranking (tracker 0.4906,
+        // front 0.4506, ring root 0.4206, hole root 0.4106) dropped the hole.
+        const int StartLit = 1;
+
+        // The sockets asking for lights on this avatar, in the order they
+        // get them.
+        public static System.Collections.Generic.List<YapsSocket> Lit(YapsSocket socket)
+        {
+            var avatar = socket.GetComponentInParent<CVRAvatar>(true);
+            var root = avatar != null ? avatar.transform : socket.transform.root;
+            return root.GetComponentsInChildren<YapsSocket>(true)
+                .Where(s => s != null && s.emitLights)
+                .OrderBy(s => s.kind == YapsSocket.SocketKind.Hole ? 0 : 1)
+                .ThenBy(s => YapsScanner.StablePath(s.transform, root))
+                .ToList();
+        }
+
+        // What Build tells the user when it withheld a socket's lights.
+        public static string LightCapNote(YapsSocket socket)
+        {
+            if (socket == null || !socket.emitLights || WithinLightCap(socket)) return null;
+            var kept = Lit(socket).Take(StartLit).Select(s => $"\"{s.name}\"").ToList();
+            // Four vertex light slots per mesh: a socket takes two and the
+            // entering tracker a third, so a second lit socket evicts a hole's root.
+            return $"marker lights start dark: only {string.Join(", ", kept)} {(kept.Count == 1 ? "starts" : "start")} lit. The " +
+                   "\"Marker lights\" menu entry lights one socket at a time. Only DPS plugs need " +
+                   "them; YAPS plugs find this socket through the screen atlas.";
+        }
+
+        // Lights and pointers as children, replacing what it built before.
+        public static void Build(YapsSocket socket)
+        {
+            if (socket == null) return;
+            var t = socket.transform;
+            bool hole = socket.kind == YapsSocket.SocketKind.Hole;
+
+            // What is already announced outside the toolkit's folders. Only
+            // what is missing is added; only the folders are replaced.
+            bool hasRootLight = false, hasFrontLight = false;
+            var havePointers = new System.Collections.Generic.HashSet<string>();
+            foreach (var l in t.GetComponentsInChildren<Light>(true))
+            {
+                if (l.transform.IsChildOf(t) && Owned(l.transform, t)) continue;
+                if (!YapsScanner.IsProtocolLight(l)) continue;
+                int d = YapsScanner.LightDigit(l);
+                // 1 to 4 legacy roots, 7 the YAPS root; 5 and 6 legacy fronts, 0
+                // the YAPS front.
+                if ((d >= 1 && d <= 4) || d == 7) hasRootLight = true;
+                if (d == 5 || d == 6 || d == 0) hasFrontLight = true;
+            }
+            foreach (var p in t.GetComponentsInChildren<CVRPointer>(true))
+            {
+                if (p == null || string.IsNullOrEmpty(p.type) || Owned(p.transform, t)) continue;
+                havePointers.Add(p.type);
+            }
+
+            Replace(t, LightsName, lights =>
+            {
+                if (!socket.emitLights) return;
+                // Every socket carries its pair; only the capped one starts on. A
+                // disabled light never enters Unity's ranking.
+                if (!hasRootLight) MarkerLight(lights, "Root", hole ? HoleRange : RingRange, Vector3.zero);
+                if (!hasFrontLight) MarkerLight(lights, "Front", FrontRange, new Vector3(0, 0, FrontOffset));
+                lights.gameObject.SetActive(WithinLightCap(socket));
+            });
+
+            // The atlas writer, on every socket: YAPS plugs find sockets
+            // through it.
+            Replace(t, AtlasName, atlas =>
+            {
+                YapsAtlas.AddWriter(atlas, YapsAtlas.KindOf(socket), socket.tags);
+                // Its readout, where a menu can show it.
+                if (socket.readout && socket.GetComponentInParent<CVRAvatar>(true) != null) YapsDebugOverlayBuilder.AddSocketReadout(atlas);
+            });
+
+            Replace(t, PointersName, pointers =>
+            {
+                string spsRoot = hole ? "SPSLL_Socket_Hole" : "SPSLL_Socket_Ring";
+                bool anySpsRoot = havePointers.Any(k => k.StartsWith("SPSLL_Socket_Root") || k.StartsWith("SPSLL_Socket_Hole") || k.StartsWith("SPSLL_Socket_Ring"));
+                // Each tag twice: the _SelfNotOnHips twin is the SELF channel,
+                // which the Self trigger listens for alone.
+                if (!anySpsRoot)
+                {
+                    Pointer(pointers, "Socket Root", spsRoot, Vector3.zero);
+                    Pointer(pointers, "Socket Root Self", spsRoot + Twin, Vector3.zero);
+                }
+                if (!havePointers.Any(k => k.StartsWith("SPSLL_Socket_Front")))
+                {
+                    Pointer(pointers, "Socket Front", "SPSLL_Socket_Front", new Vector3(0, 0, FrontOffset));
+                    Pointer(pointers, "Socket Front Self", "SPSLL_Socket_Front" + Twin,
+                        new Vector3(0, 0, FrontOffset));
+                }
+                if (!havePointers.Any(k => k.StartsWith("TPS_Orf_Root")))
+                {
+                    Pointer(pointers, "Socket Root (for older plugs)", "TPS_Orf_Root", Vector3.zero);
+                    Pointer(pointers, "Socket Root Self (for older plugs)", "TPS_Orf_Root" + Twin, Vector3.zero);
+                }
+                if (!havePointers.Any(k => k.StartsWith("TPS_Orf_Norm")))
+                {
+                    Pointer(pointers, "Socket Front (for older plugs)", "TPS_Orf_Norm", new Vector3(0, 0, FrontOffset));
+                    Pointer(pointers, "Socket Front Self (for older plugs)", "TPS_Orf_Norm" + Twin,
+                        new Vector3(0, 0, FrontOffset));
+                }
+            });
+
+            var avatar = socket.GetComponentInParent<CVRAvatar>(true);
+            BuildExit(socket, avatar);
+
+            // The avatar renumbers it; a prop's or world's still needs one for its bucket.
+            if (avatar != null) YapsOwner.ApplySelf(avatar.gameObject);
+            else YapsOwner.NumberWriters(YapsNativeBuilder.AvatarRoot(socket.transform).gameObject, false);
+        }
+
+        // --- portals ----------------------------------------------------------
+
+        // Named for the entrance so the owner layer's path holds; outside the
+        // exit's folders, which its rebuild replaces.
+        public static string ExitName(YapsSocket entrance) => "Atlas Exit (from " + entrance.name + ")";
+
+        // The writer is the entrance's whose name it carries. A duplicated
+        // entrance copies the reference and must not take the writer with it.
+        public static bool Owns(YapsSocket entrance, GameObject writer) =>
+            entrance != null && writer != null && entrance.builtExit == writer && writer.name == ExitName(entrance);
+
+        // Owned and still under the exit the entrance names. One retargeted
+        // without a rebuild, by a script, still sits under the old exit.
+        public static bool Leads(YapsSocket entrance, GameObject writer) =>
+            Owns(entrance, writer) && entrance.portalExit != null && writer.transform.parent == entrance.portalExit.transform;
+
+        // Why a link builds no writer. Null when it builds one.
+        static string Refused(YapsSocket socket, CVRAvatar avatar)
+        {
+            var exit = socket.portalExit;
+            if (exit == null)
+            {
+                // None and Missing both read null; only the stored id tells them apart.
+                var p = new SerializedObject(socket).FindProperty(nameof(YapsSocket.portalExit));
+                return p != null && p.objectReferenceInstanceIDValue != 0
+                    ? "its portal exit is gone, so it is an ordinary hole. Pick the exit again, or clear the field"
+                    : null;
+            }
+            // Only a hole cuts. The inspector locks Kind; a script or a conversion does not.
+            if (socket.kind != YapsSocket.SocketKind.Hole)
+                return "a ring cannot be a portal entrance, only a hole can. Set Kind to Hole, or clear the field";
+            if (exit == socket) return "its portal exit is itself, so it is an ordinary hole. Pick another socket";
+            if (avatar == null) return null;
+            if (exit.GetComponentInParent<CVRAvatar>(true) != avatar)
+                return $"its portal exit \"{exit.name}\" is not on this avatar, so it is an ordinary hole. " +
+                       "An exit has to be worn by the same avatar as its entrance";
+            return null;
+        }
+
+        static void BuildExit(YapsSocket socket, CVRAvatar avatar)
+        {
+            var old = socket.builtExit;
+            socket.builtExit = null;
+            if (old != null && !ClaimedByAnother(socket, old)) Undo.DestroyObjectImmediate(old);
+            // A prop carries no owner, so its writer would publish nothing.
+            if (socket.portalExit == null || avatar == null || Refused(socket, avatar) != null) return;
+            // One whose record was lost, a copy pasted back for instance.
+            var stale = socket.portalExit.transform.Find(ExitName(socket));
+            if (stale != null && IsExitWriter(stale) && !ClaimedByAnother(socket, stale.gameObject))
+                Undo.DestroyObjectImmediate(stale.gameObject);
+            var made = YapsAtlas.AddExit(socket.portalExit.transform, ExitName(socket));
+            if (made == null) return;
+            Undo.RegisterCreatedObjectUndo(made, "Build YAPS portal");
+            socket.builtExit = made;
+            EditorUtility.SetDirty(socket);
+        }
+
+        // GetComponent hands back a fake null in the editor, so no pattern match.
+        public static bool IsExitWriter(Transform t)
+        {
+            var r = t != null ? t.GetComponent<MeshRenderer>() : null;
+            return r != null && YapsAtlas.IsExit(r.sharedMaterial);
+        }
+
+        static bool ClaimedByAnother(YapsSocket socket, GameObject writer) =>
+            writer.transform.root.GetComponentsInChildren<YapsSocket>(true).Any(s => s != socket && Owns(s, writer));
+
+        // What Build tells the user about a portal, starting with a mark the
+        // windows colour by. Null when the socket is not an entrance.
+        public static string PortalNote(YapsSocket socket)
+        {
+            if (socket == null) return null;
+            var avatar = socket.GetComponentInParent<CVRAvatar>(true);
+            string refused = Refused(socket, avatar);
+            if (refused != null) return "⚠ " + refused + ".";
+            var exit = socket.portalExit;
+            if (exit == null) return null;
+            if (avatar == null)
+                return "⚠ a portal on a prop stays an ordinary hole: a prop has no wearer to key its exit by.";
+            if (!Leads(socket, socket.builtExit))
+                return "⚠ the portal is not built yet: press Build.";
+            string twin = exit.transform.Cast<Transform>().Count(c => c.name == ExitName(socket)) > 1
+                ? $" Another entrance called \"{socket.name}\" leads there too, and only one of them can: rename one and build both."
+                : "";
+            var writer = socket.builtExit.GetComponent<MeshRenderer>();
+            int n = writer != null && writer.sharedMaterial != null
+                ? Mathf.RoundToInt(writer.sharedMaterial.GetFloat("_YAPS_EntranceIndex")) : 0;
+            if (n == 0)
+                return $"⚠ the portal to \"{exit.name}\" is an ordinary hole for now: only an avatar's first " +
+                       $"{YapsOwner.MaxSelfSockets} sockets carry a number, and a portal is found by its number." + twin;
+            return (twin.Length > 0 ? "⚠ " : "✓ ") +
+                   $"a plug with Two At Once that goes in comes out of \"{exit.name}\". Screen atlas only: to any " +
+                   "other plug, by marker light, and to plugs built before 5.0, it is an ordinary hole." + twin;
+        }
+
+        // Inside one of the toolkit's own folders under the socket.
+        static bool Owned(Transform marker, Transform socket)
+        {
+            for (var at = marker; at != null && at != socket; at = at.parent)
+            {
+                if (at.parent == socket && (at.name == LightsName || at.name == PointersName)) return true;
+            }
+            return false;
+        }
+
+        static void Replace(Transform parent, string name, System.Action<Transform> fill)
+        {
+            var old = parent.Find(name);
+            if (old != null) Object.DestroyImmediate(old.gameObject);
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            fill(go.transform);
+            if (go.transform.childCount == 0) Object.DestroyImmediate(go);
+        }
+
+        public static Light MarkerLight(Transform parent, string name, float range, Vector3 at)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = at;
+            var light = go.AddComponent<Light>();
+            light.type = LightType.Point;
+            light.range = range;
+            // Black, never intensity zero: Unity drops a light that adds nothing.
+            light.color = Color.black;
+            light.intensity = 1f;
+            light.bounceIntensity = 0f;
+            light.shadows = LightShadows.None;
+            light.renderMode = LightRenderMode.ForceVertex;
+            return light;
+        }
+
+        public static CVRPointer Pointer(Transform parent, string name, string type, Vector3 at)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = at;
+            var p = go.AddComponent<CVRPointer>();
+            p.type = type;
+            return p;
+        }
+
+        static void EnsureFolder(string path)
+        {
+            if (AssetDatabase.IsValidFolder(path)) return;
+            string parent = System.IO.Path.GetDirectoryName(path).Replace('\\', '/');
+            string leaf = System.IO.Path.GetFileName(path);
+            if (!AssetDatabase.IsValidFolder(parent)) EnsureFolder(parent);
+            AssetDatabase.CreateFolder(parent, leaf);
+        }
+    }
+}
+#endif

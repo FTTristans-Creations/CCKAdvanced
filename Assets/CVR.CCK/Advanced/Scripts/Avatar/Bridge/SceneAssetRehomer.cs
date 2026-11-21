@@ -1,0 +1,402 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.CompilerServices;
+using UnityEditor;
+using UnityEngine;
+
+namespace AvatarBridge
+{
+    // VRCFury bakes meshes, materials and shaders under Packages/com.vrcfury.temp and deletes
+    // that folder on its next build, leaving the avatar invisible or pink. Copies them into the
+    // output folder and repoints the renderers. Sibling of AnimatorMerger.RehomeVolatileAssets.
+    public static class SceneAssetRehomer
+    {
+        const string Category = "Assets";
+
+        // One copy per temp object, or a swap restores a duplicate the mesh is not wearing.
+        sealed class Rescued
+        {
+            internal readonly Dictionary<UnityEngine.Object, UnityEngine.Object> Copies =
+                new Dictionary<UnityEngine.Object, UnityEngine.Object>();
+            // Source container path to its copy. Per avatar: the copies live in its output folder.
+            internal readonly Dictionary<string, string> Containers = new Dictionary<string, string>();
+            // Set only while Run walks the renderers, whose mesh and material copies are written
+            // in one batch at its end. Null for a later caller, which may load its copy at once.
+            internal List<(UnityEngine.Object Copy, string Path)> Pending;
+            internal List<string> Stale;
+        }
+
+        static readonly ConditionalWeakTable<BridgeContext, Rescued> PerConversion =
+            new ConditionalWeakTable<BridgeContext, Rescued>();
+
+        static Rescued StateOf(BridgeContext ctx) => PerConversion.GetValue(ctx, _ => new Rescued());
+
+        static bool IsVolatile(UnityEngine.Object obj)
+        {
+            if (obj == null)
+            {
+                return false;
+            }
+            // Fury's temp and NDMF's __Generated (used once Modular Avatar is installed); both
+            // are wiped by the next play mode bake.
+            return AnimatorMerger.IsDoomedGeneratedPath(AssetDatabase.GetAssetPath(obj));
+        }
+
+        public static void Run(BridgeContext ctx)
+        {
+            var skinned = ctx.Target.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            var filters = ctx.Target.GetComponentsInChildren<MeshFilter>(true);
+            var renderers = ctx.Target.GetComponentsInChildren<Renderer>(true);
+
+            if (!AnyVolatile(skinned, filters, renderers))
+            {
+                return; // everything is a permanent project asset: nothing to rescue
+            }
+
+            string dir = ctx.OutputDir.TrimEnd('/') + "/RehomedAssets";
+            OutputAssetPaths.EnsureFolder(dir);
+
+            var state = StateOf(ctx);
+            state.Pending = new List<(UnityEngine.Object, string)>();
+            state.Stale = new List<string>();
+            try
+            {
+                foreach (var smr in skinned)
+                {
+                    var m = (Mesh)Rehome(ctx, smr.sharedMesh);
+                    if (m != smr.sharedMesh) { smr.sharedMesh = m; EditorUtility.SetDirty(smr); }
+                }
+                foreach (var mf in filters)
+                {
+                    var m = (Mesh)Rehome(ctx, mf.sharedMesh);
+                    if (m != mf.sharedMesh) { mf.sharedMesh = m; EditorUtility.SetDirty(mf); }
+                }
+                foreach (var r in renderers)
+                {
+                    RehomeMaterials(ctx, r);
+                }
+            }
+            catch
+            {
+                // The renderers already point at the copies, so they are written either way,
+                // and a failure writing them must not hide the one that stopped the loop.
+                try { WritePending(state); }
+                catch (System.Exception e) { Debug.LogException(e); }
+                throw;
+            }
+            WritePending(state);
+            AssetDatabase.SaveAssets();
+
+            int meshes = 0, materials = 0, shaders = 0, textures = 0;
+            foreach (var pair in StateOf(ctx).Copies)
+            {
+                if (pair.Key == pair.Value) continue;   // left in place, nothing copied
+                if (pair.Key is Mesh) meshes++;
+                else if (pair.Key is Material) materials++;
+                else if (pair.Key is Shader) shaders++;
+                else if (pair.Key is Texture) textures++;
+            }
+            ctx.Report.Converted(Category,
+                $"Re-homed {BridgeElements.Count(meshes, "mesh", "meshes")}, {BridgeElements.Count(materials, "material", "materials")}, {BridgeElements.Count(shaders, "shader", "shaders")}, " +
+                $"{BridgeElements.Count(textures, "texture", "textures")} out of temp",
+                "VRCFury deletes Packages/com.vrcfury.temp on its next build, leaving the avatar invisible, " +
+                "pink or missing textures. Saved to " + dir + ".");
+        }
+
+        // The animator's rescue of swap-clip references in one batch, as Run's: each copied
+        // material was a write and an import of its own.
+        internal static void Batched(BridgeContext ctx, System.Action body)
+        {
+            var state = StateOf(ctx);
+            if (state.Pending != null)
+            {
+                body();
+                return;
+            }
+            state.Pending = new List<(UnityEngine.Object, string)>();
+            state.Stale = new List<string>();
+            try
+            {
+                body();
+            }
+            catch
+            {
+                try { WritePending(state); }
+                catch (System.Exception e) { Debug.LogException(e); }
+                throw;
+            }
+            WritePending(state);
+        }
+
+        // The four kinds a renderer wears, through the same map, so swap-clip rescue reuses the
+        // renderers' copies. False for other kinds.
+        internal static bool TryRehome(BridgeContext ctx, UnityEngine.Object value, out UnityEngine.Object copy)
+        {
+            copy = value;
+            if (!(value is Mesh || value is Material || value is Shader || value is Texture))
+            {
+                return false;
+            }
+            copy = Rehome(ctx, value);
+            return true;
+        }
+
+        static UnityEngine.Object Rehome(BridgeContext ctx, UnityEngine.Object value)
+        {
+            if (!IsVolatile(value))
+            {
+                return value; // permanent (or null): leave it alone
+            }
+            var copies = StateOf(ctx).Copies;
+            if (copies.TryGetValue(value, out var known))
+            {
+                return known;
+            }
+            string dir = ctx.OutputDir.TrimEnd('/') + "/RehomedAssets";
+            if (!AssetDatabase.IsValidFolder(dir))
+            {
+                OutputAssetPaths.EnsureFolder(dir);
+            }
+            UnityEngine.Object copy;
+            switch (value)
+            {
+                case Mesh mesh: copy = CopyMesh(ctx, mesh, dir); break;
+                case Material material: copy = CopyMaterial(ctx, material, dir); break;
+                case Shader shader: copy = CopyShader(shader, dir); break;
+                case Texture texture: copy = CopyTexture(ctx, texture, dir); break;
+                default: return value;
+            }
+            copies[value] = copy;
+            return copy;
+        }
+
+        static bool AnyVolatile(SkinnedMeshRenderer[] skinned, MeshFilter[] filters, Renderer[] renderers)
+        {
+            foreach (var smr in skinned) if (IsVolatile(smr.sharedMesh)) return true;
+            foreach (var mf in filters) if (IsVolatile(mf.sharedMesh)) return true;
+            foreach (var r in renderers)
+            {
+                foreach (var mat in r.sharedMaterials)
+                {
+                    if (IsVolatile(mat) || (mat != null && IsVolatile(mat.shader))) return true;
+                }
+            }
+            return false;
+        }
+
+        static Mesh CopyMesh(BridgeContext ctx, Mesh mesh, string dir)
+        {
+            var copy = UnityEngine.Object.Instantiate(mesh);
+            copy.name = mesh.name;
+            Create(ctx, copy, $"{dir}/{OutputAssetPaths.SafeFileName(mesh.name)}.asset");
+            return copy;
+        }
+
+        // Claimed now, so names come out in the same order, and written later when Run is
+        // collecting. Only copies finished before they are written come through here: nothing
+        // loads one by path until the batch stops.
+        static void Create(BridgeContext ctx, UnityEngine.Object copy, string desiredPath)
+        {
+            var state = StateOf(ctx);
+            if (state.Pending == null)
+            {
+                AssetDatabase.CreateAsset(copy, OutputAssetPaths.Claim(desiredPath));
+                return;
+            }
+            state.Pending.Add((copy, OutputAssetPaths.Claim(desiredPath, state.Stale)));
+        }
+
+        // One delete and one import for the pass instead of two refreshes per copy. Safe to batch:
+        // meshes name nothing and every asset a material names is already imported.
+        static void WritePending(Rescued state)
+        {
+            var pending = state.Pending;
+            var stale = state.Stale;
+            state.Pending = null;
+            state.Stale = null;
+            try
+            {
+                if (stale.Count > 0)
+                {
+                    AssetDatabase.DeleteAssets(stale.ToArray(), new List<string>());
+                }
+            }
+            finally
+            {
+                // A failed delete still writes: an unwritten copy is lost at the scene save.
+                if (pending.Count > 0)
+                {
+                    AssetDatabase.StartAssetEditing();
+                    try
+                    {
+                        foreach (var (copy, path) in pending)
+                        {
+                            AssetDatabase.CreateAsset(copy, path);
+                        }
+                    }
+                    finally
+                    {
+                        AssetDatabase.StopAssetEditing();
+                    }
+                }
+            }
+        }
+
+        static void RehomeMaterials(BridgeContext ctx, Renderer r)
+        {
+            var mats = r.sharedMaterials;
+            bool changed = false;
+            for (int i = 0; i < mats.Length; i++)
+            {
+                var rehomed = (Material)Rehome(ctx, mats[i]);
+                if (rehomed != mats[i])
+                {
+                    mats[i] = rehomed;
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                r.sharedMaterials = mats;
+                EditorUtility.SetDirty(r);
+            }
+        }
+
+        static Material CopyMaterial(BridgeContext ctx, Material mat, string dir)
+        {
+            var copy = UnityEngine.Object.Instantiate(mat);
+            copy.name = mat.name;
+            // A generated (SPS/locked) shader lives in temp too; rescue it so the copy isn't pink.
+            // Before the textures: assigning a shader can drop properties, and doing it after
+            // would undo them.
+            if (Rehome(ctx, copy.shader) is Shader shader && shader != copy.shader)
+            {
+                ShaderSpiPatcher.Wear(copy, shader);
+            }
+            // And its textures: Instantiate keeps texture references verbatim, so a rescued
+            // material still pointed into the wiped folder (Fury packs baked textures in one
+            // "VRCFury Other.asset"). Showed in game as particles drawing as white squares.
+            RehomeTextures(ctx, copy);
+            Create(ctx, copy, $"{dir}/{OutputAssetPaths.SafeFileName(mat.name)}.mat");
+            return copy;
+        }
+
+        static void RehomeTextures(BridgeContext ctx, Material mat)
+        {
+            var shader = mat.shader;
+            if (shader == null)
+            {
+                return;
+            }
+            for (int i = 0; i < ShaderUtil.GetPropertyCount(shader); i++)
+            {
+                if (ShaderUtil.GetPropertyType(shader, i) != ShaderUtil.ShaderPropertyType.TexEnv)
+                {
+                    continue;
+                }
+                string property = ShaderUtil.GetPropertyName(shader, i);
+                var texture = mat.GetTexture(property);
+                if (Rehome(ctx, texture) is Texture rescued && rescued != texture)
+                {
+                    mat.SetTexture(property, rescued);
+                }
+            }
+        }
+
+        // A file of only textures is copied once, byte for byte. A 2D texture inside anything
+        // else comes out alone (one bake kept four inside its FX controller). Other kinds keep
+        // the whole copy, since only a 2D clone has been measured.
+        static Texture CopyTexture(BridgeContext ctx, Texture texture, string dir)
+        {
+            string source = AssetDatabase.GetAssetPath(texture);
+            if (texture is Texture2D flat && !OnlyTextures(source))
+            {
+                return CloneTexture(flat, dir);
+            }
+            var containers = StateOf(ctx).Containers;
+            if (!containers.TryGetValue(source, out string copyPath))
+            {
+                string wanted = $"{dir}/{OutputAssetPaths.SafeFileName(Path.GetFileNameWithoutExtension(source))}" +
+                                Path.GetExtension(source);
+                string claimed = OutputAssetPaths.Claim(wanted);
+                copyPath = AssetDatabase.CopyAsset(source, claimed) ? claimed : null;
+                containers[source] = copyPath;
+            }
+            if (copyPath == null)
+            {
+                return texture;
+            }
+            return Counterpart(texture, source, copyPath) as Texture ?? texture;
+        }
+
+        // Something that will not load could be anything, so it counts against.
+        static bool OnlyTextures(string path)
+        {
+            foreach (var o in AssetDatabase.LoadAllAssetsAtPath(path))
+            {
+                if (!(o is Texture)) return false;
+            }
+            return true;
+        }
+
+        // Instantiate keeps the pixels of a non-readable texture: measured on the GPU.
+        static Texture CloneTexture(Texture2D texture, string dir)
+        {
+            var copy = UnityEngine.Object.Instantiate(texture);
+            copy.name = texture.name;
+            AssetDatabase.CreateAsset(copy, OutputAssetPaths.Claim($"{dir}/{OutputAssetPaths.SafeFileName(texture.name)}.asset"));
+            return copy;
+        }
+
+        static UnityEngine.Object Counterpart(UnityEngine.Object original, string source, string copyPath)
+        {
+            // The import names a file's main object after the file, so a copy's main object can
+            // differ in name from a source still named as it was made.
+            if (AssetDatabase.IsMainAsset(original))
+            {
+                return AssetDatabase.LoadMainAssetAtPath(copyPath);
+            }
+            int index = 0;
+            foreach (var candidate in AssetDatabase.LoadAllAssetsAtPath(source))
+            {
+                if (candidate == original)
+                {
+                    break;
+                }
+                if (Matches(candidate, original))
+                {
+                    index++;
+                }
+            }
+            foreach (var candidate in AssetDatabase.LoadAllAssetsAtPath(copyPath))
+            {
+                if (Matches(candidate, original) && index-- == 0)
+                {
+                    return candidate;
+                }
+            }
+            return null;
+        }
+
+        static bool Matches(UnityEngine.Object candidate, UnityEngine.Object original) =>
+            candidate != null && candidate.name == original.name
+            && candidate.GetType() == original.GetType();
+
+        // Only a shader that is a file of its own can be copied cleanly; one embedded in another
+        // asset is left where it is.
+        static Shader CopyShader(Shader shader, string dir)
+        {
+            if (!AssetDatabase.IsMainAsset(shader))
+            {
+                return shader;
+            }
+            string src = AssetDatabase.GetAssetPath(shader);
+            string dst = OutputAssetPaths.Claim($"{dir}/{OutputAssetPaths.SafeFileName(shader.name)}{Path.GetExtension(src)}");
+            return AssetDatabase.CopyAsset(src, dst)
+                ? AssetDatabase.LoadAssetAtPath<Shader>(dst) ?? shader
+                : shader;
+        }
+    }
+}
+#endif

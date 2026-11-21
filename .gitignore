@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------
+# Unity generated / local-only
+# ---------------------------------------------------------------
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+UserSettings/
+MemoryCaptures/
+[Rr]ecordings/
+sysinfo.txt
+*.pidb
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb.meta
+crashlytics-build.properties
+
+# Unity crash / profiler output
+*.stackdump
+*.tmp
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.DotSettings.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------
+# Only Assets/CVR.CCK ships in the release zip — everything else
+# under Assets/ is local project content and stays out of git.
+# ---------------------------------------------------------------
+Assets/*
+!Assets/CVR.CCK/
+
+# Package payload dependencies live outside Assets/ or are resolved
+# by VCC at install time; keep only the manifests for reference.
+Packages/*
+!Packages/manifest.json
+!Packages/packages-lock.json
+
+# Reference copies of the official CCK kept for diffing.
+Official/
+
+# Stray asset folders dropped at the project root.
+Poi/
+Thry/

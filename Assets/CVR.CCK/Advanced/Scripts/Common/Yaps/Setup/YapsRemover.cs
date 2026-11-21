@@ -1,0 +1,1020 @@
+// Takes a socket or plug out entire, in one undo step, and sweeps up
+// what a hand delete left. Generated files stay for the next bake.
+#if CVR_CCK_EXISTS
+using System.Collections.Generic;
+using System.Linq;
+using ABI.CCK.Components;
+using AvatarBridge.Yaps;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+
+namespace AvatarBridge
+{
+    public static class YapsRemover
+    {
+        // Objects the toolkit puts under a plug or a socket, by name.
+        static readonly string[] OwnChildren = { "YAPS Markers", "YAPS Depth", "YAPS Lights", "YAPS Pointers", "YAPS Atlas" };
+
+        // The material curves Bake writes into the avatar's own clips.
+        static readonly string[] WiredProperties =
+        {
+            // Written beside a curve on the component's own Enabled field,
+            // which is inert, so it goes when the rest of YAPS does.
+            "material._YAPS_Enabled", "material._YAPS_Enabled2",
+            "material._YAPS_BakeScale", "material._YAPS_BakeGirth",
+            "material._YAPS_BakeScale2", "material._YAPS_BakeGirth2",
+            "material._YAPS_ShapeWeights.x", "material._YAPS_ShapeWeights.y", "material._YAPS_ShapeWeights.z", "material._YAPS_ShapeWeights.w",
+            "material._YAPS_ShapeWeights2.x", "material._YAPS_ShapeWeights2.y", "material._YAPS_ShapeWeights2.z", "material._YAPS_ShapeWeights2.w",
+            "material._YAPS_ShapeWeights3.x", "material._YAPS_ShapeWeights3.y", "material._YAPS_ShapeWeights3.z", "material._YAPS_ShapeWeights3.w",
+            "material._YAPS_ShapeWeights4.x", "material._YAPS_ShapeWeights4.y", "material._YAPS_ShapeWeights4.z", "material._YAPS_ShapeWeights4.w",
+        };
+
+        // What Remove would do, for the confirmation, one line each.
+        public static List<string> Plan(YapsSocket socket)
+        {
+            var lines = new List<string>();
+            if (socket == null) return lines;
+            var avatar = socket.GetComponentInParent<CVRAvatar>(true);
+            lines.Add(OwnObject(socket.gameObject, typeof(YapsSocket))
+                ? $"the object \"{socket.name}\" and everything under it"
+                : $"the YAPS Socket component on \"{socket.name}\" and the markers, lights and pointers under it (the object stays: it has other things on it)");
+            if (YapsSocketReactions.Exists(socket))
+                lines.Add($"the animator layer \"{YapsSocketReactions.LayerName(socket)}\" and its parameter");
+            if (YapsSocketReactions.AnimationsExist(socket))
+                lines.Add($"the animator layer \"{YapsSocketReactions.AnimationsLayerName(socket)}\"");
+            if (avatar != null)
+                foreach (var e in ToggleEntriesFor(avatar, socket.gameObject))
+                    lines.Add($"the menu toggle \"{e.name}\"");
+            // The renderer Remove restores, which outlives the socket's mesh field.
+            var baked = socket.bakedRenderer != null ? socket.bakedRenderer : socket.renderer;
+            if (baked != null && socket.bakedFrom != null)
+                lines.Add($"the socket bake on \"{baked.name}\": its material goes back to \"{socket.bakedFrom.name}\"");
+            // Remove takes both ends of a portal, and one of them lives under another socket.
+            if (YapsSocketBuilder.Owns(socket, socket.builtExit))
+                lines.Add($"its portal writer under \"{socket.builtExit.transform.parent.name}\"");
+            foreach (Transform c in socket.transform)
+                if (YapsSocketBuilder.IsExitWriter(c))
+                    lines.Add($"\"{c.name}\" under it, so that entrance becomes an ordinary hole");
+            return lines;
+        }
+
+        public static List<string> Plan(YapsPlug plug)
+        {
+            var lines = new List<string>();
+            if (plug == null) return lines;
+            var avatar = plug.GetComponentInParent<CVRAvatar>(true);
+            var renderer = plug.Target;
+            var sharing = SharingOf(plug);
+            lines.Add(OwnObject(plug.gameObject, typeof(YapsPlug))
+                ? $"the object \"{plug.name}\" and everything under it"
+                : $"the YAPS Plug component on \"{plug.name}\" and its markers (the object stays: it is a bone or a mesh of yours)");
+            var restores = renderer != null ? Restores(plug, sharing, renderer, false) : null;
+            if (restores != null && restores.Count > 0)
+                lines.Add($"the bake on \"{renderer.name}\": " + Describe(restores));
+            var others = YapsToggles.MeshesOf(plug).Where(m => m != renderer).Select(m => $"\"{m.name}\"").ToList();
+            if (others.Count > 0)
+                lines.Add($"the bake on {string.Join(", ", others)}: each back on its own material");
+            // What Remove keeps for the other plugs on the mesh is not listed.
+            if (avatar != null && renderer != null && sharing.Count == 0 && WiredClips(avatar, renderer).Any())
+                lines.Add("the size wiring Bake added to your own animations");
+            if (avatar != null)
+            {
+                foreach (var e in ToggleEntriesFor(avatar, plug))
+                    lines.Add($"the menu toggle \"{e.name}\"");
+            }
+            // Each plug has its own chooser, shared mesh or not.
+            var chooser = avatar != null && plug.Target != null ? ChooserEntry(avatar, YapsTagMenu.Parameter(avatar, plug)) : null;
+            if (chooser != null) lines.Add($"the tag chooser \"{chooser.name}\"");
+            return lines;
+        }
+
+        // Asks, listing what goes, then removes. True when it did.
+        public static bool Ask(YapsSocket socket)
+        {
+            if (socket == null || RefusedPlaying()) return false;
+            if (!Confirm($"Remove socket \"{socket.name}\"?", Plan(socket))) return false;
+            Debug.Log("[YAPS] " + RemoveSocket(socket));
+            return true;
+        }
+
+        public static bool Ask(YapsPlug plug)
+        {
+            if (plug == null || RefusedPlaying()) return false;
+            if (!Confirm($"Remove plug \"{plug.name}\"?", Plan(plug))) return false;
+            Debug.Log("[YAPS] " + RemovePlug(plug));
+            return true;
+        }
+
+        // Removing edits the controller as well as the scene, the same split a build has.
+        static bool RefusedPlaying()
+        {
+            if (!YapsNativeBuilder.Playing) return false;
+            EditorUtility.DisplayDialog("YAPS", YapsNativeBuilder.NotInPlayMode, "OK");
+            return true;
+        }
+
+        static bool Confirm(string title, List<string> plan)
+        {
+            return EditorUtility.DisplayDialog(title,
+                "This removes:\n•  " + string.Join("\n•  ", plan) +
+                "\n\nOne undo step. The files it generated stay in " + YapsNativeBuilder.OutputRoot + " for the next Bake.",
+                "Remove", "Keep");
+        }
+
+        // --- sockets ---------------------------------------------------------
+
+        public static string RemoveSocket(YapsSocket socket)
+        {
+            if (socket == null) return null;
+            string name = socket.name;
+            var avatar = socket.GetComponentInParent<CVRAvatar>(true);
+            var top = YapsNativeBuilder.AvatarRoot(socket.transform);
+            var done = new List<string>();
+
+            Undo.IncrementCurrentGroup();
+            int group = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Remove YAPS socket " + name);
+
+            // Only its own preview: switching one off takes the scene's one preview plug, which
+            // another socket may be watching.
+            if (socket.preview || socket.gameObject.name == YapsPreview.SocketName) YapsPreview.Set(socket, false);
+            // The dropped preview socket goes with its preview, and it was never built into
+            // anything, so there is nothing left to take out.
+            if (socket == null)
+            {
+                Undo.CollapseUndoOperations(group);
+                return $"Removed socket \"{name}\". Undo brings it back.";
+            }
+            YapsShapeSim.Release(socket);
+
+            // Under its current and last-built names: names follow the bone.
+            var controllers = ControllersOf(top);
+            string layer = YapsSocketReactions.LayerName(socket);
+            string parameter = YapsSocketReactions.Parameter(socket);
+            int layers = RemoveLayer(controllers, layer, parameter);
+            if (layers > 0) done.Add($"layer \"{layer}\" out of {BridgeElements.Count(layers, "controller", "controllers")}");
+            if (!string.IsNullOrEmpty(socket.builtLayer) && socket.builtLayer != layer)
+            {
+                int old = RemoveLayer(controllers, socket.builtLayer, socket.builtParameter);
+                if (old > 0) done.Add($"the layer it was built as, \"{socket.builtLayer}\"");
+            }
+            // The depth animations, after the reactions: the depth parameter
+            // goes with whichever of the two layers is the last to read it.
+            string played = YapsSocketReactions.AnimationsLayerName(socket);
+            int playedOut = RemoveLayer(controllers, played, parameter);
+            if (playedOut > 0) done.Add($"layer \"{played}\" out of {BridgeElements.Count(playedOut, "controller", "controllers")}");
+            if (!string.IsNullOrEmpty(socket.builtAnimations) && socket.builtAnimations != played)
+                RemoveLayer(controllers, socket.builtAnimations, parameter);
+            RemoveIfUnused(controllers, YapsSocketReactions.One);
+            // By name, once every layer is out: removing per layer left a
+            // parameter still read by the other layer, or never reached it.
+            RemoveIfUnused(controllers, YapsSocketReactions.LegacyParameter(socket));
+            if (!string.IsNullOrEmpty(socket.builtParameter)) RemoveIfUnused(controllers, socket.builtParameter);
+
+            // The socket's toggle, and the menu animator without it.
+            if (avatar != null)
+            {
+                int before = YapsToggles.Edits;
+                int entries = RemoveEntries(avatar, ToggleEntriesFor(avatar, socket.gameObject));
+                if (entries > 0) done.Add("its menu toggle");
+                string menu = YapsToggles.RefreshMenuAnimator(avatar, before);
+                if (menu != null) done.Add(menu.TrimEnd('.'));
+            }
+
+            // The original goes back on the recorded slot, never assumed 0.
+            var baked = socket.bakedRenderer != null ? socket.bakedRenderer : socket.renderer;
+            int bakedSlot = socket.bakedSlot >= 0 ? socket.bakedSlot : 0;
+            if (baked != null && socket.bakedFrom != null)
+            {
+                var mats = baked.sharedMaterials;
+                if (bakedSlot < mats.Length && mats[bakedSlot] != null
+                    && mats[bakedSlot].HasProperty("_YAPS_Bake") && mats[bakedSlot] != socket.bakedFrom)
+                {
+                    Undo.RecordObject(baked, "Remove YAPS socket");
+                    var wasBaked = mats[bakedSlot];
+                    mats[bakedSlot] = socket.bakedFrom;
+                    baked.sharedMaterials = mats;
+                    // A toggle that swaps this slot still names the bake, and would put it back.
+                    YapsSwapFollow.Follow(baked, bakedSlot, wasBaked, socket.bakedFrom);
+                    done.Add($"\"{baked.name}\" back on \"{socket.bakedFrom.name}\"");
+                }
+            }
+
+            // Its portal's writer, which lives under the exit.
+            if (socket.builtExit != null && YapsSocketBuilder.Owns(socket, socket.builtExit))
+            {
+                done.Add($"its portal writer under \"{socket.builtExit.transform.parent.name}\"");
+                Undo.DestroyObjectImmediate(socket.builtExit);
+            }
+
+            // The objects. Writers under it for entrances that lead here go
+            // with it, as the toolkit's own.
+            var go = socket.gameObject;
+            if (OwnObject(go, typeof(YapsSocket)))
+            {
+                Undo.DestroyObjectImmediate(go);
+                done.Add($"the object \"{name}\"");
+            }
+            else
+            {
+                foreach (var child in OwnChildrenOf(go.transform)) Undo.DestroyObjectImmediate(child.gameObject);
+                Undo.DestroyObjectImmediate(socket);
+                done.Add($"the component on \"{name}\" and the toolkit's objects under it");
+            }
+
+            // The lighthouse without this socket: fewer rows, or gone
+            // entirely when one socket needs no chooser.
+            if (avatar != null)
+            {
+                string lighthouse = null;
+                foreach (var controller in YapsOwner.Targets(avatar)) lighthouse = YapsLighthouse.Build(avatar, controller) ?? lighthouse;
+                if (lighthouse != null) done.Add(lighthouse);
+                string owner = YapsOwner.Wire(avatar);
+                if (owner != null) done.Add(owner);
+                string readout = null;
+                foreach (var controller in YapsOwner.Targets(avatar)) readout = YapsDebugOverlayBuilder.Menu(avatar, controller) ?? readout;
+                if (readout != null) done.Add(readout);
+            }
+            DropAtlasIfUnused(top, done);
+
+            Undo.CollapseUndoOperations(group);
+            // After the sentence, not in it: nothing was rewritten there.
+            return $"Removed socket \"{name}\": " + string.Join(", ", done) + ". Undo brings it all back."
+                   + (YapsOwner.SharedWarning(avatar) is string shared ? $" ✗ {shared}." : "");
+        }
+
+        // --- plugs -----------------------------------------------------------
+
+        public static string RemovePlug(YapsPlug plug)
+        {
+            if (plug == null) return null;
+            string name = plug.name;
+            var avatar = plug.GetComponentInParent<CVRAvatar>(true);
+            var top = YapsNativeBuilder.AvatarRoot(plug.transform);
+            var renderer = plug.Target;
+            var done = new List<string>();
+            // Other plugs on the mesh share its toggle, size wiring and slots,
+            // so those stay.
+            var sharing = SharingOf(plug);
+
+            Undo.IncrementCurrentGroup();
+            int group = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Remove YAPS plug " + name);
+
+            if (renderer != null)
+            {
+                // The readout first: its slot carries the bake texture too,
+                // and left in place it would be restored as a plug material.
+                Renderer readoutOn = plug.readoutRenderer;
+                if (plug.readoutRenderer != null)
+                {
+                    Undo.RecordObject(plug.readoutRenderer, "Remove YAPS plug");
+                    Undo.RecordObject(plug, "Remove YAPS plug");
+                    YapsDebugOverlayBuilder.Drop(plug);
+                    done.Add("the debug readout off its mesh");
+                }
+
+                // The bake: the material it replaced back in its slot; when
+                // that cannot be found, the deform off and the source shader
+                // back where it is known.
+                var restores = Restores(plug, sharing, renderer, true);
+                if (restores.Count > 0)
+                {
+                    var mats = renderer.sharedMaterials;
+                    Undo.RecordObject(renderer, "Remove YAPS plug");
+                    var clips = YapsSwapFollow.RunnableClips(renderer.transform);
+                    foreach (var (slot, back, _) in restores)
+                    {
+                        if (back != null)
+                        {
+                            // A toggle that swaps this slot still names the bake, and would put it back.
+                            YapsSwapFollow.Follow(renderer, slot, mats[slot], back, null, clips);
+                            mats[slot] = back;
+                            continue;
+                        }
+                        var m = mats[slot];
+                        Undo.RecordObject(m, "Remove YAPS plug");
+                        m.SetFloat("_YAPS_Enabled", 0f);
+                        var shader = YapsShaderPatcher.OriginalShaderOf(m);
+                        if (shader != null) YapsShaderPatcher.Wear(m, shader);
+                        EditorUtility.SetDirty(m);
+                    }
+                    renderer.sharedMaterials = mats;
+                    done.Add($"\"{renderer.name}\" with " + Describe(restores));
+                }
+
+                // The mesh from before the second copy, while the copy is on it.
+                if (plug.dupFrom != null && renderer is SkinnedMeshRenderer copied && YapsDuplicate.Is(copied.sharedMesh))
+                {
+                    Undo.RecordObject(copied, "Remove YAPS plug");
+                    copied.sharedMesh = plug.dupFrom;
+                    YapsDebugOverlayBuilder.Replaced(copied, plug.dupFrom);
+                    done.Add($"\"{renderer.name}\" back on the mesh from before its second copy");
+                }
+
+                // Only while this split is the last on the mesh; a later one
+                // moved more triangles off the same copy.
+                if (plug.splitFrom != null && renderer is SkinnedMeshRenderer skin && skin.sharedMesh != null
+                    && skin.sharedMesh.subMeshCount == plug.splitFrom.subMeshCount + 1)
+                {
+                    Undo.RecordObject(skin, "Remove YAPS plug");
+                    skin.sharedMesh = plug.splitFrom;
+                    skin.sharedMaterials = skin.sharedMaterials.Take(plug.splitFrom.subMeshCount).ToArray();
+                    YapsDebugOverlayBuilder.Replaced(skin, plug.splitFrom);
+                    done.Add($"\"{renderer.name}\" back on the mesh from before its slot split off");
+                }
+
+                // The pre-bounds plain mesh, unless another plug still bends past
+                // those bounds: it keeps the copy and takes the record.
+                var filter = renderer.GetComponent<MeshFilter>();
+                if (plug.boundsFrom != null && filter != null && filter.sharedMesh != null
+                    && AssetDatabase.GetAssetPath(filter.sharedMesh).EndsWith(" bounds.asset"))
+                {
+                    if (sharing.Count == 0)
+                    {
+                        Undo.RecordObject(filter, "Remove YAPS plug");
+                        filter.sharedMesh = plug.boundsFrom;
+                        done.Add($"\"{renderer.name}\" back on its own mesh, without the widened bounds");
+                    }
+                    else
+                    {
+                        foreach (var other in sharing.Where(p => p.boundsFrom == null))
+                        {
+                            Undo.RecordObject(other, "Remove YAPS plug");
+                            other.boundsFrom = plug.boundsFrom;
+                        }
+                    }
+                }
+
+                // The size wiring in the avatar's own clips.
+                if (avatar != null && sharing.Count == 0)
+                {
+                    int stripped = StripWiring(avatar, renderer);
+                    if (stripped > 0) done.Add($"size wiring out of {BridgeElements.Count(stripped, "clip", "clips")}");
+                }
+
+                // Any other plug's readout on the same mesh, built again over
+                // the materials the bake put back.
+                YapsDebugOverlayBuilder.Build(readoutOn, null);
+            }
+
+            // Other meshes the bake reached, or they bend with the plug gone.
+            // Only recorded slots, each back on its own original.
+            foreach (var mesh in YapsToggles.MeshesOf(plug).Where(m => m != renderer))
+            {
+                var mats = mesh.sharedMaterials;
+                int back = 0;
+                Undo.RecordObject(mesh, "Remove YAPS plug");
+                foreach (var b in plug.bakedSlots)
+                {
+                    if (b == null || b.renderer != mesh || b.was == null || b.slot >= mats.Length) continue;
+                    if (mats[b.slot] == null || !mats[b.slot].HasProperty("_YAPS_Bake")) continue;
+                    YapsSwapFollow.Follow(mesh, b.slot, mats[b.slot], b.was);
+                    mats[b.slot] = b.was;
+                    back++;
+                }
+                mesh.sharedMaterials = mats;
+                if (back > 0) done.Add($"\"{mesh.name}\" back on its own {BridgeElements.Count(back, "material", "materials")}");
+                if (avatar != null)
+                {
+                    int stripped = StripWiring(avatar, mesh);
+                    if (stripped > 0) done.Add($"size wiring out of {BridgeElements.Count(stripped, "clip", "clips")} on \"{mesh.name}\"");
+                }
+            }
+
+            if (avatar != null)
+            {
+                int before = YapsToggles.Edits;
+                int entries = RemoveEntries(avatar, ToggleEntriesFor(avatar, plug));
+                if (entries > 0) done.Add(entries > 1 ? "its menu toggles" : "its menu toggle");
+                string menu = YapsToggles.RefreshMenuAnimator(avatar, before);
+                if (menu != null) done.Add(menu.TrimEnd('.'));
+                // The tag chooser, before the plug goes. Its own, also when
+                // another plug shares the mesh: each plug has one.
+                if (plug.Target != null)
+                {
+                    string key = YapsTagMenu.Parameter(avatar, plug);
+                    if (RemoveChoosers(avatar, ControllersOf(top), k => k == key).Count > 0) done.Add("its tag chooser");
+                }
+            }
+
+            var go = plug.gameObject;
+            if (OwnObject(go, typeof(YapsPlug)))
+            {
+                Undo.DestroyObjectImmediate(go);
+                done.Add($"the object \"{name}\"");
+            }
+            else
+            {
+                foreach (var child in OwnChildrenOf(go.transform)) Undo.DestroyObjectImmediate(child.gameObject);
+                Undo.DestroyObjectImmediate(plug);
+                done.Add($"the component on \"{name}\" and its markers");
+            }
+
+            // The contact channel, when this was the last baked plug.
+            if (avatar != null && !avatar.GetComponentsInChildren<YapsPlug>(true)
+                    .Any(p2 => p2 != null && p2 != plug && p2.Target != null && BakedSlots(p2.Target).Any()))
+            {
+                int cleared = YapsNativeChannel.Clear(avatar);
+                if (cleared > 0)
+                {
+                    done.Add($"the contact channel ({BridgeElements.Count(cleared, "object, layer or parameter", "objects, layers and parameters")}): no baked plug left to carry it");
+                }
+            }
+
+            string owner = YapsOwner.Wire(avatar);
+            if (owner != null) done.Add(owner);
+            string readout = null;
+            foreach (var controller in YapsOwner.Targets(avatar)) readout = YapsDebugOverlayBuilder.Menu(avatar, controller) ?? readout;
+            if (readout != null) done.Add(readout);
+            DropAtlasIfUnused(top, done);
+
+            Undo.CollapseUndoOperations(group);
+            return $"Removed plug \"{name}\": " + string.Join(", ", done) + ". Undo brings it all back."
+                   + (YapsOwner.SharedWarning(avatar) is string shared ? $" ✗ {shared}." : "");
+        }
+
+        // --- leftovers ---------------------------------------------------------
+
+        // What a socket or plug deleted by hand leaves: layers with no
+        // socket, parameters with no layer, toggles aiming at nothing, and
+        // the toolkit's objects with no component above them. Returns one
+        // line per thing removed; empty when the avatar is clean.
+        public static List<string> Sweep(Transform top)
+        {
+            var done = new List<string>();
+            if (top == null) return done;
+            var avatar = top.GetComponentInChildren<CVRAvatar>(true);
+            var sockets = top.GetComponentsInChildren<YapsSocket>(true);
+            var plugs = top.GetComponentsInChildren<YapsPlug>(true);
+            // And the last build's names: a renamed bone moves them.
+            var liveLayers = new HashSet<string>(sockets.Select(YapsSocketReactions.LayerName)
+                .Concat(sockets.Select(YapsSocketReactions.AnimationsLayerName))
+                .Concat(sockets.Select(s => s.builtLayer))
+                .Concat(sockets.Select(s => s.builtAnimations))
+                .Where(n => !string.IsNullOrEmpty(n)));
+
+            Undo.IncrementCurrentGroup();
+            int group = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Clean up YAPS leftovers");
+
+            foreach (var controller in ControllersOf(top))
+            {
+                // Layers named for a socket that is gone.
+                foreach (var layer in controller.layers.ToList())
+                {
+                    string suffix = layer.name.EndsWith(" reactions") ? " reactions"
+                        : layer.name.EndsWith(" animations") ? " animations" : null;
+                    if (!layer.name.StartsWith("YAPS ") || suffix == null || liveLayers.Contains(layer.name)) continue;
+                    string socketName = layer.name.Substring(5, layer.name.Length - 5 - suffix.Length);
+                    var one = new List<AnimatorController> { controller };
+                    // The synced name this build writes, and the local one older builds did.
+                    RemoveLayer(one, layer.name, "YAPS/" + Machine(socketName) + "/Depth");
+                    RemoveLayer(one, layer.name, "#YAPS/" + Sanitise(socketName) + "/Depth");
+                    done.Add($"layer \"{layer.name}\" in \"{controller.name}\": its socket is gone");
+                }
+                // Depth parameters no layer reads.
+                foreach (var p in controller.parameters.ToList())
+                {
+                    if (!YapsSocketReactions.IsDepthName(p.name) && p.name != YapsSocketReactions.One) continue;
+                    if (ParameterUsed(controller, p.name)) continue;
+                    Undo.RegisterCompleteObjectUndo(controller, "Clean up YAPS leftovers");
+                    controller.RemoveParameter(p);
+                    EditorUtility.SetDirty(controller);
+                    done.Add($"parameter \"{p.name}\" in \"{controller.name}\": nothing reads it");
+                }
+            }
+
+            if (avatar != null && avatar.avatarSettings != null && avatar.avatarSettings.settings != null)
+            {
+                var dead = new List<ABI.CCK.Scripts.CVRAdvancedSettingsEntry>();
+                foreach (var e in avatar.avatarSettings.settings)
+                {
+                    if (e == null || e.type != ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.Toggle || e.toggleSettings == null) continue;
+                    var t = e.toggleSettings;
+                    if (t.useAnimationClip)
+                    {
+                        // A plug toggle aiming at a path with no bake. Both
+                        // toggles count: the own-sockets one writes no
+                        // _YAPS_Enabled and was swept from live plugs.
+                        if (!Generated(t.animationClip)) continue;
+                        var paths = AnimationUtility.GetCurveBindings(t.animationClip)
+                            .Where(b => Switch(b))
+                            .Select(b => b.path).ToList();
+                        if (paths.Count == 0) continue;
+                        bool live = false;
+                        foreach (string path in paths)
+                        {
+                            var at = BridgeContext.FindByAnimationPath(avatar.transform, path);
+                            var r = at != null ? at.GetComponent<Renderer>() : null;
+                            if (r != null && BakedSlots(r).Any()) live = true;
+                        }
+                        if (live) continue;
+                        dead.Add(e);
+                        done.Add($"menu toggle \"{e.name}\": its plug is gone");
+                    }
+                    // A socket's own toggle: one object, labelled as LabelFor labels a socket. Any
+                    // toggle with its objects gone was taken, the wearer's own included.
+                    else if (t.gameObjectTargets != null && t.gameObjectTargets.Count == 1
+                             && t.gameObjectTargets.All(g => g == null || g.gameObject == null)
+                             && System.Text.RegularExpressions.Regex.IsMatch(e.name ?? "", @"\b(hole|ring)\)?$"))
+                    {
+                        dead.Add(e);
+                        done.Add($"menu toggle \"{e.name}\": every object it switched is gone");
+                    }
+                }
+                int before = YapsToggles.Edits;
+                RemoveEntries(avatar, dead);
+                string menu = YapsToggles.RefreshMenuAnimator(avatar, before);
+                if (menu != null) done.Add(menu.TrimEnd('.'));
+            }
+
+            // Tag choosers keyed on no plug's mesh: Build only walks live plugs.
+            if (avatar != null)
+            {
+                var keys = new HashSet<string>(plugs.Where(p => p != null && p.Target != null)
+                    .Select(p => YapsTagMenu.Parameter(avatar, p)));
+                foreach (string chooser in RemoveChoosers(avatar, ControllersOf(top), k => !keys.Contains(k)))
+                    done.Add($"tag chooser \"{chooser}\": its plug is gone");
+            }
+
+            // The contact channel, once no plug is baked: named by plug index,
+            // so nothing else sweeps it.
+            if (avatar != null && !plugs.Any(p => p != null && p.Target != null && BakedSlots(p.Target).Any()))
+            {
+                int cleared = YapsNativeChannel.Clear(avatar);
+                if (cleared > 0)
+                {
+                    done.Add($"the contact channel ({BridgeElements.Count(cleared, "object, layer or parameter", "objects, layers and parameters")}): no baked plug left to carry it");
+                }
+            }
+
+            // The toolkit's objects with nothing of the toolkit's above them.
+            foreach (var t in top.GetComponentsInChildren<Transform>(true).ToList())
+            {
+                if (t == null || t == top || !OwnChildren.Contains(t.name) || t.parent == null) continue;
+                if (t.parent.GetComponent<YapsSocket>() != null || t.parent.GetComponent<YapsPlug>() != null) continue;
+                done.Add($"\"{t.name}\" under \"{t.parent.name}\": no socket or plug there any more");
+                var shell = t.parent;
+                Undo.DestroyObjectImmediate(t.gameObject);
+                // A socket object the toolkit made, emptied by a remove that
+                // left its atlas behind.
+                if (shell != top && shell.name.StartsWith("YAPS ") && shell.childCount == 0
+                    && shell.GetComponents<Component>().Length == 1)
+                {
+                    done.Add($"the empty \"{shell.name}\"");
+                    Undo.DestroyObjectImmediate(shell.gameObject);
+                }
+            }
+
+            // Portal writers no entrance owns: one deleted by hand, or aimed
+            // elsewhere by a script that never rebuilt.
+            foreach (var t in top.GetComponentsInChildren<Transform>(true).ToList())
+            {
+                if (t == null || !YapsSocketBuilder.IsExitWriter(t)) continue;
+                if (sockets.Any(s => s != null && YapsSocketBuilder.Leads(s, t.gameObject))) continue;
+                done.Add($"\"{t.name}\" under \"{t.parent.name}\": no entrance leads there any more");
+                Undo.DestroyObjectImmediate(t.gameObject);
+            }
+
+            // The readout toggle, once nothing carries a readout. After the
+            // sweep above, which can take a socket's readout with its atlas.
+            if (!top.GetComponentsInChildren<Renderer>(true).Any(r => r.sharedMaterials.Any(YapsDebugOverlayBuilder.IsReadout)))
+            {
+                string readout = null;
+                foreach (var controller in YapsOwner.Targets(avatar)) readout = YapsDebugOverlayBuilder.Menu(avatar, controller) ?? readout;
+                if (readout != null) done.Add(readout);
+            }
+            DropAtlasIfUnused(top, done);
+
+            // Material swaps left naming a copy that was deleted by hand.
+            int back = YapsSwapFollow.RestoreMissing(YapsSwapFollow.RunnableClips(top));
+            if (back > 0)
+                done.Add($"{BridgeElements.Count(back, "material swap", "material swaps")} back on what they held before YAPS: the copy they named was deleted");
+            Undo.CollapseUndoOperations(group);
+            return done;
+        }
+
+        // The atlas grab and clear at the root serve every socket and plug on
+        // it, so they go with the last of them. A converted avatar keeps its
+        // bakes without components, so a baked material still counts.
+        static void DropAtlasIfUnused(Transform top, List<string> done)
+        {
+            if (top == null) return;
+            if (top.GetComponentsInChildren<YapsSocket>(true).Length > 0
+                || top.GetComponentsInChildren<YapsPlug>(true).Length > 0
+                || top.GetComponentsInChildren<Transform>(true).Any(t => t.name == "YAPS Atlas")
+                || top.GetComponentsInChildren<Renderer>(true).Any(r => r.sharedMaterials
+                    .Any(m => m != null && m.HasProperty("_YAPS_Bake"))))
+                return;
+            foreach (string name in new[] { YapsAtlas.GrabName, YapsAtlas.ClearName })
+            {
+                var t = top.Find(name);
+                if (t == null) continue;
+                done.Add($"\"{name}\": nothing on the avatar reads the atlas any more");
+                Undo.DestroyObjectImmediate(t.gameObject);
+            }
+        }
+
+        // --- pieces ----------------------------------------------------------
+
+        // Every animator controller the avatar plays: the uploaded one, the
+        // CCK's base, its override's, and the animator's own.
+        static List<AnimatorController> ControllersOf(Transform top)
+        {
+            var list = new List<AnimatorController>();
+            void Add(RuntimeAnimatorController c)
+            {
+                if (c is AnimatorOverrideController o) c = o.runtimeAnimatorController;
+                if (c is AnimatorController a && !list.Contains(a)) list.Add(a);
+            }
+            if (top == null) return list;
+            var avatar = top.GetComponentInChildren<CVRAvatar>(true);
+            if (avatar != null) Add(avatar.overrides);
+            if (avatar != null && avatar.avatarSettings != null)
+            {
+                Add(avatar.avatarSettings.baseController);
+                Add(avatar.avatarSettings.baseOverrideController);
+            }
+            foreach (var animator in top.GetComponentsInChildren<Animator>(true)) Add(animator.runtimeAnimatorController);
+            return list;
+        }
+
+        static void RemoveIfUnused(List<AnimatorController> controllers, string parameter)
+        {
+            foreach (var controller in controllers)
+            {
+                var p = controller.parameters.FirstOrDefault(x => x.name == parameter);
+                if (p == null || ParameterUsed(controller, parameter)) continue;
+                Undo.RegisterCompleteObjectUndo(controller, "Remove YAPS parameter");
+                controller.RemoveParameter(p);
+                EditorUtility.SetDirty(controller);
+            }
+        }
+
+        static int RemoveLayer(List<AnimatorController> controllers, string layerName, string parameter)
+        {
+            int n = 0;
+            foreach (var controller in controllers)
+            {
+                var layers = controller.layers;
+                int index = System.Array.FindIndex(layers, l => l.name == layerName);
+                if (index < 0) continue;
+                Undo.RegisterCompleteObjectUndo(controller, "Remove YAPS layer");
+                // RemoveLayer clears and destroys the embedded machine itself.
+                controller.RemoveLayer(index);
+                var p = controller.parameters.FirstOrDefault(x => x.name == parameter);
+                if (p != null && !ParameterUsed(controller, parameter)) controller.RemoveParameter(p);
+                EditorUtility.SetDirty(controller);
+                n++;
+            }
+            if (n > 0) AssetDatabase.SaveAssets();
+            return n;
+        }
+
+        // Does any layer still read this parameter: a tree blends by it, a
+        // transition tests it, or a state's speed or time follows it.
+        public static bool ParameterUsed(AnimatorController controller, string parameter)
+        {
+            foreach (var layer in controller.layers)
+            {
+                if (layer.stateMachine == null) continue;
+                foreach (var machine in Machines(layer.stateMachine))
+                {
+                    foreach (var s in machine.states)
+                    {
+                        var state = s.state;
+                        if (state == null) continue;
+                        if (state.speedParameterActive && state.speedParameter == parameter) return true;
+                        if (state.timeParameterActive && state.timeParameter == parameter) return true;
+                        if (state.mirrorParameterActive && state.mirrorParameter == parameter) return true;
+                        if (state.cycleOffsetParameterActive && state.cycleOffsetParameter == parameter) return true;
+                        if (state.motion is BlendTree tree && TreeUses(tree, parameter)) return true;
+                        foreach (var t in state.transitions)
+                            if (t.conditions.Any(c => c.parameter == parameter)) return true;
+                    }
+                    foreach (var t in machine.anyStateTransitions)
+                        if (t.conditions.Any(c => c.parameter == parameter)) return true;
+                    foreach (var t in machine.entryTransitions)
+                        if (t.conditions.Any(c => c.parameter == parameter)) return true;
+                }
+            }
+            return false;
+        }
+
+        static IEnumerable<AnimatorStateMachine> Machines(AnimatorStateMachine root)
+        {
+            yield return root;
+            foreach (var child in root.stateMachines)
+                if (child.stateMachine != null)
+                    foreach (var m in Machines(child.stateMachine)) yield return m;
+        }
+
+        static bool TreeUses(BlendTree tree, string parameter)
+        {
+            if (tree == null) return false;
+            if (tree.blendParameter == parameter || tree.blendParameterY == parameter) return true;
+            foreach (var child in tree.children)
+            {
+                if (child.directBlendParameter == parameter) return true;
+                if (child.motion is BlendTree inner && TreeUses(inner, parameter)) return true;
+            }
+            return false;
+        }
+
+        // The toolkit's toggle for an object: a Toggle entry aiming at it and
+        // nothing else.
+        static IEnumerable<ABI.CCK.Scripts.CVRAdvancedSettingsEntry> ToggleEntriesFor(CVRAvatar avatar, GameObject target)
+        {
+            if (avatar == null || avatar.avatarSettings == null || avatar.avatarSettings.settings == null) yield break;
+            foreach (var e in avatar.avatarSettings.settings)
+            {
+                if (e == null || e.type != ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.Toggle || e.toggleSettings == null) continue;
+                var targets = e.toggleSettings.gameObjectTargets;
+                if (targets == null || targets.Count == 0 || e.toggleSettings.useAnimationClip) continue;
+                if (targets.All(g => g != null && g.gameObject == target)) yield return e;
+            }
+        }
+
+        // The toolkit's toggles for a plug: entries with generated clips
+        // switching _YAPS_Enabled, or _YAPS_SelfAllow for its own sockets
+        // row, on the plug's renderer. On a mesh shared with another plug,
+        // only this plug's: by its label, or by the second plug's own names.
+        static IEnumerable<ABI.CCK.Scripts.CVRAdvancedSettingsEntry> ToggleEntriesFor(CVRAvatar avatar, YapsPlug plug)
+        {
+            if (avatar == null || avatar.avatarSettings == null || avatar.avatarSettings.settings == null || plug.Target == null) yield break;
+            string path = AnimationUtility.CalculateTransformPath(plug.Target.transform, avatar.transform);
+            bool shared = SharingOf(plug).Count > 0;
+            int lane = YapsToggles.LaneOn(plug, plug.Target);
+            string label = YapsToggles.MenuLabelFor(plug);
+            foreach (var e in avatar.avatarSettings.settings)
+            {
+                if (e == null || e.type != ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.Toggle || e.toggleSettings == null) continue;
+                var t = e.toggleSettings;
+                if (!t.useAnimationClip || !Generated(t.animationClip)) continue;
+                var at = AnimationUtility.GetCurveBindings(t.animationClip).Where(b => b.path == path && Switch(b)).ToList();
+                if (at.Count == 0) continue;
+                if (!shared || (e.name != null && e.name.StartsWith(label, System.StringComparison.Ordinal))
+                    || (lane > 0 && at.Any(b => b.propertyName.EndsWith("2", System.StringComparison.Ordinal))))
+                    yield return e;
+            }
+        }
+
+        // A plug's own switch, the first plug's or the second's on a shared mesh.
+        static bool Switch(EditorCurveBinding b) =>
+            YapsToggles.Writes(b, "_YAPS_Enabled") || YapsToggles.Writes(b, "_YAPS_SelfAllow")
+            || YapsToggles.Writes(b, "_YAPS_Enabled2") || YapsToggles.Writes(b, "_YAPS_SelfAllow2");
+
+        // Other plugs baked on the same mesh. Plan and Remove ask the same
+        // question, or the dialog promises what Remove then keeps.
+        static List<YapsPlug> SharingOf(YapsPlug plug)
+        {
+            var renderer = plug.Target;
+            return renderer == null ? new List<YapsPlug>()
+                : YapsNativeBuilder.AvatarRoot(plug.transform).GetComponentsInChildren<YapsPlug>(true)
+                    .Where(p => p != plug && p.Target == renderer).ToList();
+        }
+
+        // A plug's tag chooser: a dropdown, its "YAPS tags" layer and its Int.
+        // No build removes a gone plug's chooser, and its layer kept writing.
+        const string ChooserPrefix = "YAPS/Tags/";
+        const string ChooserLayer = "YAPS tags ";
+
+        static ABI.CCK.Scripts.CVRAdvancedSettingsEntry ChooserEntry(CVRAvatar avatar, string key)
+        {
+            if (avatar.avatarSettings == null || avatar.avatarSettings.settings == null) return null;
+            return avatar.avatarSettings.settings.FirstOrDefault(e => e != null && e.machineName == key);
+        }
+
+        // Every chooser whose key `gone` accepts, wherever any part of it is
+        // left. Returns each one's menu name, or its key when the entry is gone.
+        static List<string> RemoveChoosers(CVRAvatar avatar, List<AnimatorController> controllers, System.Func<string, bool> gone)
+        {
+            var keys = new HashSet<string>(controllers.SelectMany(c => c.parameters).Select(p => p.name)
+                .Concat(controllers.SelectMany(c => c.layers).Where(l => l.name.StartsWith(ChooserLayer))
+                    .Select(l => l.name.Substring(ChooserLayer.Length))));
+            if (avatar.avatarSettings != null && avatar.avatarSettings.settings != null)
+                keys.UnionWith(avatar.avatarSettings.settings.Where(e => e != null).Select(e => e.machineName));
+            var removed = new List<string>();
+            foreach (string key in keys.Where(k => k != null && k.StartsWith(ChooserPrefix) && gone(k)).ToList())
+            {
+                var entry = ChooserEntry(avatar, key);
+                if (entry != null)
+                {
+                    Undo.RecordObject(avatar, "Remove YAPS tag chooser");
+                    avatar.avatarSettings.settings.Remove(entry);
+                    EditorUtility.SetDirty(avatar);
+                }
+                RemoveLayer(controllers, ChooserLayer + key, key);
+                RemoveIfUnused(controllers, key);
+                removed.Add(entry != null ? entry.name : key);
+            }
+            return removed;
+        }
+
+        static int RemoveEntries(CVRAvatar avatar, IEnumerable<ABI.CCK.Scripts.CVRAdvancedSettingsEntry> entries)
+        {
+            var list = entries.ToList();
+            if (list.Count == 0) return 0;
+            Undo.RecordObject(avatar, "Remove YAPS toggle");
+            foreach (var e in list) { avatar.avatarSettings.settings.Remove(e); YapsToggles.NoteRemoved(e.machineName); }
+            EditorUtility.SetDirty(avatar);
+            return list.Count;
+        }
+
+        // On any slot: a second slot's curve reads "material[1]._X".
+        static bool Wired(UnityEditor.EditorCurveBinding b)
+        {
+            return WiredProperties.Contains(YapsToggles.Bare(b.propertyName));
+        }
+
+        // A slot another plug still bends with (its last bake, its shaft, or
+        // only its record). This plug's record passes to it, so its Remove can
+        // restore. The shaft test covers materials baked in place, which have
+        // no record. transfer: false for the confirmation, which changes nothing.
+        static bool KeptFor(YapsPlug plug, List<YapsPlug> sharing, Renderer renderer, int slot, bool transfer)
+        {
+            var material = renderer.sharedMaterials[slot];
+            YapsPlug.BakedSlot RecordOf(YapsPlug p) => p.bakedSlots.FirstOrDefault(b => b != null && b.slot == slot
+                && b.was != null && YapsNativeBuilder.Same(b.renderer, renderer, p));
+            bool Draws(YapsPlug p)
+            {
+                var skin = renderer as SkinnedMeshRenderer;
+                if (skin == null || skin.sharedMesh == null || slot >= skin.sharedMesh.subMeshCount) return false;
+                var mask = YapsSlotSplit.Mask(skin, p.rootBone != null ? p.rootBone : p.transform);
+                return mask != null && skin.sharedMesh.GetTriangles(slot).Any(v => v < mask.Length && mask[v]);
+            }
+            var mine = RecordOf(plug);
+            var keeper = sharing.FirstOrDefault(p => p.readoutSource == material)
+                         ?? sharing.FirstOrDefault(Draws)
+                         ?? (mine == null ? sharing.FirstOrDefault(p => RecordOf(p) != null) : null);
+            if (keeper == null) return false;
+            if (transfer && mine != null && RecordOf(keeper) == null)
+            {
+                Undo.RecordObject(keeper, "Remove YAPS plug");
+                keeper.bakedSlots.Add(new YapsPlug.BakedSlot { slot = slot, was = mine.was, renderer = renderer });
+                EditorUtility.SetDirty(keeper);
+            }
+            return true;
+        }
+
+        // Slots on a renderer holding a baked YAPS material.
+        static IEnumerable<int> BakedSlots(Renderer renderer)
+        {
+            var mats = renderer.sharedMaterials;
+            for (int i = 0; i < mats.Length; i++)
+                if (mats[i] != null && mats[i].HasProperty("_YAPS_Bake") && mats[i].GetTexture("_YAPS_Bake") != null
+                    && !YapsDebugOverlayBuilder.IsReadout(mats[i]))
+                    yield return i;
+        }
+
+        // What this plug's bake recorded for one slot of one renderer.
+        static Material Recorded(YapsPlug plug, Renderer renderer, int slot) =>
+            plug.bakedSlots.FirstOrDefault(b => b != null && b.slot == slot && b.was != null
+                                                && YapsNativeBuilder.Same(b.renderer, renderer, plug))?.was;
+
+        // "Body (YAPS)" in memory, "Body _YAPS_ 1a2b3c4d5e6f" once the file
+        // names it (YapsBaker.Apply), "Body_YAPS_ 1a2b3c4d5e6f" off the mirror
+        // path, with a place key after a slot split and no hash before the
+        // names carried one. The stem is what came before the first marker.
+        static readonly System.Text.RegularExpressions.Regex CloneName =
+            new System.Text.RegularExpressions.Regex(@"^(.+?)\s*(?:\(YAPS\)|_YAPS_)(?: .*)?$");
+
+        // The original a clone was made from, traced by name, including a
+        // hash suffix (exact endings alone left the clone in the slot).
+        // how: what decided it, or why nothing did.
+        static Material OriginalOfSlot(Material clone, out string how)
+        {
+            how = null;
+            if (clone == null) return null;
+            var match = CloneName.Match(clone.name);
+            string stem = match.Success ? match.Groups[1].Value : null;
+            if (string.IsNullOrEmpty(stem)) return null;
+            var found = AssetDatabase.FindAssets("t:Material " + stem)
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Where(pth => !pth.StartsWith(YapsNativeBuilder.OutputRoot + "/", System.StringComparison.Ordinal))
+                .Select(AssetDatabase.LoadAssetAtPath<Material>)
+                .Where(m => m != null && m.name == stem)
+                .ToList();
+            if (found.Count == 1) { how = "found by name"; return found[0]; }
+            if (found.Count > 1)
+            {
+                string source = YapsShaderPatcher.SourceShaderOf(clone);
+                var bySource = found.Where(m => m.shader != null && m.shader.name == source).ToList();
+                if (bySource.Count == 1) { how = "found by name and shader"; return bySource[0]; }
+                how = $"{found.Count} materials named \"{stem}\"; pick the right one by hand";
+            }
+            return null;
+        }
+
+        // Each slot and what goes back (null: deform off). Plan and RemovePlug
+        // both read it, so the dialog matches. Each slot's OWN original first,
+        // keyed by renderer too; then the clone traced by name. bakedFrom is
+        // the PRIMARY's, safe only when one slot is left.
+        static List<(int slot, Material back, string how)> Restores(YapsPlug plug, List<YapsPlug> sharing,
+            Renderer renderer, bool transfer)
+        {
+            var mats = renderer.sharedMaterials;
+            var slots = BakedSlots(renderer).Where(s => !KeptFor(plug, sharing, renderer, s, transfer)).ToList();
+            var list = new List<(int, Material, string)>();
+            foreach (int slot in slots)
+            {
+                string how = "recorded at bake";
+                var back = Recorded(plug, renderer, slot);
+                if (back == null) back = OriginalOfSlot(mats[slot], out how);
+                if (back == null && slots.Count == 1 && plug.bakedFrom != null) { back = plug.bakedFrom; how = "recorded at bake"; }
+                if (back == null && how == null)
+                    how = plug.bakedFrom != null ? "no slot's own original was found" : "the material it replaced was not found";
+                list.Add((slot, back, how));
+            }
+            return list;
+        }
+
+        // One line for what Restores found, worded the same in the dialog and the log.
+        static string Describe(List<(int slot, Material back, string how)> restores)
+        {
+            var put = restores.Where(r => r.back != null).ToList();
+            int off = restores.Count - put.Count;
+            if (put.Count == 0)
+                return $"the deform switched off ({string.Join("; ", restores.Select(r => r.how).Distinct())})";
+            if (restores.Count == 1) return $"its material back to \"{put[0].back.name}\" ({put[0].how})";
+            return $"{put.Count} of its materials each back to its own original"
+                   + (off > 0 ? $", the deform switched off on {off} more" : "");
+        }
+
+        static IEnumerable<AnimationClip> WiredClips(CVRAvatar avatar, Renderer renderer)
+        {
+            string path = AnimationUtility.CalculateTransformPath(renderer.transform, avatar.transform);
+            foreach (var clip in ControllersOf(avatar.transform).SelectMany(YapsCurveMirror.ClipsOf).Distinct())
+            {
+                if (Generated(clip)) continue;
+                if (AnimationUtility.GetCurveBindings(clip).Any(b => b.path == path && Wired(b)))
+                    yield return clip;
+            }
+        }
+
+        static int StripWiring(CVRAvatar avatar, Renderer renderer)
+        {
+            string path = AnimationUtility.CalculateTransformPath(renderer.transform, avatar.transform);
+            int n = 0;
+            foreach (var clip in WiredClips(avatar, renderer).ToList())
+            {
+                Undo.RegisterCompleteObjectUndo(clip, "Remove YAPS plug");
+                foreach (var b in AnimationUtility.GetCurveBindings(clip))
+                    if (b.path == path && Wired(b))
+                        AnimationUtility.SetEditorCurve(clip, b, null);
+                EditorUtility.SetDirty(clip);
+                n++;
+            }
+            if (n > 0) AssetDatabase.SaveAssets();
+            return n;
+        }
+
+        // An object the toolkit made outright: nothing on it but its
+        // transform and the YAPS component, and nothing under it but the
+        // toolkit's own. A bone or a mesh with a component added is not.
+        static bool OwnObject(GameObject go, System.Type component)
+        {
+            // The test and preview plugs carry a mesh of the toolkit's own.
+            if (go.name == "YAPS Test Plug" || go.name == YapsPreview.PlugName) return true;
+            foreach (var c in go.GetComponents<Component>())
+            {
+                if (c is Transform || c == null) continue;
+                if (c.GetType() != component) return false;
+            }
+            for (int i = 0; i < go.transform.childCount; i++)
+                if (!Own(go.transform.GetChild(i))) return false;
+            return true;
+        }
+
+        static IEnumerable<Transform> OwnChildrenOf(Transform t)
+        {
+            for (int i = 0; i < t.childCount; i++)
+                if (Own(t.GetChild(i))) yield return t.GetChild(i);
+        }
+
+        static bool Own(Transform child) => OwnChildren.Contains(child.name) || YapsSocketBuilder.IsExitWriter(child);
+
+        static bool Generated(AnimationClip clip)
+        {
+            string path = clip != null ? AssetDatabase.GetAssetPath(clip) : null;
+            return !string.IsNullOrEmpty(path)
+                   && path.Replace('\\', '/').StartsWith(YapsNativeBuilder.OutputRoot + "/", System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string Sanitise(string s)
+        {
+            foreach (char c in System.IO.Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
+            return s;
+        }
+
+        // The parameter-safe form the reactions use.
+        static string Machine(string s)
+        {
+            string clean = System.Text.RegularExpressions.Regex.Replace(s ?? "", "[^A-Za-z0-9_-]+", "");
+            return string.IsNullOrEmpty(clean) ? "Socket" : clean;
+        }
+    }
+}
+#endif

@@ -1,0 +1,777 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using ABI.CCK.Scripts;
+
+namespace AvatarBridge
+{
+    // Turns layers that only flip objects into native CCK GameObjectToggle entries: targets move
+    // into the menu entry, the layer goes, and the parameter becomes a real bool.
+    public static class ToggleNativizer
+    {
+        const string Category = "Native toggles";
+
+        class TargetInfo
+        {
+            public string Path;
+            public bool OnState;
+        }
+
+        public static void Run(BridgeContext ctx, AnimatorController master, List<AnimatorControllerLayer> vrcLayers)
+        {
+            _appliedTargets.Clear();
+
+            var entriesByParam = new Dictionary<string, CVRAdvancedSettingsEntry>();
+            foreach (var entry in ctx.CvrAvatar.avatarSettings.settings)
+            {
+                if (entry.setting is CVRAdvancesAvatarSettingGameObjectToggle &&
+                    !string.IsNullOrEmpty(entry.machineName) &&
+                    !entriesByParam.ContainsKey(entry.machineName))
+                {
+                    entriesByParam.Add(entry.machineName, entry);
+                }
+            }
+            if (entriesByParam.Count == 0)
+            {
+                return;
+            }
+
+            // Asked once, before anything is mutated: per entry, a "no" could arrive after layers
+            // were already removed, skipping their cleanup. Only the native style needs it.
+            bool useNativeTargets = ctx.Settings.toggleStyle == ToggleStyle.CvrNativeTargets;
+            if (useNativeTargets && TargetsField() == null)
+            {
+                ctx.Report.Warning(Category, "CCK toggle targets not found on this CCK version",
+                    "Keeping animator-based toggles instead.");
+                useNativeTargets = false;
+            }
+
+            var removedMachines = new HashSet<AnimatorStateMachine>();
+            var nativizedParams = new HashSet<string>();
+            var renamedLayers = new List<(AnimatorStateMachine machine, string name)>();
+
+            foreach (var layer in vrcLayers.ToList())
+            {
+                if (layer.stateMachine == null || layer.stateMachine.stateMachines.Length > 0)
+                {
+                    continue;
+                }
+                var refs = SystemStripper.CollectParameterRefs(layer.stateMachine);
+                if (refs.Count != 1)
+                {
+                    continue;
+                }
+                string param = refs.First();
+                if (!entriesByParam.TryGetValue(param, out var entry))
+                {
+                    continue;
+                }
+
+                var targets = AnalyzeToggleLayer(layer.stateMachine, param);
+                if (targets == null || targets.Count == 0)
+                {
+                    continue;
+                }
+
+                if (!useNativeTargets)
+                {
+                    // The layer is already a working Off/On toggle; just give it a
+                    // human name instead of VRCFury's "[FX] [VF121] ..." label.
+                    string friendly = "Toggle " + entry.name;
+                    if (layer.name != friendly && !LayerNameExists(master, new List<AnimatorControllerLayer>(), friendly))
+                    {
+                        renamedLayers.Add((layer.stateMachine, friendly));
+                        ctx.Report.Converted(Category, entry.name,
+                            $"Kept as its own animator layer (renamed from \"{layer.name}\").");
+                    }
+                    continue;
+                }
+
+                ApplyTargets(ctx, entry, targets);
+                removedMachines.Add(layer.stateMachine);
+                vrcLayers.Remove(layer);
+                nativizedParams.Add(param);
+                ctx.Report.Converted(Category, entry.name,
+                    $"{BridgeElements.Count(targets.Count, "object", "objects")} toggled natively by CVR; layer \"{layer.name}\" removed.");
+            }
+
+            // Modern VRCFury merges many toggles as branches of shared direct blend
+            // trees; pull pure object toggles out of those too. Only needed for the
+            // CVR-native style; the layer style expands every branch below instead.
+            if (useNativeTargets)
+            {
+                foreach (var layer in vrcLayers)
+                {
+                    string layerName = layer.name;
+                    SystemStripper.WalkMachines(layer.stateMachine, machine =>
+                    {
+                        foreach (var child in machine.states)
+                        {
+                            if (child.state.motion is BlendTree tree)
+                            {
+                                NativizeTreeToggles(ctx, tree, entriesByParam, nativizedParams, layerName);
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Branches that animate more than object state become plain On/Off layers instead
+            // of staying buried in VRCFury's service tree.
+            var expandedLayers = new List<AnimatorControllerLayer>();
+            var expandedParams = new HashSet<string>();
+            foreach (var layer in vrcLayers)
+            {
+                int before = expandedLayers.Count;
+                SystemStripper.WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state.motion is BlendTree tree)
+                        {
+                            ExpandToggleBranches(ctx, master, tree, entriesByParam, expandedLayers, expandedParams);
+                        }
+                    }
+                });
+                // A branch split out of FX is still FX, so it is kept off the body like its layer.
+                if (AnimatorMerger.FxMachines.Contains(layer.stateMachine))
+                {
+                    for (int i = before; i < expandedLayers.Count; i++)
+                    {
+                        AnimatorMerger.FxMachines.Add(expandedLayers[i].stateMachine);
+                    }
+                }
+            }
+            if (expandedLayers.Count > 0)
+            {
+                master.layers = master.layers.Concat(expandedLayers).ToArray();
+                vrcLayers.AddRange(expandedLayers);
+            }
+
+            // Fury's merged-service layer name means nothing to humans; whatever internal
+            // parameter math survives gets an honest label.
+            var relabeled = master.layers;
+            bool didRelabel = false;
+            for (int i = 0; i < relabeled.Length; i++)
+            {
+                if (relabeled[i].name.Contains("LayerToTreeService"))
+                {
+                    relabeled[i].name = "[FX] Internal Parameter Math (VRCFury)";
+                    didRelabel = true;
+                }
+            }
+            if (didRelabel)
+            {
+                master.layers = relabeled;
+            }
+
+            if (renamedLayers.Count > 0)
+            {
+                var byMachine = renamedLayers.ToDictionary(r => r.machine, r => r.name);
+                var layers = master.layers;
+                for (int i = 0; i < layers.Length; i++)
+                {
+                    if (layers[i].stateMachine != null && byMachine.TryGetValue(layers[i].stateMachine, out var newName))
+                    {
+                        layers[i].name = newName;
+                    }
+                }
+                master.layers = layers;
+            }
+
+            if (removedMachines.Count == 0 && nativizedParams.Count == 0 &&
+                expandedLayers.Count == 0 && renamedLayers.Count == 0)
+            {
+                return;
+            }
+
+            if (removedMachines.Count > 0)
+            {
+                master.layers = master.layers
+                    .Where(l => l.stateMachine == null || !removedMachines.Contains(l.stateMachine))
+                    .ToArray();
+            }
+
+            // The parameter must STAY in the controller: the CCK inspector validates every
+            // menu entry against it and flags a missing one with a red warning. It is
+            // simply retyped to a real bool, which is what the generated toggle drives.
+            var stillReferenced = new HashSet<string>();
+            foreach (var layer in master.layers)
+            {
+                stillReferenced.UnionWith(SystemStripper.CollectParameterRefs(layer.stateMachine));
+            }
+            var parameters = master.parameters;
+            foreach (var param in parameters)
+            {
+                if (nativizedParams.Contains(param.name) && !stillReferenced.Contains(param.name))
+                {
+                    param.type = AnimatorControllerParameterType.Bool;
+                    param.defaultBool = param.defaultFloat != 0f;
+                }
+            }
+            master.parameters = parameters;
+            foreach (var param in nativizedParams)
+            {
+                if (!stillReferenced.Contains(param) && entriesByParam[param].setting != null)
+                {
+                    entriesByParam[param].setting.usedType = CVRAdvancesAvatarSettingBase.ParameterType.Bool;
+                }
+            }
+            if (nativizedParams.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(nativizedParams.Count, "toggle", "toggles")} handed to CVR's own animator builder");
+            }
+            if (expandedLayers.Count > 0 || renamedLayers.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(expandedLayers.Count + renamedLayers.Count, "toggle given its own", "toggles given their own")} animator layer",
+                    "They work from the generated controller without running \"Create Controller\".");
+            }
+        }
+
+        static void NativizeTreeToggles(BridgeContext ctx, BlendTree tree,
+            Dictionary<string, CVRAdvancedSettingsEntry> entriesByParam,
+            HashSet<string> nativizedParams, string layerName)
+        {
+            var children = tree.children;
+            var kept = new List<ChildMotion>(children.Length);
+            bool changed = false;
+            foreach (var child in children)
+            {
+                if (tree.blendType == BlendTreeType.Direct &&
+                    !string.IsNullOrEmpty(child.directBlendParameter) &&
+                    entriesByParam.TryGetValue(child.directBlendParameter, out var entry) &&
+                    child.motion is AnimationClip clip)
+                {
+                    var targets = ExtractPureToggleTargets(clip);
+                    if (targets != null && targets.Count > 0)
+                    {
+                        ApplyTargets(ctx, entry, targets);
+                        nativizedParams.Add(child.directBlendParameter);
+                        changed = true;
+                        ctx.Report.Converted(Category, entry.name,
+                            $"{BridgeElements.Count(targets.Count, "object", "objects")} toggled natively by CVR; branch removed from \"{layerName}\".");
+                        continue; // drop this branch
+                    }
+                }
+                var keptChild = child;
+                if (child.motion is BlendTree subTree)
+                {
+                    NativizeTreeToggles(ctx, subTree, entriesByParam, nativizedParams, layerName);
+                }
+                kept.Add(keptChild);
+            }
+            if (changed)
+            {
+                tree.children = kept.ToArray();
+            }
+        }
+
+        static void ExpandToggleBranches(BridgeContext ctx, AnimatorController master, BlendTree tree,
+            Dictionary<string, CVRAdvancedSettingsEntry> entriesByParam,
+            List<AnimatorControllerLayer> expandedLayers, HashSet<string> expandedParams)
+        {
+            var children = tree.children;
+            var kept = new List<ChildMotion>(children.Length);
+            bool changed = false;
+            foreach (var child in children)
+            {
+                if (tree.blendType == BlendTreeType.Direct &&
+                    !string.IsNullOrEmpty(child.directBlendParameter) &&
+                    entriesByParam.ContainsKey(child.directBlendParameter) &&
+                    !expandedParams.Contains(child.directBlendParameter) &&
+                    child.motion is AnimationClip clip &&
+                    !LayerNameExists(master, expandedLayers, "Toggle " + entriesByParam[child.directBlendParameter].name))
+                {
+                    var entry = entriesByParam[child.directBlendParameter];
+                    var restore = BuildRestoreClip(ctx, clip, entry.name + " Off");
+                    expandedLayers.Add(BuildToggleLayer(master, entry, child.directBlendParameter, clip, restore));
+                    expandedParams.Add(child.directBlendParameter);
+                    changed = true;
+                    ctx.Report.Converted(Category, entry.name,
+                        restore == null
+                            ? "Expanded into a classic On/Off toggle layer (it animates more than object on/off)."
+                            : "Expanded into a classic On/Off toggle layer, with an Off clip restoring the " +
+                              "original materials, which Write Defaults never puts back.");
+                    continue;
+                }
+                var keptChild = child;
+                if (child.motion is BlendTree subTree)
+                {
+                    ExpandToggleBranches(ctx, master, subTree, entriesByParam, expandedLayers, expandedParams);
+                }
+                kept.Add(keptChild);
+            }
+            if (changed)
+            {
+                tree.children = kept.ToArray();
+            }
+        }
+
+        static bool LayerNameExists(AnimatorController master,
+            List<AnimatorControllerLayer> pending, string name)
+        {
+            return master.layers.Any(l => l.name == name) || pending.Any(l => l.name == name);
+        }
+
+        static AnimationClip BuildRestoreClip(BridgeContext ctx, AnimationClip onClip, string name)
+        {
+            AnimationClip restore = null;
+            foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(onClip))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    binding.propertyName, @"^m_Materials\.Array\.data\[(\d+)\]$");
+                if (!match.Success)
+                {
+                    continue; // not a material slot: no known safe restore value
+                }
+                Transform target = string.IsNullOrEmpty(binding.path)
+                    ? ctx.Target.transform
+                    : BridgeContext.FindByAnimationPath(ctx.Target.transform, binding.path);
+                var renderer = target != null ? target.GetComponent<Renderer>() : null;
+                if (renderer == null)
+                {
+                    continue;
+                }
+                int slot = int.Parse(match.Groups[1].Value);
+                var materials = renderer.sharedMaterials;
+                if (slot >= materials.Length || materials[slot] == null)
+                {
+                    continue;
+                }
+                restore = restore != null ? restore : new AnimationClip { name = name };
+                AnimationUtility.SetObjectReferenceCurve(restore, binding, new[]
+                {
+                    new ObjectReferenceKeyframe { time = 0f, value = materials[slot] },
+                    new ObjectReferenceKeyframe { time = 1f / 60f, value = materials[slot] }
+                });
+            }
+            return restore;
+        }
+
+        static AnimatorControllerLayer BuildToggleLayer(AnimatorController master,
+            CVRAdvancedSettingsEntry entry, string parameter, AnimationClip clip, AnimationClip restoreClip)
+        {
+            bool isBoolParam = master.parameters
+                .Any(p => p.name == parameter && p.type == AnimatorControllerParameterType.Bool);
+
+            var off = new AnimatorState { name = "Off", motion = restoreClip, writeDefaultValues = true, hideFlags = HideFlags.HideInHierarchy };
+            var on = new AnimatorState { name = "On", motion = clip, writeDefaultValues = true, hideFlags = HideFlags.HideInHierarchy };
+
+            var toOn = new AnimatorStateTransition
+            {
+                destinationState = on,
+                hasExitTime = false,
+                duration = 0f,
+                hideFlags = HideFlags.HideInHierarchy,
+                conditions = new[]
+                {
+                    new AnimatorCondition
+                    {
+                        parameter = parameter,
+                        mode = isBoolParam ? AnimatorConditionMode.If : AnimatorConditionMode.Greater,
+                        threshold = 0.5f
+                    }
+                }
+            };
+            var toOff = new AnimatorStateTransition
+            {
+                destinationState = off,
+                hasExitTime = false,
+                duration = 0f,
+                hideFlags = HideFlags.HideInHierarchy,
+                conditions = new[]
+                {
+                    new AnimatorCondition
+                    {
+                        parameter = parameter,
+                        mode = isBoolParam ? AnimatorConditionMode.IfNot : AnimatorConditionMode.Less,
+                        threshold = 0.5f
+                    }
+                }
+            };
+            off.transitions = new[] { toOn };
+            on.transitions = new[] { toOff };
+
+            var machine = new AnimatorStateMachine
+            {
+                name = "Toggle " + entry.name,
+                hideFlags = HideFlags.HideInHierarchy,
+                states = new[]
+                {
+                    new ChildAnimatorState { state = off, position = new Vector3(250, 0, 0) },
+                    new ChildAnimatorState { state = on, position = new Vector3(250, 120, 0) }
+                }
+            };
+            bool defaultOn = entry.setting is CVRAdvancesAvatarSettingGameObjectToggle toggle && toggle.defaultValue;
+            machine.defaultState = defaultOn ? on : off;
+
+            return new AnimatorControllerLayer
+            {
+                name = "Toggle " + entry.name,
+                defaultWeight = 1f,
+                blendingMode = AnimatorLayerBlendingMode.Override,
+                stateMachine = machine
+            };
+        }
+
+        static List<TargetInfo> ExtractPureToggleTargets(AnimationClip clip)
+        {
+            var bindings = AnimationUtility.GetCurveBindings(clip);
+            if (bindings.Length == 0)
+            {
+                return null;
+            }
+            var targets = new List<TargetInfo>();
+            foreach (var binding in bindings)
+            {
+                if (binding.type != typeof(GameObject) || binding.propertyName != "m_IsActive")
+                {
+                    return null;
+                }
+                var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                if (curve != null && curve.length > 0)
+                {
+                    targets.Add(new TargetInfo
+                    {
+                        Path = binding.path,
+                        OnState = curve.keys[curve.length - 1].value > 0.5f
+                    });
+                }
+            }
+            if (AnimationUtility.GetObjectReferenceCurveBindings(clip).Length > 0)
+            {
+                return null;
+            }
+            return targets;
+        }
+
+        // ---------------------------------------------------------------- analysis ----
+
+        static List<TargetInfo> AnalyzeToggleLayer(AnimatorStateMachine machine, string param)
+        {
+            var states = machine.states.Select(c => c.state).ToArray();
+            if (states.Length == 0)
+            {
+                return null;
+            }
+
+            // Classify states as ON/OFF from the transition conditions that lead to them.
+            var onness = new Dictionary<AnimatorState, bool>();
+            void Classify(AnimatorTransitionBase t)
+            {
+                if (t.destinationState == null)
+                {
+                    return;
+                }
+                foreach (var c in t.conditions)
+                {
+                    if (c.parameter != param)
+                    {
+                        continue;
+                    }
+                    switch (c.mode)
+                    {
+                        case AnimatorConditionMode.If: onness[t.destinationState] = true; break;
+                        case AnimatorConditionMode.Greater: onness[t.destinationState] = c.threshold >= 0f; break;
+                        case AnimatorConditionMode.IfNot: onness[t.destinationState] = false; break;
+                        case AnimatorConditionMode.Less: onness[t.destinationState] = false; break;
+                        case AnimatorConditionMode.Equals: onness[t.destinationState] = c.threshold != 0f; break;
+                        case AnimatorConditionMode.NotEqual: onness[t.destinationState] = c.threshold == 0f; break;
+                    }
+                }
+            }
+            foreach (var t in machine.anyStateTransitions) Classify(t);
+            foreach (var t in machine.entryTransitions) Classify(t);
+            foreach (var s in states)
+                foreach (var t in s.transitions) Classify(t);
+
+            var onValues = new Dictionary<string, bool>();
+            var offValues = new Dictionary<string, bool>();
+
+            bool Extract(AnimationClip clip, Dictionary<string, bool> into)
+            {
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type != typeof(GameObject) || binding.propertyName != "m_IsActive")
+                    {
+                        return false; // touches materials/blendshapes/transforms: not pure
+                    }
+                    var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                    if (curve != null && curve.length > 0)
+                    {
+                        into[binding.path] = curve.keys[curve.length - 1].value > 0.5f;
+                    }
+                }
+                return AnimationUtility.GetObjectReferenceCurveBindings(clip).Length == 0;
+            }
+
+            foreach (var state in states)
+            {
+                // Shape A: 1D blend tree on the parameter (Fury float toggle).
+                if (state.motion is BlendTree tree)
+                {
+                    if (tree.blendType != BlendTreeType.Simple1D || tree.blendParameter != param)
+                    {
+                        return null;
+                    }
+                    var children = tree.children.OrderBy(c => c.threshold).ToArray();
+                    foreach (var child in children)
+                    {
+                        if (!(child.motion is AnimationClip childClip))
+                        {
+                            return null;
+                        }
+                        bool isOn = child.threshold > 0.5f;
+                        if (!Extract(childClip, isOn ? onValues : offValues))
+                        {
+                            return null;
+                        }
+                    }
+                    continue;
+                }
+
+                if (!(state.motion is AnimationClip clip))
+                {
+                    if (state.motion == null)
+                    {
+                        continue;
+                    }
+                    return null;
+                }
+
+                // Shape B: motion-time state (curve sampled by the parameter itself).
+                if (state.timeParameterActive && state.timeParameter == param)
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        if (binding.type != typeof(GameObject) || binding.propertyName != "m_IsActive")
+                        {
+                            return null;
+                        }
+                        var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                        if (curve == null || curve.length == 0)
+                        {
+                            continue;
+                        }
+                        offValues[binding.path] = curve.keys[0].value > 0.5f;
+                        onValues[binding.path] = curve.keys[curve.length - 1].value > 0.5f;
+                    }
+                    continue;
+                }
+
+                // Shape C: plain ON/OFF states.
+                if (!onness.TryGetValue(state, out var stateOn))
+                {
+                    // A state whose curves attribute to neither on nor off: play safe.
+                    if (AnimationUtility.GetCurveBindings(clip).Length > 0)
+                    {
+                        return null;
+                    }
+                    continue;
+                }
+                if (!Extract(clip, stateOn ? onValues : offValues))
+                {
+                    return null;
+                }
+            }
+
+            // Objects only touched by the OFF state would need inverse handling the CCK
+            // toggle can't express; bail out and keep the animator layer for those.
+            if (offValues.Keys.Any(path => !onValues.ContainsKey(path)))
+            {
+                return null;
+            }
+
+            var result = new List<TargetInfo>();
+            foreach (var pair in onValues)
+            {
+                bool offState = offValues.TryGetValue(pair.Key, out var off) ? off : !pair.Value;
+                if (offState == pair.Value)
+                {
+                    continue; // constant; nothing to toggle
+                }
+                result.Add(new TargetInfo { Path = pair.Key, OnState = pair.Value });
+            }
+            return result;
+        }
+
+        // ------------------------------------------------------------------- apply ----
+
+        // The CCK's native toggle target list, or null on a CCK without one.
+        // The field layout differs between CCK versions and reflection keeps
+        // this compiling either way.
+        static FieldInfo TargetsField()
+        {
+            var field = typeof(CVRAdvancesAvatarSettingGameObjectToggle)
+                .GetField("gameObjectTargets", BindingFlags.Public | BindingFlags.Instance);
+            return field != null && field.FieldType.IsGenericType ? field : null;
+        }
+
+        // Only reached once Run has found the list on this CCK.
+        static void ApplyTargets(BridgeContext ctx, CVRAdvancedSettingsEntry entry, List<TargetInfo> targets)
+        {
+            var toggle = (CVRAdvancesAvatarSettingGameObjectToggle)entry.setting;
+            var field = TargetsField();
+            var list = field.GetValue(toggle) as IList;
+            if (list == null)
+            {
+                list = (IList)Activator.CreateInstance(field.FieldType);
+                field.SetValue(toggle, list);
+            }
+            var elementType = field.FieldType.GetGenericArguments()[0];
+
+            foreach (var target in WithContactHosts(ctx, targets))
+            {
+                var transform = BridgeContext.FindByAnimationPath(ctx.Target.transform, target.Path);
+                if (transform == null)
+                {
+                    ctx.Report.Warning(Category, entry.name,
+                        $"Toggle target \"{target.Path}\" not found on the avatar; skipped.");
+                    continue;
+                }
+                // One parameter can drive two service trees; the same object twice is one target.
+                if (!_appliedTargets.Add($"{entry.machineName}|{target.Path}|{target.OnState}"))
+                {
+                    continue;
+                }
+                var item = Activator.CreateInstance(elementType);
+                AssignTargetMembers(item, transform.gameObject, target.OnState, target.Path);
+                list.Add(item);
+            }
+            EditorUtility.SetDirty(ctx.CvrAvatar);
+        }
+
+        // A contact or collider rebuilt under a rootTransform elsewhere is not under the object
+        // the toggle switches, and a native toggle has no clip for a repoint pass to carry. So
+        // its host joins the toggle, and it stops when its object does.
+        static List<TargetInfo> WithContactHosts(BridgeContext ctx, List<TargetInfo> targets)
+        {
+            var all = new List<TargetInfo>(targets);
+            var hosted = ctx.ContactHosts.Select(p => (path: p.Key.path, hosts: p.Value))
+                .Concat(ctx.PhysicsColliderHosts.Select(p => (path: p.Key, hosts: p.Value)));
+            foreach (var pair in hosted)
+            {
+                // The closest target decides: a clip can switch Outfit on and Outfit/Hat off.
+                var owner = targets.Where(t => IsUnder(pair.path, t.Path))
+                    .OrderByDescending(t => t.Path.Length).FirstOrDefault();
+                if (owner == null || BridgeContext.FindByAnimationPath(ctx.Target.transform, owner.Path) == null) continue;
+                foreach (string host in pair.hosts)
+                {
+                    if (IsUnder(host, owner.Path)) continue;
+                    var go = BridgeContext.FindByAnimationPath(ctx.Target.transform, host);
+                    if (go == null) continue;
+                    // A host off because its object starts off is the toggle's to wake; one off
+                    // because its component was off stays off whatever its object does.
+                    if (ctx.DisabledHosts.Contains(host)) continue;
+                    all.Add(new TargetInfo { Path = host, OnState = owner.OnState });
+                }
+            }
+            return all;
+        }
+
+        internal static List<string> ContactHostsJoiningForTest(BridgeContext ctx, string target, bool onState) =>
+            WithContactHosts(ctx, new List<TargetInfo> { new TargetInfo { Path = target, OnState = onState } })
+                .Skip(1).Select(t => t.Path).ToList();
+
+        static bool IsUnder(string path, string root) =>
+            !string.IsNullOrEmpty(root) && path != null
+            && (path == root || path.StartsWith(root + "/", StringComparison.Ordinal));
+
+        // Every (entry, object, state) handed to the CCK this run, so the
+        // same one written from two branches is not added twice.
+        static readonly HashSet<string> _appliedTargets = new HashSet<string>();
+
+        static void AssignTargetMembers(object item, GameObject go, bool onState, string path)
+        {
+            var fields = item.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance);
+            foreach (var field in fields)
+            {
+                try
+                {
+                    if (field.FieldType == typeof(GameObject))
+                    {
+                        field.SetValue(item, go);
+                    }
+                    else if (field.FieldType == typeof(bool))
+                    {
+                        field.SetValue(item, onState);
+                    }
+                    else if (field.FieldType == typeof(string) &&
+                             field.Name.ToLowerInvariant().Contains("path"))
+                    {
+                        field.SetValue(item, path);
+                    }
+                }
+                catch
+                {
+                    // leave the field at its default
+                }
+            }
+        }
+
+        // The CCK builds toggle clips from each target's stored path and refreshes it only while
+        // the inspector list is drawn. Later passes move and rename objects, so run this last,
+        // computing the path as the CCK inspector does.
+        internal static void RefreshTargetPaths(BridgeContext ctx)
+        {
+            var field = TargetsField();
+            var settings = ctx.CvrAvatar != null ? ctx.CvrAvatar.avatarSettings?.settings : null;
+            if (field == null || settings == null)
+            {
+                return;
+            }
+            var root = ctx.CvrAvatar.transform;
+            int refreshed = 0;
+            foreach (var entry in settings)
+            {
+                if (!(entry?.setting is CVRAdvancesAvatarSettingGameObjectToggle toggle)
+                    || !(field.GetValue(toggle) is IList list))
+                {
+                    continue;
+                }
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var item = list[i];
+                    if (item == null)
+                    {
+                        continue;
+                    }
+                    var fields = item.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance);
+                    var go = fields.Where(f => f.FieldType == typeof(GameObject))
+                        .Select(f => f.GetValue(item) as GameObject)
+                        .FirstOrDefault(g => g != null);
+                    if (go == null || !go.transform.IsChildOf(root))
+                    {
+                        continue;
+                    }
+                    string path = AnimationUtility.CalculateTransformPath(go.transform, root);
+                    foreach (var pathField in fields.Where(f => f.FieldType == typeof(string)
+                                 && f.Name.ToLowerInvariant().Contains("path")))
+                    {
+                        if (pathField.GetValue(item) as string != path)
+                        {
+                            pathField.SetValue(item, path);
+                            refreshed++;
+                        }
+                    }
+                    list[i] = item;
+                }
+            }
+            if (refreshed > 0)
+            {
+                EditorUtility.SetDirty(ctx.CvrAvatar);
+                ctx.Report.Converted(Category, $"{BridgeElements.Count(refreshed, "native toggle target path", "native toggle target paths")} updated",
+                    "Their objects moved or were renamed after the toggle was built.");
+            }
+        }
+    }
+}
+#endif

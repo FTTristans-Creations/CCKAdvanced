@@ -1,0 +1,110 @@
+.unity-scroll-view__content-container {
+    flex-grow: 1;
+}
+
+.unity-text-field__input {
+    -unity-text-align: upper-left;
+    white-space: normal;
+}
+
+.cck-content-tag {
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    max-width: 160px;
+    background-color: rgba(128, 128, 128, 0.2);
+    border-radius: 2px;
+    margin: 1px;
+}
+
+.cck-content-tag > .unity-toggle__input {
+    flex-grow: 0;
+    margin: 2px;
+}
+
+.cck-content-tag > .unity-label {
+    -unity-text-align: middle-left;
+    min-width: 0;
+    padding: 0;
+    margin: 0;
+}
+
+.cck-foldout-root {
+    flex-grow: 0;
+    margin: 5px;
+    padding: 5px;
+    border-color: black;
+    border-width: 1px;
+    border-radius: 5px;
+}
+
+.cck-foldout-arrow {
+    background-image: resource('d_IN_foldout@2x');
+    width: 17px;
+    height: 17px;
+}
+
+.cck-foldout-arrow-on {
+    background-image: resource('d_IN_foldout_on@2x');
+}
+
+.cck-separator {
+    height: 1px;
+    background-color: rgb(0, 0, 0);
+    margin: 2px 5px;
+}
+
+.transparent-dropdown > .unity-popup-field__input {
+    height: 16px;
+    font-size: 11px;
+    background-color: transparent;
+    border-width: 0;
+    padding: 0;
+}
+
+.cck-build-selector {
+    background-image: resource("d_dropdown@2x");
+}
+
+.cck-button-separator {
+    background-color: var(--unity-colors-button-border);
+}
+
+.cck-build-platform-windows {
+    background-image: resource("BuildSettings.Metro@2x");
+}
+
+.cck-build-platform-windows:hover {
+    background-image: resource("BuildSettings.Metro ON@2x");
+}
+
+.cck-build-platform-android {
+    background-image: resource("BuildSettings.Android@2x");
+}
+
+.cck-build-platform-android:hover {
+    background-image: resource("BuildSettings.Android ON@2x");
+}
+
+.cck-tab-icon {
+    -unity-background-image-tint-color: var(--unity-colors-default-text);
+}
+
+.cck-tab:hover > .unity-label {
+    color: white;
+}
+
+.cck-tab:hover > .cck-tab-icon {
+    -unity-background-image-tint-color: white;
+}
+
+.cck-tab-selected > .unity-label {
+    color: white;
+}
+
+.cck-tab-selected > .cck-tab-icon {
+    -unity-background-image-tint-color: white;
+}
+
+.cck-tab-disabled > .unity-label {
+    color: dimgray;
+}

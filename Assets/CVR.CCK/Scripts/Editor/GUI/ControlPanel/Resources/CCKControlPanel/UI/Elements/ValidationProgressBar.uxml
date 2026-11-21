@@ -1,0 +1,8 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" editor-extension-mode="True">
+    <Style src="project://database/Assets/CVR.CCK/Scripts/Editor/GUI/ControlPanel/Resources/CCKControlPanel/UI/ControlPanelStyles.uss?fileID=7433441132597879392&amp;guid=1ddb0f4cf43313e49bfe30377cfbffdb&amp;type=3#ControlPanelStyles" />
+    <ui:VisualElement name="validationProgressBar" style="flex-direction: column; flex-shrink: 1; flex-grow: 0; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 0; border-right-width: 0; border-top-width: 0; border-bottom-width: 0; padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-top: 5px;">
+        <ui:VisualElement style="border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-top-width: 1px; border-right-width: 1px; border-bottom-width: 1px; border-left-width: 1px; flex-direction: column; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px; border-top-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-bottom-left-radius: 5px;">
+            <ui:ProgressBar value="22" title="22%" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

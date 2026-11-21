@@ -1,0 +1,10045 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.IO;
+using System.Text.RegularExpressions;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using VRC.SDK3.Avatars.Components;
+using VRC.SDK3.Avatars.ScriptableObjects;
+using ABI.CCK.Components;
+using ABI.CCK.Scripts;
+
+namespace AvatarBridge
+{
+    // Merges the selected VRChat playable layers into one ChilloutVR
+    // controller on the CCK's AvatarAnimator. Rewrites the VRC-specific
+    // parts: gestures, parameter names, "#" locals, drivers, masks.
+    public static partial class AnimatorMerger
+    {
+        const string Category = "Animator";
+        const int MaxConditionBranches = 64;
+
+        // Aliases of CvrParameterNames, which the toolkit ships without this file.
+        static Dictionary<string, string> ParameterRenameMap => CvrParameterNames.RenameMap;
+        internal static HashSet<string> CvrCoreParameters => CvrParameterNames.Core;
+        static HashSet<string> StreamFedParameters => CvrParameterNames.StreamFed;
+
+        internal static bool IsGameDrivenParameter(string vrcParameterName)
+            => CvrParameterNames.IsGameDriven(vrcParameterName);
+
+        // The list and the test live in CvrParameterNames: the survey reads
+        // them too and ships without this file.
+        internal static readonly HashSet<string> KnownUnsupportedVrcParameters = CvrParameterNames.NeverFedNames;
+
+        public static void Run(BridgeContext ctx)
+        {
+            // Log only, so digests do not move. Steps under 10 ms go into "rest".
+            var times = new List<string>();
+            long rest = 0;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            void Lap(string step)
+            {
+                long ms = clock.ElapsedMilliseconds;
+                if (ms >= 10) times.Add($"{step} {ms}"); else rest += ms;
+                clock.Restart();
+            }
+            CheckNamingTables(ctx);
+            var vrcControllers = GetSelectedVrcControllers(ctx);
+            ReportSkippedLayers(ctx);
+            // Only a gesture layer that actually claims a hand slot costs
+            // ChilloutVR its own hand layers. A proxy-only one claims
+            // nothing, so the CCK's poses must survive.
+            bool convertingGestureLayer = vrcControllers.Any(c =>
+                c.id == VRCAvatarDescriptor.AnimLayerType.Gesture
+                && c.controller != null
+                && c.controller.layers.Any(l => GetCvrHandLayerName(c.id, l) != null));
+
+            // Captured before merging. The saved-controller audit uses
+            // these to tell inherited dead references from introduced ones.
+            _sourceControllerGuids.Clear();
+            foreach (var (_, sourceController) in vrcControllers)
+            {
+                CollectSerializedGuids(AssetDatabase.GetAssetPath(sourceController), _sourceControllerGuids);
+            }
+
+            // The Action transplant and LocomotionGrafter share
+            // per-conversion clone caches. Reset before the merge loop.
+            LocomotionGrafter.ResetClones();
+            DroppedPlayAudio.Clear();
+            DroppedPlayAudioCount = 0;
+            ConvertedPlayAudio.Clear();
+            ApproximatedPlayAudio.Clear();
+            AudioWindowClones.Clear();
+            AudioSourceOwnClips.Clear();
+            LoopedSourceClips.Clear();
+            DroppedPoseSpace.Clear();
+            DroppedPoseSpaceCount = 0;
+            MergedLayerMachines.Clear();
+            FxMachines.Clear();
+            CapturedLayerControls.Clear();
+            LayerControlGoals.Clear();
+
+            AnimatorController master = LoadBaseController(ctx, convertingGestureLayer);
+            var masterLayers = master.layers.ToList();
+            var vrcLayers = new List<AnimatorControllerLayer>();
+
+            // In keep-GoGo mode Base/Additive/Action replace CVR's
+            // locomotion and must run at full weight.
+            bool gogoDrivesLocomotion = !ctx.Settings.stripGogoLoco && SystemStripper.AvatarUsesGogo(ctx);
+            int actionLayersRested = 0;
+            // Action layers the avatar drives itself; see the weight decision below.
+            var actionFeatures = new List<string>();
+            var actionMoved = new List<string>();
+
+            foreach (var (id, controller) in vrcControllers)
+            {
+                // VRChat raises Action from weight 0 only during emotes; merged at 1 it
+                // would run forever. CVR's Locomotion/Emotes layer still plays emotes.
+                bool actionAtRest = id == VRCAvatarDescriptor.AnimLayerType.Action && !gogoDrivesLocomotion;
+                var copier = new AnimatorDeepCopier();
+                MergeParameters(master, controller, ctx);
+
+                int srcIndex = -1;
+                foreach (var srcLayer in controller.layers)
+                {
+                    srcIndex++;
+                    if (srcLayer.syncedLayerIndex >= 0)
+                    {
+                        ctx.Report.Skipped(Category, $"{id} layer \"{srcLayer.name}\"",
+                            "Synced layers cannot survive merging into one controller.");
+                        continue;
+                    }
+
+                    // Proxy-only gesture layer: dropped, or its stand-ins snap the fingers
+                    // over CVR's own hand poses.
+                    if (id == VRCAvatarDescriptor.AnimLayerType.Gesture && IsProxyOnlyLayer(srcLayer))
+                    {
+                        ctx.Report.Converted(Category,
+                            $"Gesture layer \"{srcLayer.name}\" left to ChilloutVR's own hand poses",
+                            "Every clip in it is a VRChat \"proxy_\" placeholder, so the avatar has no hand " +
+                            "poses of its own. ChilloutVR's hand set is kept instead.");
+                        continue;
+                    }
+
+                    // Proxy-only Base: no locomotion, but its landing-state tracking controls
+                    // spin a VR avatar. Handing the head to animation stops the root turning
+                    // with the headset (IKHandlerHalfBody.HandleRootAngle, maxRootAngle 180);
+                    // handing it back turns to catch up. Confirmed in game: Base off, spin gone.
+                    if (id == VRCAvatarDescriptor.AnimLayerType.Base && IsProxyOnlyLayer(srcLayer))
+                    {
+                        int drivers = CountParameterDrivers(srcLayer);
+                        ctx.Report.Converted(Category,
+                            $"Base layer \"{srcLayer.name}\" left to ChilloutVR's own locomotion",
+                            "Every clip in it is a VRChat \"proxy_\" placeholder, so the avatar has no " +
+                            "walking, jumping or landing of its own. Its landing states also told " +
+                            "ChilloutVR to stop steering the body by the headset and then start again, " +
+                            "which in VR set the avatar spinning on the spot. Left out whole; ChilloutVR's " +
+                            "locomotion is used." +
+                            (drivers > 0 ? $" {BridgeElements.Count(drivers, "parameter driver", "parameter drivers")} went with it." : ""));
+                        continue;
+                    }
+
+                    // Same shape in Action: the AFK and emote states carry
+                    // the same head hand-offs with nothing to play. AFK is
+                    // fed by the headset sensor in CVR, so they do fire.
+                    if (id == VRCAvatarDescriptor.AnimLayerType.Action && IsProxyOnlyLayer(srcLayer))
+                    {
+                        int drivers = CountParameterDrivers(srcLayer);
+                        ctx.Report.Converted(Category,
+                            $"Action layer \"{srcLayer.name}\" left to ChilloutVR's own emotes and AFK",
+                            "Every clip in it is a VRChat \"proxy_\" placeholder, so the avatar has no " +
+                            "emotes or AFK animation of its own. Its states would only have handed the " +
+                            "head and body to animation and back, which in VR stops the body turning " +
+                            "with the headset. Left out whole." +
+                            (drivers > 0 ? $" {BridgeElements.Count(drivers, "parameter driver", "parameter drivers")} went with it." : ""));
+                        continue;
+                    }
+
+                    var clone = copier.CloneLayer(srcLayer);
+                    // Hand-pose layers take over the freed LeftHand/RightHand slots.
+                    string cvrHandName = GetCvrHandLayerName(id, srcLayer);
+                    clone.name = MakeUniqueLayerName(masterLayers,
+                        cvrHandName ?? $"[{id}] {clone.name}");
+                    if (cvrHandName != null)
+                    {
+                        // Reported so finger-pose issues stay diagnosable.
+                        ctx.Report.Converted(Category,
+                            $"Gesture hand layer \"{srcLayer.name}\" -> \"{clone.name}\"",
+                            "Replaces the CCK's hand-pose layer, with an equivalent copy of its VRChat hand mask.");
+                    }
+                    MergedLayerMachines[$"{id}:{srcIndex}"] = clone.stateMachine;
+                    if (id == VRCAvatarDescriptor.AnimLayerType.FX)
+                    {
+                        FxMachines.Add(clone.stateMachine);
+                    }
+                    if (srcIndex == 0)
+                    {
+                        // Unity forces a controller's first layer to weight 1; once merged it
+                        // is no longer first, so bake that weight in. Source index, not the
+                        // first merged layer: when layer 0 is dropped, nothing was forced.
+                        clone.defaultWeight = 1f;
+                    }
+                    if (actionAtRest)
+                    {
+                        // After the first-layer rule, which would re-raise it. A live Action
+                        // layer cannot yield and freezes the body; the pose loss is reported.
+                        clone.defaultWeight = 0f;
+                        actionLayersRested++;
+                        // GoGo's own is stripped below, so its poses moved here would be left
+                        // behind with nothing driving them. They reach the emote wheel instead.
+                        if (!(ctx.Settings.stripGogoLoco && SystemStripper.IsGogoLayer(srcLayer))
+                            && ActionLayerDrivesOwnFeature(clone, out string byWhat))
+                        {
+                            // Poses move into CVR's locomotion layer.
+                            // The clone stays at weight 0 so its drivers still fire.
+                            int moved = TransplantActionFeature(master, masterLayers, clone, srcLayer, ctx);
+                            if (moved > 0)
+                            {
+                                actionMoved.Add($"\"{clone.name}\" (driven by {byWhat}, {BridgeElements.Count(moved, "pose state", "pose states")})");
+                            }
+                            else
+                            {
+                                actionFeatures.Add($"\"{clone.name}\" (driven by {byWhat})");
+                            }
+                        }
+                    }
+                    clone.avatarMask = ReplaceVrcMask(clone.avatarMask, ctx);
+                    masterLayers.Add(clone);
+                    vrcLayers.Add(clone);
+                }
+                ctx.Report.Converted(Category, $"{id} layer merged", $"{controller.layers.Length} sub-layers");
+            }
+
+            if (actionMoved.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(actionMoved.Count, "Action-layer feature", "Action-layer features")} moved into ChilloutVR's locomotion layer",
+                    $"{string.Join("; ", actionMoved)}. The poses take over locomotion while their conditions " +
+                    "hold; the original layer stays at weight 0 so its drivers still fire. Not carried: the IK " +
+                    "cut-off, and VRChat's half-second fades become a quarter second.");
+            }
+            if (actionFeatures.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(actionFeatures.Count, "Action layer carries a feature", "Action layers carry a feature")} this platform cannot pose",
+                    $"{string.Join("; ", actionFeatures)}. ChilloutVR cannot raise a layer's weight at runtime, " +
+                    "so it is merged at 0: the FX side still works, the full-body pose does not show. Weight 1 " +
+                    "freezes the body in its last pose.");
+            }
+            if (actionLayersRested > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Action layer merged at weight 0, the weight VRChat gives it",
+                    "At weight 1 its idle state would hold the body over locomotion. Emotes still play from " +
+                    "ChilloutVR's own layer.");
+            }
+
+            master.layers = masterLayers.ToArray();
+            Lap("Merge layers");
+
+            _gestureConditionsRedirected = 0;
+            GesturePass(master, vrcLayers, ctx);
+            Lap("GesturePass");
+            // The CCK's kept hand layers already use gesture floats. Left alone.
+            if (_gestureConditionsRedirected > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(_gestureConditionsRedirected, "gesture condition", "gesture conditions")} rebuilt as ChilloutVR float threshold bands",
+                    "GestureLeft == 4 becomes > 3.9 and < 4.1, as the stock animator does; fist starts at 0.1. " +
+                    "On Index controllers gestures need \"Skeletal Input\" or \"Infer Gestures from Finger " +
+                    "Tracking\" on in ChilloutVR's settings.");
+            }
+            RebuildAnalogFist(master, ctx);
+            Lap("RebuildAnalogFist");
+            BehaviourPass(master, vrcLayers, ctx);
+            Lap("BehaviourPass");
+            SystemStripper.Run(ctx, master, vrcLayers);
+            Lap("SystemStripper.Run");
+            // After the stripper, before any renames. Reads the source
+            // controllers, which still carry VRChat parameter names.
+            LocomotionGrafter.Run(ctx, master);
+            Lap("LocomotionGrafter.Run");
+            StripExistingFaceTracking(master, vrcLayers, ctx);
+            Lap("StripExistingFaceTracking");
+            ReplaceAnimatorBlink(master, ctx);
+            Lap("ReplaceAnimatorBlink");
+            ToggleNativizer.Run(ctx, master, vrcLayers);
+            Lap("ToggleNativizer.Run");
+            // Before RenamePass, so menu machineNames still match.
+            // Before CompactIntDropdowns, which needs the Ints in place.
+            ParameterTypeInference.Run(master, ctx);
+            Lap("ParameterTypeInference.Run");
+            RenamePass(master, vrcLayers, ctx);
+            Lap("RenamePass");
+            ApplyParameterDefaults(master, ctx);
+            Lap("ApplyParameterDefaults");
+            ReconcileAasInputTypes(master, ctx);
+            Lap("ReconcileAasInputTypes");
+            // Before CreateParameterStreams, which must see the
+            // EyeHeightAsMeters declaration this can add.
+            FeedScaleParameters(master, ctx);
+            Lap("FeedScaleParameters");
+            CreateParameterStreams(master, ctx);
+            Lap("CreateParameterStreams");
+            FeedVelocityMagnitude(master, ctx);
+            Lap("FeedVelocityMagnitude");
+            FeedGestureWeights(master, ctx);
+            Lap("FeedGestureWeights");
+            RehomeVolatileAssets(master, vrcLayers, ctx);
+            Lap("RehomeVolatileAssets");
+            DeduplicateLayers(master, ctx);
+            Lap("DeduplicateLayers");
+            DropStateMachinelessLayers(master, ctx);
+            Lap("DropStateMachinelessLayers");
+            MaskMergedLayers(master, vrcLayers, ctx);
+            Lap("MaskMergedLayers");
+            // Before the empty-state filler. Their preconditions are
+            // mutually exclusive, so this order cannot reprocess its output.
+            // Before the restore passes, so hoisted layers join ownership.
+            HoistContestedTreeToggles(master, ctx);
+            Lap("HoistContestedTreeToggles");
+            WriteRestoreClips(master, ctx);
+            Lap("WriteRestoreClips");
+            // After the filler; its added motions are what can strobe.
+            SuppressAnyStateSelfRestarts(master, ctx);
+            Lap("SuppressAnyStateSelfRestarts");
+            UnlatchImpulsePingPongs(master, ctx);
+            Lap("UnlatchImpulsePingPongs");
+            WarnLocomotionOverrides(master, vrcLayers, ctx);
+            Lap("WarnLocomotionOverrides");
+            FaceTrackingInjector.Inject(master, ctx);
+            Lap("FaceTrackingInjector.Inject");
+            AvatarScalerInjector.Inject(master, ctx);
+            Lap("AvatarScalerInjector.Inject");
+            // After every layer exists. The stack checked is the one the game runs.
+            AuditHandPoseConflicts(master, ctx);
+            Lap("AuditHandPoseConflicts");
+            // After every pass that can hand out a mask. A masked layer
+            // applies only the first object-reference binding, so a
+            // masked material swap loses every slot but one.
+            UnmaskObjectSwapLayers(master, ctx);
+            Lap("UnmaskObjectSwapLayers");
+            // Run last. CVR silently drops transitions whose comparison
+            // does not match the parameter's final type.
+            ReconcileConditionModes(master, ctx);
+            Lap("ReconcileConditionModes");
+            SyncDriverParameterTypes(master, ctx);
+            Lap("SyncDriverParameterTypes");
+            RepairUnconditionalDriverStates(master, ctx);
+            Lap("RepairUnconditionalDriverStates");
+            VerifyMenuParameterNames(master, ctx);
+            Lap("VerifyMenuParameterNames");
+            PruneDeadMenuEntries(master, ctx);
+            Lap("PruneDeadMenuEntries");
+            WithdrawSelfDrivenExposures(master, ctx);
+            Lap("WithdrawSelfDrivenExposures");
+            CompactIntDropdowns(master, ctx);
+            Lap("CompactIntDropdowns");
+            // After the menu is final. A parameter kept only for a menu
+            // entry pruned above would stay declared and cost sync bits.
+            // Before pruning, while every reference is still visible.
+            RepairPrefixedReferences(master, ctx);
+            Lap("RepairPrefixedReferences");
+            DeclareDanglingParameters(master, ctx);
+            Lap("DeclareDanglingParameters");
+            DefaultUnsupportedBuiltIns(master, ctx);
+            Lap("DefaultUnsupportedBuiltIns");
+            PruneOrphanedParameters(master, ctx);
+            Lap("PruneOrphanedParameters");
+            // After pruning, which would throw these parameters away.
+            SafeguardBlendParameters(master, ctx);
+            Lap("SafeguardBlendParameters");
+
+            ReviveWeightGatedLayers(master, ctx);
+            Lap("ReviveWeightGatedLayers");
+            BalanceMenuTreeActives(master, ctx);
+            Lap("BalanceMenuTreeActives");
+
+            // Right before saving: animations that toggled a converted
+            // PhysBone must reach the generated physics too.
+            RewirePhysicsToggles(master, ctx);
+            Lap("RewirePhysicsToggles");
+            AuditSizeBlendshapes(master, ctx);
+            Lap("AuditSizeBlendshapes");
+            RepairClipPaths(master, ctx);
+            Lap("RepairClipPaths");
+            AuditClipBindings(master, ctx);
+            Lap("AuditClipBindings");
+            AuditMaterialProperties(master, ctx);
+            Lap("AuditMaterialProperties");
+            ReportKeptFaceTracking(master, ctx);
+            Lap("ReportKeptFaceTracking");
+            AuditCurveControlledGameParameters(master, ctx);
+            Lap("AuditCurveControlledGameParameters");
+            // Last: every clip name in the master is final, and the labels must not repeat one.
+            LocomotionGrafter.PlaceGogoEmotes(ctx, master);
+            Lap("LocomotionGrafter.PlaceGogoEmotes");
+
+            master.name = SanitizeFileName(ctx.Target.name) + "_CVR";
+
+            // Save can hand back a different persisted object.
+            // Everything below must reference that one.
+            string controllerPath = $"{ctx.OutputDir}/{master.name}.controller";
+            // Counted before and after saving. Unity refuses DontSave
+            // objects at save time and the reference dangles silently.
+            // Any loss is an Error in the report.
+            int motionsBeforeSave = CountMotionReferences(master);
+            master = AnimatorAssetSaver.Save(master, controllerPath);
+            Lap("AnimatorAssetSaver.Save");
+            // Before the filler, which plugs the very holes a failed save
+            // leaves and drops counted curveless slider children.
+            int motionsAfterSave = CountMotionReferences(master);
+            // After the save. AddObjectToAsset needs a persisted asset.
+            FillEmptyMotionSlots(ctx, master);
+            Lap("FillEmptyMotionSlots");
+            // The serialized-guid audit runs later, from BridgeConverter,
+            // so it judges the final file.
+            if (motionsAfterSave < motionsBeforeSave)
+            {
+                ctx.Report.Error(Category,
+                    $"{BridgeElements.Count(motionsBeforeSave - motionsAfterSave, "animation reference", "animation references")} failed to persist",
+                    $"{motionsBeforeSave} motions in memory, {motionsAfterSave} saved. Usually a VRCFury bake that " +
+                    "errored partway: look for its error above, fix it and convert again. Do not upload this.");
+            }
+            ctx.MergedController = master;
+
+            // CVR runs the avatar through the override controller.
+            // It must exist, not be left empty.
+            var overrides = new AnimatorOverrideController(master) { name = master.name + "_Overrides" };
+            string overridesPath = $"{ctx.OutputDir}/{overrides.name}.overrideController";
+            // Before the save, which copies the pairs into the asset.
+            LocomotionGrafter.FillGogoEmotes(overrides);
+            overrides = AnimatorAssetSaver.SaveOverride(overrides, overridesPath);
+
+            ctx.CvrAvatar.avatarSettings.baseController = master;
+            // The CCK's Advanced Settings editor reads this slot when it
+            // regenerates a controller. Leave it filled.
+            ctx.CvrAvatar.avatarSettings.baseOverrideController = overrides;
+            ctx.CvrAvatar.overrides = overrides;
+
+            var animator = ctx.TargetAnimator;
+            if (animator == null)
+            {
+                // Reported, never silent. Cloned avatars can inherit an
+                // Animator whose controller reference is already dead.
+                ctx.Report.Error(Category, "No Animator found to assign the controller to",
+                    "The root has no Animator. ChilloutVR still loads it, but nothing animates in the editor. " +
+                    "Add an Animator to the root and convert again.");
+            }
+            else
+            {
+                // The override, not the base: CVR assigns it on load, so
+                // skipping this loses nothing. Skipped when references
+                // dangle, since the setter rebinds and that segfaults.
+                if (ControllerWouldCrashUnity(overrides))
+                {
+                    ctx.Report.Error(Category, "Controller NOT assigned to the Animator: it crashes Unity",
+                        "It references missing assets, and assigning it would crash Unity, so it is left " +
+                        "unassigned. The CVRAvatar still carries it. Fix the references (see the unresolvable-asset " +
+                        "error) and convert again before uploading.");
+                }
+                else
+                {
+                    // Cleared first, then set. A clone can inherit a dead
+                    // controller whose failed native rebind refuses any
+                    // new controller until the broken one is let go.
+                    animator.runtimeAnimatorController = null;
+                    animator.runtimeAnimatorController = overrides;
+
+                    // Record a prefab-instance override, or
+                    // SaveAsPrefabAssetAndConnect reverts the assignment
+                    // to the prefab's own value.
+                    if (PrefabUtility.IsPartOfPrefabInstance(animator))
+                    {
+                        PrefabUtility.RecordPrefabInstancePropertyModifications(animator);
+                    }
+
+                    // Read back: the assignment can silently fail, a dangling reference reading
+                    // null while its GUID survives into the prefab. Then clear it.
+                    if (animator.runtimeAnimatorController != overrides)
+                    {
+                        // The Inspector's path: serialized m_Controller works where the native
+                        // setter stores null, and the prefab saves from it.
+                        var serialized = new SerializedObject(animator);
+                        serialized.FindProperty("m_Controller").objectReferenceValue = overrides;
+                        serialized.ApplyModifiedPropertiesWithoutUndo();
+                        if (PrefabUtility.IsPartOfPrefabInstance(animator))
+                        {
+                            PrefabUtility.RecordPrefabInstancePropertyModifications(animator);
+                        }
+
+                        // Or the binding stays empty until a scene reload. Safe: the crash guard
+                        // already cleared this controller.
+                        animator.Rebind();
+                        ctx.Report.Approximated(Category,
+                            "Controller linked through the serialized property",
+                            "Unity's API refused the assignment, so it was written the way the Inspector does.");
+                    }
+
+                    // The serialized value, which CVR loads; the getter can lag a frame.
+                    var verify = new SerializedObject(animator);
+                    var heldReference = verify.FindProperty("m_Controller").objectReferenceValue;
+                    if (heldReference != overrides)
+                    {
+                        // Carry what the read-back saw into the report.
+                        var getterHeld = animator.runtimeAnimatorController;
+                        string evidence =
+                            $"[serialized={(heldReference == null ? "null" : heldReference.name)}" +
+                            $"; getter={(getterHeld == null ? "null" : getterHeld.name + " (" + getterHeld.GetType().Name + ")")}" +
+                            $"; wanted={(overrides == null ? "null" : overrides.name)}" +
+                            $"; wantedPath=\"{AssetDatabase.GetAssetPath(overrides)}\"" +
+                            $"; wantedPersisted={EditorUtility.IsPersistent(overrides)}" +
+                            $"; animatorOnPrefabAsset={PrefabUtility.IsPartOfPrefabAsset(animator)}" +
+                            $"; animatorOnPrefabInstance={PrefabUtility.IsPartOfPrefabInstance(animator)}" +
+                            $"; animatorEnabled={animator.enabled}" +
+                            $"; objectActive={animator.gameObject.activeInHierarchy}] ";
+
+                        // Cleared through the same serialized path.
+                        verify.FindProperty("m_Controller").objectReferenceValue = null;
+                        verify.ApplyModifiedPropertiesWithoutUndo();
+                        ctx.Report.Error(Category, "Controller would not stay assigned to the Animator",
+                            evidence +
+                            "The Animator kept a dead reference of its own, so the slot was cleared. ChilloutVR is " +
+                            "unaffected. If the source avatar's controller shows Missing, fix it and convert again.");
+                    }
+                }
+            }
+            EditorUtility.SetDirty(ctx.CvrAvatar);
+            Lap("Overrides");
+            Debug.Log($"[AvatarBridge] Animator merge steps (ms): {string.Join(", ", times)}, rest {rest}");
+        }
+
+        static HashSet<string> SliderParameterNames(BridgeContext ctx)
+        {
+            var names = new HashSet<string>();
+            var settings = ctx.CvrAvatar != null && ctx.CvrAvatar.avatarSettings != null
+                ? ctx.CvrAvatar.avatarSettings.settings
+                : null;
+            if (settings == null)
+            {
+                return names;
+            }
+            foreach (var entry in settings)
+            {
+                if (entry != null && entry.setting is CVRAdvancesAvatarSettingSlider
+                    && !string.IsNullOrEmpty(entry.machineName))
+                {
+                    names.Add(entry.machineName);
+                }
+            }
+            return names;
+        }
+
+        static void FillEmptyMotionSlots(BridgeContext ctx, AnimatorController master)
+        {
+            AnimationClip filler = null;
+            int filled = 0;
+            int states = 0;
+            int emptied = 0;
+            var seen = new HashSet<Motion>();
+            var sliders = new SortedSet<string>(StableSampleOrder.Instance);
+            var sliderParameters = SliderParameterNames(ctx);
+
+            AnimationClip Filler()
+            {
+                if (filler == null)
+                {
+                    filler = new AnimationClip { name = "AvatarBridge_EmptySlot" };
+                    string anchor = EmptySlotAnchorPath(ctx);
+                    if (anchor != null)
+                    {
+                        // One curve, constant, asserting a value the object already has. See the
+                        // summary: a curve-less clip misaligns the animator's binding array.
+                        filler.SetCurve(anchor, typeof(GameObject), "m_IsActive",
+                            AnimationCurve.Constant(0f, 1f / 60f, 1f));
+                    }
+                    AssetDatabase.AddObjectToAsset(filler, master);
+                }
+                return filler;
+            }
+
+            void Walk(Motion motion)
+            {
+                if (!(motion is BlendTree tree) || !seen.Add(tree))
+                {
+                    return;
+                }
+                var children = tree.children;
+
+                // A slider's holes are dropped, not filled: a null child
+                // takes no weight, a filler clip does. Sliders only, and
+                // thresholds are pinned first so nothing renumbers.
+                if (tree.blendType == BlendTreeType.Simple1D
+                    && !string.IsNullOrEmpty(tree.blendParameter)
+                    && sliderParameters.Contains(tree.blendParameter))
+                {
+                    var kept = new List<ChildMotion>();
+                    foreach (var child in children)
+                    {
+                        if (child.motion != null && !IsCurveless(child.motion, filler))
+                        {
+                            kept.Add(child);
+                        }
+                    }
+                    int dropped = children.Length - kept.Count;
+                    if (dropped > 0 && kept.Count >= 1)
+                    {
+                        // ONE survivor: a 1D tree with one child plays it at full weight across
+                        // the range, stuck on. Keep one placeholder at the far end so the slider
+                        // fades the real clip in across its travel.
+                        if (kept.Count == 1)
+                        {
+                            float at = kept[0].threshold;
+                            int far = -1;
+                            float furthest = -1f;
+                            for (int i = 0; i < children.Length; i++)
+                            {
+                                if (children[i].motion != null
+                                    && !IsCurveless(children[i].motion, filler)) continue;
+                                float gap = Mathf.Abs(children[i].threshold - at);
+                                if (gap <= furthest) continue;
+                                furthest = gap;
+                                far = i;
+                            }
+                            if (far >= 0)
+                            {
+                                var hold = children[far];
+                                hold.motion = Filler();
+                                filled++;
+                                if (hold.threshold < at) kept.Insert(0, hold);
+                                else kept.Add(hold);
+                                dropped--;
+                            }
+                        }
+
+                        foreach (var child in kept)
+                        {
+                            Walk(child.motion);
+                        }
+                        tree.useAutomaticThresholds = false;
+                        tree.children = kept.ToArray();
+                        emptied += dropped;
+                        sliders.Add(tree.blendParameter);
+                        return;
+                    }
+                }
+
+                bool changed = false;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    if (children[i].motion == null || IsCurveless(children[i].motion, filler))
+                    {
+                        children[i].motion = Filler();
+                        changed = true;
+                        filled++;
+                    }
+                    else
+                    {
+                        Walk(children[i].motion);
+                    }
+                }
+                if (changed)
+                {
+                    // children is a copy; the setter is what writes it back.
+                    tree.children = children;
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        // A motionless state is the same hole: Unity derives duration from it.
+                        if (child.state.motion == null || IsCurveless(child.state.motion, filler))
+                        {
+                            child.state.motion = Filler();
+                            filled++;
+                            states++;
+                        }
+                        else
+                        {
+                            Walk(child.state.motion);
+                        }
+                    }
+                });
+            }
+
+            // Dirty only: the conversion's later saves write it, and on a controller of a gigabyte
+            // one save more cost 19 s. The filler carries no GUID, so the audit reads the same.
+            if (filled > 0)
+            {
+                EditorUtility.SetDirty(master);
+            }
+
+            if (emptied > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(emptied, "empty slot", "empty slots")} removed from {BridgeElements.Count(sliders.Count, "slider tree", "slider trees")} instead of filled",
+                    $"{string.Join(", ", sliders)}: a placeholder would stall the slider until it reached a real " +
+                    "clip. Thresholds are kept; a slider left with one motion keeps one placeholder so it still fades.");
+            }
+
+            if (filled > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(filled, "empty motion slot", "empty motion slots")} given a placeholder clip" +
+                    (states == 0 ? " (all blend tree slots)"
+                        : states == filled ? " (all animator states)"
+                        : $" ({states} animator states, {filled - states} blend tree slots)"),
+                    "Empty or curve-less motions crash Unity or swap menu controls around, so each now holds an " +
+                    "inert placeholder. What they should have been is still missing: find out why before relying " +
+                    "on the feature.");
+            }
+        }
+
+        static bool IsCurveless(Motion motion, AnimationClip filler)
+        {
+            if (!(motion is AnimationClip clip) || clip == filler)
+            {
+                return false;
+            }
+            return !clip.humanMotion && !clip.legacy
+                && AnimationUtility.GetCurveBindings(clip).Length == 0
+                && AnimationUtility.GetObjectReferenceCurveBindings(clip).Length == 0;
+        }
+
+        static string EmptySlotAnchorPath(BridgeContext ctx)
+        {
+            if (ctx == null || ctx.Target == null)
+            {
+                return null;
+            }
+            const string anchorName = "AvatarBridge_EmptySlot";
+            var anchor = ctx.Target.transform.Find(anchorName);
+            if (anchor == null)
+            {
+                var holder = new GameObject(anchorName);
+                holder.transform.SetParent(ctx.Target.transform, false);
+                anchor = holder.transform;
+            }
+            anchor.gameObject.SetActive(true);
+            return ctx.PathInTarget(anchor);
+        }
+
+        internal static bool ControllerWouldCrashUnity(RuntimeAnimatorController controller)
+        {
+            try
+            {
+                var paths = new List<string>();
+                for (RuntimeAnimatorController c = controller; c != null; )
+                {
+                    string p = AssetDatabase.GetAssetPath(c);
+                    if (!string.IsNullOrEmpty(p))
+                    {
+                        paths.Add(p);
+                    }
+                    c = c is AnimatorOverrideController over ? over.runtimeAnimatorController : null;
+                }
+                foreach (string assetPath in paths)
+                {
+                    string absolute = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
+                    if (!File.Exists(absolute))
+                    {
+                        continue;
+                    }
+                    foreach (string guid in BridgeContext.ReferencedGuids(File.ReadAllText(absolute)))
+                    {
+                        if (string.IsNullOrEmpty(AssetDatabase.GUIDToAssetPath(guid)))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Unreadable for any reason: treat as unsafe. Leaving an Animator switched off is
+                // an inconvenience; a hard editor crash costs unsaved work.
+                return true;
+            }
+            return false;
+        }
+
+        // ------------------------------------------------------------------ setup ----
+
+        static bool TryOperator(out AnimatorDriverTask.Operator op, params string[] names)
+        {
+            foreach (string name in names)
+            {
+                if (System.Enum.IsDefined(typeof(AnimatorDriverTask.Operator), name))
+                {
+                    op = (AnimatorDriverTask.Operator)System.Enum.Parse(
+                        typeof(AnimatorDriverTask.Operator), name);
+                    return true;
+                }
+            }
+            op = default;
+            return false;
+        }
+
+        // One switch for both callers, so a layer is never converted and
+        // also reported as left out. The label is the window's, verbatim;
+        // null means the window has no option for that layer type.
+        static (bool wanted, string option) LayerOption(BridgeContext ctx, VRCAvatarDescriptor.AnimLayerType type)
+        {
+            switch (type)
+            {
+                case VRCAvatarDescriptor.AnimLayerType.Base: return (ctx.Settings.convertBaseLayer, "Base / locomotion");
+                case VRCAvatarDescriptor.AnimLayerType.Additive: return (ctx.Settings.convertAdditiveLayer, "Additive");
+                case VRCAvatarDescriptor.AnimLayerType.Gesture: return (ctx.Settings.convertGestureLayer, "Gesture (hand poses)");
+                case VRCAvatarDescriptor.AnimLayerType.Action: return (ctx.Settings.convertActionLayer, "Action (emotes, AFK)");
+                case VRCAvatarDescriptor.AnimLayerType.FX: return (ctx.Settings.convertFxLayer, "FX (toggles, expressions)");
+                default: return (false, null);
+            }
+        }
+
+        static void ReportSkippedLayers(BridgeContext ctx)
+        {
+            if (ctx.SourceDescriptor?.baseAnimationLayers == null)
+            {
+                return;
+            }
+            foreach (var layer in ctx.SourceDescriptor.baseAnimationLayers)
+            {
+                var (wanted, option) = LayerOption(ctx, layer.type);
+                if (option == null)
+                {
+                    continue;
+                }
+                if (wanted || layer.isDefault
+                    || !(layer.animatorController is AnimatorController controller)
+                    || controller.layers.Length == 0)
+                {
+                    continue;
+                }
+
+                int drivers = 0, states = 0;
+                foreach (var sub in controller.layers)
+                {
+                    WalkMachines(sub.stateMachine, machine =>
+                    {
+                        foreach (var child in machine.states)
+                        {
+                            states++;
+                            foreach (var behaviour in child.state.behaviours)
+                            {
+                                if (behaviour is VRCAvatarParameterDriver)
+                                {
+                                    drivers++;
+                                }
+                            }
+                        }
+                    });
+                }
+
+                ctx.Report.Warning(Category,
+                    $"The avatar's own {layer.type} layer is NOT being converted",
+                    $"\"{controller.name}\", {BridgeElements.Count(controller.layers.Length, "layer", "layers")}, {BridgeElements.Count(states, "state", "states")}" +
+                    (drivers > 0 ? $" and {BridgeElements.Count(drivers, "parameter driver", "parameter drivers")}" : "") +
+                    ". Left out entirely, with anything it drove" +
+                    (drivers > 0
+                        ? ": a feature its drivers switch back off, like a transformation, will turn on and stay on."
+                        : ".") +
+                    $" Tick \"{option}\" and convert again if this layer matters.");
+            }
+        }
+
+        internal static List<(VRCAvatarDescriptor.AnimLayerType id, AnimatorController controller)> GetSelectedVrcControllers(BridgeContext ctx)
+        {
+            var result = new List<(VRCAvatarDescriptor.AnimLayerType, AnimatorController)>();
+            // Never filled: the SDK's setup does not run on AddComponent in batch mode.
+            if (ctx.SourceDescriptor == null || ctx.SourceDescriptor.baseAnimationLayers == null)
+            {
+                return result;
+            }
+            foreach (var layer in ctx.SourceDescriptor.baseAnimationLayers)
+            {
+                if (!LayerOption(ctx, layer.type).wanted || layer.isDefault)
+                {
+                    continue;
+                }
+                if (layer.animatorController is AnimatorController controller)
+                {
+                    result.Add((layer.type, controller));
+                }
+            }
+            return result;
+        }
+
+        // The naming tables are constants, so a hit is this tool's bug; reported, not just
+        // logged. The last one it would have caught ran for months as an avatar pedalling in a chair.
+        static void CheckNamingTables(BridgeContext ctx)
+        {
+            foreach (string problem in CvrParameterNames.Contradictions(KnownUnsupportedVrcParameters))
+            {
+                Debug.LogError("[AvatarBridge] parameter naming tables disagree: " + problem);
+                ctx.Report.Warning(Category, "Parameter naming tables disagree", problem
+                    + " This is a bug in AvatarBridge rather than in your avatar; please report it.");
+            }
+        }
+
+        static AnimatorController LoadBaseController(BridgeContext ctx, bool convertingGestureLayer)
+        {
+            var source = CvrSetup.LoadCckAnimator();
+
+            var master = new AnimatorController();
+
+            if (source == null)
+            {
+                ctx.Report.Warning(Category, "CCK AvatarAnimator.controller not found",
+                    "Locomotion/hand layers are missing; the CCK usually regenerates them, but check the result.");
+                master.parameters = CvrSetup.CckCoreParameters();
+                return master;
+            }
+
+            // When the VRC Gesture layer takes over hand animation, CVR's own hand layers
+            // must go or they fight for the finger muscles.
+            var allowed = new List<string> { "Locomotion/Emotes" };
+            if (!convertingGestureLayer)
+            {
+                allowed.Add("LeftHand");
+                allowed.Add("RightHand");
+            }
+
+            // GoGo is the locomotion; the CCK's Locomotion/Emotes underneath would fight it.
+            if (!ctx.Settings.stripGogoLoco && SystemStripper.AvatarUsesGogo(ctx))
+            {
+                allowed.Remove("Locomotion/Emotes");
+                ctx.Report.Warning(Category,
+                    "GoGo Loco kept: ChilloutVR's own Locomotion/Emotes layer removed",
+                    "EXPERIMENTAL. Poses don't lock movement, floor poses keep a standing viewpoint, and the " +
+                    "quick-menu emotes stop. Merge Base, Additive and Action or there is no locomotion.");
+            }
+            string[] allowedLayers = allowed.ToArray();
+
+            var copier = new AnimatorDeepCopier();
+            master.parameters = source.parameters.Select(AnimatorDeepCopier.CloneParameter).ToArray();
+            master.layers = source.layers
+                .Where(l => allowedLayers.Contains(l.name))
+                .Select(copier.CloneLayer)
+                .ToArray();
+
+            ctx.Report.Converted(Category, "CCK base animator",
+                master.layers.Length > 0
+                    ? $"Kept layers: {string.Join(", ", master.layers.Select(l => l.name))}"
+                    : "Kept layers: none. GoGo replaces ChilloutVR's locomotion, and the " +
+                      "avatar's own gesture layers replace the CCK's hand-pose layers.");
+            return master;
+        }
+
+        static void MergeParameters(AnimatorController master, AnimatorController source, BridgeContext ctx)
+        {
+            var masterParams = master.parameters.ToList();
+            foreach (var srcParam in source.parameters)
+            {
+                var param = AnimatorDeepCopier.CloneParameter(srcParam);
+                if (GestureMap.GestureParameters.Contains(param.name))
+                {
+                    param.type = AnimatorControllerParameterType.Float; // CVR gestures are floats
+                }
+
+                var existing = masterParams.FirstOrDefault(p => p.name == param.name);
+                if (existing == null)
+                {
+                    masterParams.Add(param);
+                }
+                else if (existing.type != param.type &&
+                         !GestureMap.GestureParameters.Contains(param.name))
+                {
+                    ctx.Report.Warning(Category, $"Parameter \"{param.name}\"",
+                        $"Type conflict between controllers ({existing.type} vs {param.type}); keeping {existing.type}.");
+                }
+            }
+            master.parameters = masterParams.ToArray();
+        }
+
+        // --------------------------------------------------------------- gestures ----
+
+        static void GesturePass(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            foreach (var layer in vrcLayers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        RemapMotionGestureParameters(child.state.motion, ctx);
+                        // Set only when rewritten: each setter rebuilds the machine natively, and
+                        // setting every state's array back unchanged cost seconds a conversion.
+                        var had = child.state.transitions;
+                        var made = RewriteTransitions(had, ctx);
+                        if (!ReferenceEquals(made, had)) child.state.transitions = made;
+                    }
+                    var any = machine.anyStateTransitions;
+                    var anyMade = RewriteTransitions(any, ctx);
+                    if (!ReferenceEquals(anyMade, any)) machine.anyStateTransitions = anyMade;
+                    var entry = machine.entryTransitions;
+                    var entryMade = RewriteTransitions(entry, ctx);
+                    if (!ReferenceEquals(entryMade, entry)) machine.entryTransitions = entryMade;
+                    foreach (var childMachine in machine.stateMachines)
+                    {
+                        var transitions = machine.GetStateMachineTransitions(childMachine.stateMachine);
+                        if (transitions != null && transitions.Length > 0)
+                        {
+                            var made = RewriteTransitions(transitions, ctx);
+                            if (!ReferenceEquals(made, transitions))
+                                machine.SetStateMachineTransitions(childMachine.stateMachine, made);
+                        }
+                    }
+                });
+            }
+        }
+
+        static void RemapMotionGestureParameters(Motion motion, BridgeContext ctx)
+        {
+            if (!(motion is BlendTree tree))
+            {
+                return;
+            }
+            foreach (var child in tree.children)
+            {
+                RemapMotionGestureParameters(child.motion, ctx);
+            }
+
+            bool remapX = GestureMap.GestureParameters.Contains(tree.blendParameter);
+            bool remapY = (tree.blendType == BlendTreeType.SimpleDirectional2D ||
+                           tree.blendType == BlendTreeType.FreeformDirectional2D ||
+                           tree.blendType == BlendTreeType.FreeformCartesian2D) &&
+                          GestureMap.GestureParameters.Contains(tree.blendParameterY);
+
+            if (tree.blendType == BlendTreeType.Simple1D && remapX)
+            {
+                // Thresholds hold VRC gesture ints; convert and re-sort for CVR values.
+                var children = tree.children;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    children[i].threshold = GestureMap.VrcToCvr(children[i].threshold);
+                }
+                Array.Sort(children, (a, b) => a.threshold.CompareTo(b.threshold));
+                tree.useAutomaticThresholds = false;
+                tree.children = children;
+                ctx.Report.Converted(Category, $"Blend tree \"{tree.name}\"", "Gesture thresholds remapped to CVR values.");
+            }
+            else if (remapX || remapY)
+            {
+                ctx.Report.Warning(Category, $"Blend tree \"{tree.name}\"",
+                    "2D blend tree driven by a gesture parameter; CVR gesture values differ, check manually.");
+            }
+        }
+
+        // The same array back when no transition has a gesture condition.
+        static T[] RewriteTransitions<T>(T[] transitions, BridgeContext ctx) where T : AnimatorTransitionBase, new()
+        {
+            bool changed = false;
+            var result = new List<T>();
+            foreach (var transition in transitions)
+            {
+                var branches = RewriteConditions(transition.conditions, ctx);
+                if (branches == null) // no gesture conditions involved
+                {
+                    result.Add(transition);
+                    continue;
+                }
+                changed = true;
+                foreach (var branch in branches)
+                {
+                    var clone = CloneForBranch(transition);
+                    clone.conditions = branch;
+                    result.Add(clone);
+                }
+            }
+            return changed ? result.ToArray() : transitions;
+        }
+
+        static List<AnimatorCondition[]> RewriteConditions(AnimatorCondition[] conditions, BridgeContext ctx)
+        {
+            bool anyChanged = false;
+            var branchSets = new List<List<AnimatorCondition>> { new List<AnimatorCondition>() };
+
+            foreach (var condition in conditions)
+            {
+                List<List<AnimatorCondition>> options;
+
+                if (GestureMap.GestureParameters.Contains(condition.parameter))
+                {
+                    options = RewriteGestureCondition(condition, ctx);
+                    anyChanged = true;
+                }
+                else
+                {
+                    // GestureLeftWeight/RightWeight conditions pass through unchanged:
+                    // FeedGestureWeights works those parameters out from the fist.
+                    options = new List<List<AnimatorCondition>> { new List<AnimatorCondition> { condition } };
+                }
+
+                // Cartesian product of existing branches with this condition's options.
+                var next = new List<List<AnimatorCondition>>();
+                foreach (var branch in branchSets)
+                {
+                    foreach (var option in options)
+                    {
+                        var combined = new List<AnimatorCondition>(branch);
+                        combined.AddRange(option);
+                        next.Add(combined);
+                    }
+                }
+                branchSets = next;
+
+                if (branchSets.Count > MaxConditionBranches)
+                {
+                    ctx.Report.Warning(Category, "Transition condition explosion",
+                        $"More than {MaxConditionBranches} branches while rewriting gesture conditions; truncating.");
+                    branchSets = branchSets.Take(MaxConditionBranches).ToList();
+                }
+            }
+
+            if (!anyChanged)
+            {
+                return null;
+            }
+            return branchSets.Select(b => b.ToArray()).ToList();
+        }
+
+        static List<List<AnimatorCondition>> RewriteGestureCondition(AnimatorCondition condition, BridgeContext ctx)
+        {
+            // Threshold bands on the gesture floats, as the CCK's controller does; it never uses Idx.
+            string param = condition.parameter;
+            _gestureConditionsRedirected++;
+
+            if (condition.mode == AnimatorConditionMode.Equals)
+            {
+                return new List<List<AnimatorCondition>>
+                {
+                    FloatBand(param, GestureMap.VrcToCvrIdx((int)condition.threshold))
+                };
+            }
+            if (condition.mode == AnimatorConditionMode.NotEqual)
+            {
+                return FloatBandInverse(param, GestureMap.VrcToCvrIdx((int)condition.threshold));
+            }
+
+            // Greater/Less compare VRChat's numeric ordering, which differs from CVR's, so
+            // enumerate the matching gestures and OR their bands.
+            var matched = new List<int>();
+            for (int g = 0; g <= 7; g++)
+            {
+                bool match = condition.mode == AnimatorConditionMode.Greater ? g > condition.threshold
+                           : condition.mode == AnimatorConditionMode.Less ? g < condition.threshold
+                           : true;
+                if (match)
+                {
+                    matched.Add(g);
+                }
+            }
+
+            if (matched.Count == 8)
+            {
+                // Always true; drop the condition entirely.
+                return new List<List<AnimatorCondition>> { new List<AnimatorCondition>() };
+            }
+            if (matched.Count == 0)
+            {
+                // Never true; a value the gesture float can't reach ([-1..6]).
+                return new List<List<AnimatorCondition>>
+                {
+                    new List<AnimatorCondition>
+                    {
+                        new AnimatorCondition
+                        {
+                            parameter = param,
+                            mode = AnimatorConditionMode.Greater,
+                            threshold = 98f
+                        }
+                    }
+                };
+            }
+
+            return matched
+                .Select(g => FloatBand(param, GestureMap.VrcToCvrIdx(g)))
+                .ToList();
+        }
+
+        static void RebuildAnalogFist(AnimatorController master, BridgeContext ctx)
+        {
+            foreach (var layer in master.layers)
+            {
+                string param = !AvatarFeatureDetect.IsHandLayer(layer.name) ? null
+                    : layer.name.StartsWith("Left", StringComparison.Ordinal) ? "GestureLeft" : "GestureRight";
+                if (param == null || layer.stateMachine == null)
+                {
+                    continue;
+                }
+                AnimatorState fist = null, idle = null;
+                void Classify(AnimatorCondition[] conditions, AnimatorState dst)
+                {
+                    if (dst == null)
+                    {
+                        return;
+                    }
+                    bool fistLo = false, fistHi = false, idleLo = false, idleHi = false;
+                    foreach (var c in conditions)
+                    {
+                        if (c.parameter != param)
+                        {
+                            continue;
+                        }
+                        if (c.mode == AnimatorConditionMode.Greater && Mathf.Abs(c.threshold - 0.1f) < 0.01f) fistLo = true;
+                        if (c.mode == AnimatorConditionMode.Less && Mathf.Abs(c.threshold - 1.1f) < 0.01f) fistHi = true;
+                        if (c.mode == AnimatorConditionMode.Greater && Mathf.Abs(c.threshold + 0.9f) < 0.01f) idleLo = true;
+                        if (c.mode == AnimatorConditionMode.Less && Mathf.Abs(c.threshold - 0.1f) < 0.01f) idleHi = true;
+                    }
+                    if (fistLo && fistHi && fist == null)
+                    {
+                        fist = dst;
+                    }
+                    if (idleLo && idleHi && idle == null)
+                    {
+                        idle = dst;
+                    }
+                }
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var t in machine.anyStateTransitions)
+                    {
+                        Classify(t.conditions, t.destinationState);
+                    }
+                    foreach (var child in machine.states)
+                    {
+                        foreach (var t in child.state.transitions)
+                        {
+                            Classify(t.conditions, t.destinationState);
+                        }
+                    }
+                });
+                if (fist == null || idle == null || fist == idle || fist.timeParameterActive)
+                {
+                    continue;
+                }
+                if (!(fist.motion is AnimationClip fistClip) || !(idle.motion is AnimationClip idleClip))
+                {
+                    continue;
+                }
+                var tree = new BlendTree
+                {
+                    name = "AnalogFist",
+                    blendType = BlendTreeType.Simple1D,
+                    blendParameter = param,
+                    useAutomaticThresholds = false,
+                    hideFlags = HideFlags.HideInHierarchy,
+                };
+                tree.children = new[]
+                {
+                    new ChildMotion { motion = idleClip, threshold = 0.1f, timeScale = 1f },
+                    new ChildMotion { motion = fistClip, threshold = 1f, timeScale = 1f },
+                };
+                fist.motion = tree;
+                ctx.Report.Converted(Category, $"{layer.name}: analog fist curl rebuilt",
+                    $"\"{fist.name}\" now blends from \"{idleClip.name}\" (grip 0.1) to \"{fistClip.name}\" " +
+                    "(full grip) on the gesture float: the CCK's own Relaxed/Fist idiom, matching how " +
+                    "VRChat eases the fist in by how far it is squeezed instead of snapping to the full pose.");
+            }
+        }
+
+        static List<AnimatorCondition> FloatBand(string param, int cvrValue)
+        {
+            var band = new List<AnimatorCondition>();
+            void Add(AnimatorConditionMode mode, float threshold) => band.Add(
+                new AnimatorCondition { parameter = param, mode = mode, threshold = threshold });
+            switch (cvrValue)
+            {
+                case -1: Add(AnimatorConditionMode.Less, -0.9f); break;
+                case 0: Add(AnimatorConditionMode.Greater, -0.9f); Add(AnimatorConditionMode.Less, 0.1f); break;
+                case 1: Add(AnimatorConditionMode.Greater, 0.1f); Add(AnimatorConditionMode.Less, 1.1f); break;
+                case 6: Add(AnimatorConditionMode.Greater, 5.9f); break;
+                default:
+                    Add(AnimatorConditionMode.Greater, cvrValue - 0.1f);
+                    Add(AnimatorConditionMode.Less, cvrValue + 0.1f);
+                    break;
+            }
+            return band;
+        }
+
+        static List<List<AnimatorCondition>> FloatBandInverse(string param, int cvrValue)
+        {
+            List<AnimatorCondition> One(AnimatorConditionMode mode, float threshold) =>
+                new List<AnimatorCondition>
+                {
+                    new AnimatorCondition { parameter = param, mode = mode, threshold = threshold }
+                };
+            switch (cvrValue)
+            {
+                case -1:
+                    return new List<List<AnimatorCondition>> { One(AnimatorConditionMode.Greater, -0.9f) };
+                case 0:
+                    return new List<List<AnimatorCondition>>
+                        { One(AnimatorConditionMode.Less, -0.9f), One(AnimatorConditionMode.Greater, 0.1f) };
+                case 1:
+                    return new List<List<AnimatorCondition>>
+                        { One(AnimatorConditionMode.Less, 0.1f), One(AnimatorConditionMode.Greater, 1.1f) };
+                case 6:
+                    return new List<List<AnimatorCondition>> { One(AnimatorConditionMode.Less, 5.9f) };
+                default:
+                    return new List<List<AnimatorCondition>>
+                    {
+                        One(AnimatorConditionMode.Less, cvrValue - 0.1f),
+                        One(AnimatorConditionMode.Greater, cvrValue + 0.1f)
+                    };
+            }
+        }
+
+        static T CloneForBranch<T>(T src) where T : AnimatorTransitionBase, new()
+        {
+            var dst = new T
+            {
+                name = src.name,
+                destinationState = src.destinationState,
+                destinationStateMachine = src.destinationStateMachine,
+                isExit = src.isExit,
+                solo = src.solo,
+                mute = src.mute,
+                hideFlags = HideFlags.HideInHierarchy
+            };
+            if (src is AnimatorStateTransition s && dst is AnimatorStateTransition d)
+            {
+                d.duration = s.duration;
+                d.offset = s.offset;
+                d.exitTime = s.exitTime;
+                d.hasExitTime = s.hasExitTime;
+                d.hasFixedDuration = s.hasFixedDuration;
+                d.interruptionSource = s.interruptionSource;
+                d.orderedInterruption = s.orderedInterruption;
+                d.canTransitionToSelf = s.canTransitionToSelf;
+            }
+            return dst;
+        }
+
+        // ------------------------------------------------------------- behaviours ----
+
+        static void BehaviourPass(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            var skippedBehaviourCounts = new Dictionary<string, int>();
+            var bodyControlStats = new BodyControlStats();
+            // master.parameters copies every parameter per read, and a driver
+            // task can ask several times. Nothing this pass adds is a user
+            // parameter (only the Float scratch), so one snapshot holds.
+            var parameterTypes = new Dictionary<string, AnimatorControllerParameterType>();
+            foreach (var p in master.parameters)
+            {
+                if (!parameterTypes.ContainsKey(p.name))
+                {
+                    parameterTypes[p.name] = p.type;
+                }
+            }
+
+            foreach (var layer in vrcLayers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    // Set only when converted: each setter costs a native rebuild, on every state.
+                    var had = machine.behaviours;
+                    var made = ConvertBehaviours(master, had, null, ctx, skippedBehaviourCounts, bodyControlStats, parameterTypes);
+                    if (!ReferenceEquals(made, had)) machine.behaviours = made;
+                    foreach (var child in machine.states)
+                    {
+                        var stateHad = child.state.behaviours;
+                        var stateMade = ConvertBehaviours(master, stateHad, child.state, ctx, skippedBehaviourCounts, bodyControlStats, parameterTypes);
+                        if (!ReferenceEquals(stateMade, stateHad)) child.state.behaviours = stateMade;
+                    }
+                });
+            }
+
+            bodyControlStats.Report(ctx);
+
+            foreach (var pair in skippedBehaviourCounts)
+            {
+                ctx.Report.Skipped(Category, pair.Key, $"{pair.Value}x removed (no ChilloutVR equivalent).");
+            }
+
+            if (ConvertedPlayAudio.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(ConvertedPlayAudio.Count, "animator-played audio player", "animator-played audio players")} wired to ChilloutVR",
+                    string.Join("; ", ConvertedPlayAudio.Take(6)) +
+                    (ConvertedPlayAudio.Count > 6 ? "; …" : "") +
+                    ". Loops switch on with their state; one-shots play through CVRAudioDriver.");
+            }
+            if (ApproximatedPlayAudio.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(ApproximatedPlayAudio.Count, "audio playback detail", "audio playback details")} simplified",
+                    string.Join("; ", ApproximatedPlayAudio.Take(8)) +
+                    (ApproximatedPlayAudio.Count > 8 ? "; …" : "") +
+                    ". A state behaviour could randomise clips, volume and pitch per play and " +
+                    "delay the start; an enable window cannot. The sound still plays, with the " +
+                    "fixed settings named here.");
+            }
+            if (DroppedPlayAudioCount > 0)
+            {
+                ctx.Report.Skipped(Category,
+                    $"{BridgeElements.Count(DroppedPlayAudioCount, "animator-driven audio player", "animator-driven audio players")} removed",
+                    string.Join("; ", DroppedPlayAudio) + (DroppedPlayAudioCount > DroppedPlayAudio.Count ? "; …" : "") +
+                    ". The AudioSources are still there to wire by hand.");
+            }
+            if (DroppedPoseSpaceCount > 0)
+            {
+                ctx.Report.Skipped(Category,
+                    $"{BridgeElements.Count(DroppedPoseSpaceCount, "viewpoint shift", "viewpoint shifts")} during poses removed",
+                    string.Join(", ", DroppedPoseSpace) +
+                    ": VRChat moved the wearer's viewpoint (usually down to the hips) while " +
+                    "these poses played, so crawling didn't leave the camera at standing height. " +
+                    "ChilloutVR has no hook for that: the pose still plays, the camera stays on " +
+                    "the head.");
+            }
+        }
+
+        static readonly List<string> DroppedPlayAudio = new List<string>();
+        static int DroppedPlayAudioCount;
+        static readonly List<string> ConvertedPlayAudio = new List<string>();
+        static readonly List<string> ApproximatedPlayAudio = new List<string>();
+        static readonly Dictionary<(Motion motion, string path, float value), AnimationClip> AudioWindowClones
+            = new Dictionary<(Motion, string, float), AnimationClip>();
+        // A source's clip before any behaviour touched it, and the clip a
+        // looping behaviour gave it; several states can share one source.
+        static readonly Dictionary<AudioSource, AudioClip> AudioSourceOwnClips
+            = new Dictionary<AudioSource, AudioClip>();
+        static readonly Dictionary<AudioSource, AudioClip> LoopedSourceClips
+            = new Dictionary<AudioSource, AudioClip>();
+        static readonly List<string> DroppedPoseSpace = new List<string>();
+        static int DroppedPoseSpaceCount;
+
+        // VRCAnimatorLayerControl, captured before the behaviours go, to rebuild their weight
+        // gates. Keys "<playable>:<source layer index>"; values are machines, as later passes rename layers.
+        static readonly Dictionary<string, AnimatorStateMachine> MergedLayerMachines =
+            new Dictionary<string, AnimatorStateMachine>();
+        // Machines of the layers that came from FX, so they are kept off the body. The toggle
+        // pass adds the layers it splits out of them.
+        internal static readonly HashSet<AnimatorStateMachine> FxMachines = new HashSet<AnimatorStateMachine>();
+        static readonly List<(string key, float goal)> CapturedLayerControls =
+            new List<(string, float)>();
+        // Max goal weight per state that carried a control; the states
+        // are the merged clones, so they can be matched by reference.
+        static readonly Dictionary<AnimatorState, float> LayerControlGoals =
+            new Dictionary<AnimatorState, float>();
+
+        // CVR has no audio state behaviour: the source plays on awake and the state animates
+        // its enabled flag; restore passes assert off elsewhere.
+        static void ConvertPlayAudio(BridgeContext ctx, AnimatorState state,
+            VRC.SDK3.Avatars.Components.VRCAnimatorPlayAudio playAudio)
+        {
+            string where = $"state \"{state?.name ?? "(machine)"}\" -> \"{playAudio.SourcePath}\"";
+            void Drop(string reason)
+            {
+                if (DroppedPlayAudio.Count < 6)
+                {
+                    DroppedPlayAudio.Add($"{where} ({reason})");
+                }
+                DroppedPlayAudioCount++;
+            }
+
+            var host = string.IsNullOrEmpty(playAudio.SourcePath)
+                ? null : BridgeContext.FindByAnimationPath(ctx.Target.transform, playAudio.SourcePath);
+            var source = host != null ? host.GetComponent<AudioSource>() : null;
+            if (source == null)
+            {
+                Drop("no AudioSource at that path");
+                return;
+            }
+            if (state == null)
+            {
+                Drop("sits on a state machine, not a state");
+                return;
+            }
+            bool play = playAudio.PlayOnEnter;
+            if (!play && !playAudio.StopOnEnter)
+            {
+                Drop("only acts on state exit");
+                return;
+            }
+            if (state.motion is BlendTree)
+            {
+                Drop("the state plays a blend tree");
+                return;
+            }
+
+            string path = playAudio.SourcePath;
+            bool effectiveLoop = source.loop;
+            var clips = (playAudio.Clips ?? new AudioClip[0]).Where(c => c != null).Distinct().ToList();
+            AudioClip wanted = null;
+            if (play)
+            {
+                // Enum names, not values: NeverApply means the source keeps its own setting.
+                bool Apply(System.Enum setting) => setting.ToString() != "NeverApply";
+                // Without clips of its own the behaviour plays the source's clip.
+                if (!AudioSourceOwnClips.TryGetValue(source, out wanted))
+                {
+                    AudioSourceOwnClips[source] = wanted = source.clip;
+                }
+                if (Apply(playAudio.ClipsApplySettings) && clips.Count > 0)
+                {
+                    wanted = clips[0];
+                    if (clips.Count > 1)
+                    {
+                        ApproximatedPlayAudio.Add(
+                            $"{where}: played one of {clips.Count} clips ({playAudio.PlaybackOrder}); plays \"{clips[0].name}\" here");
+                    }
+                }
+                if (Apply(playAudio.LoopApplySettings))
+                {
+                    source.loop = playAudio.Loop;
+                }
+                effectiveLoop = source.loop;
+                if (Apply(playAudio.VolumeApplySettings))
+                {
+                    source.volume = (playAudio.Volume.x + playAudio.Volume.y) * 0.5f;
+                    if (!Mathf.Approximately(playAudio.Volume.x, playAudio.Volume.y))
+                    {
+                        ApproximatedPlayAudio.Add(
+                            $"{where}: volume was randomised {playAudio.Volume.x:0.##}..{playAudio.Volume.y:0.##}; fixed at the midpoint");
+                    }
+                }
+                if (Apply(playAudio.PitchApplySettings))
+                {
+                    source.pitch = (playAudio.Pitch.x + playAudio.Pitch.y) * 0.5f;
+                    if (!Mathf.Approximately(playAudio.Pitch.x, playAudio.Pitch.y))
+                    {
+                        ApproximatedPlayAudio.Add(
+                            $"{where}: pitch was randomised {playAudio.Pitch.x:0.##}..{playAudio.Pitch.y:0.##}; fixed at the midpoint");
+                    }
+                }
+                if (playAudio.DelayInSeconds > 0f)
+                {
+                    ApproximatedPlayAudio.Add($"{where}: {playAudio.DelayInSeconds:0.##} s start delay dropped");
+                }
+                if (playAudio.PlayOnExit || playAudio.StopOnExit)
+                {
+                    ApproximatedPlayAudio.Add($"{where}: exit actions dropped; the sound follows the state instead");
+                }
+            }
+
+            // An enable window cuts a one-shot to a click. CVRAudioDriver plays on an index
+            // change and lets it finish, so the state pulses the index, then -1 a frame later.
+            if (play && !effectiveLoop)
+            {
+                if (wanted == null)
+                {
+                    Drop("no clip on the behaviour or the AudioSource");
+                    return;
+                }
+                source.playOnAwake = false;
+                source.enabled = true;
+                var pulse = host.GetComponent<CVRAudioDriver>();
+                if (pulse == null)
+                {
+                    pulse = host.gameObject.AddComponent<CVRAudioDriver>();
+                }
+                pulse.audioSource = source;
+                if (pulse.audioClips == null)
+                {
+                    pulse.audioClips = new List<AudioClip>();
+                }
+                // One driver per source, shared by every state that plays
+                // through it, so each state pulses its own clip's index.
+                int index = pulse.audioClips.IndexOf(wanted);
+                if (index < 0)
+                {
+                    index = pulse.audioClips.Count;
+                    pulse.audioClips.Add(wanted);
+                }
+                pulse.selectedAudioClip = -1;
+                pulse.playOnSwitch = true;
+                EditorUtility.SetDirty(pulse);
+                state.motion = AudioPulseMotion(state.motion as AnimationClip, state.name, path, index);
+                EditorUtility.SetDirty(state);
+                ConvertedPlayAudio.Add($"{where} (one-shot, audio driver pulse)");
+                return;
+            }
+            if (play)
+            {
+                source.playOnAwake = true;
+            }
+            if (play && wanted != null)
+            {
+                // A source holds one clip. A second loop asking for another
+                // would silently retarget the first, so the first keeps it.
+                if (LoopedSourceClips.TryGetValue(source, out var held) && held != wanted)
+                {
+                    ApproximatedPlayAudio.Add(
+                        $"{where}: shares its AudioSource with another looping state; plays \"{held.name}\" instead of \"{wanted.name}\"");
+                }
+                else
+                {
+                    source.clip = wanted;
+                    LoopedSourceClips[source] = wanted;
+                }
+            }
+
+            // A clip already toggling the object or component is the gate.
+            var current = state.motion as AnimationClip;
+            bool drivesActive = false, drivesEnabled = false;
+            if (current != null)
+            {
+                foreach (var binding in AnimationUtility.GetCurveBindings(current))
+                {
+                    if (binding.path != path)
+                    {
+                        continue;
+                    }
+                    drivesActive |= binding.type == typeof(GameObject) && binding.propertyName == "m_IsActive";
+                    drivesEnabled |= binding.type == typeof(AudioSource) && binding.propertyName == "m_Enabled";
+                }
+            }
+            if (play && drivesActive)
+            {
+                source.enabled = true;
+                ConvertedPlayAudio.Add($"{where} (object toggle already wired)");
+                return;
+            }
+            if (drivesEnabled)
+            {
+                if (play)
+                {
+                    source.enabled = false;
+                }
+                ConvertedPlayAudio.Add($"{where} (enable curve already wired)");
+                return;
+            }
+
+            float value = play ? 1f : 0f;
+            if (play)
+            {
+                source.enabled = false;
+            }
+            state.motion = AudioWindowMotion(current, state.name, path, value);
+            EditorUtility.SetDirty(state);
+            ConvertedPlayAudio.Add(where);
+        }
+
+        // Frame 0 writes the index, the next -1, so re-entry plays again.
+        static Motion AudioPulseMotion(AnimationClip current, string stateName, string path, int index)
+        {
+            var key = ((Motion)current, "pulse:" + path, (float)index);
+            if (AudioWindowClones.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+            AnimationClip clone;
+            if (current != null)
+            {
+                clone = UnityEngine.Object.Instantiate(current);
+                clone.name = current.name + " audio";
+            }
+            else
+            {
+                clone = new AnimationClip { name = SanitizeFileName($"{stateName} audio") };
+            }
+            clone.hideFlags = HideFlags.None;
+            var curve = new AnimationCurve(
+                new Keyframe(0f, index) { outTangent = float.PositiveInfinity },
+                new Keyframe(1f / 60f, -1f) { inTangent = float.PositiveInfinity });
+            AnimationUtility.SetEditorCurve(clone,
+                EditorCurveBinding.FloatCurve(path, typeof(CVRAudioDriver), "selectedAudioClip"),
+                curve);
+            AudioWindowClones[key] = clone;
+            return clone;
+        }
+
+        static Motion AudioWindowMotion(AnimationClip current, string stateName, string path, float value)
+        {
+            var key = ((Motion)current, path, value);
+            if (AudioWindowClones.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+            AnimationClip clone;
+            float length;
+            if (current != null)
+            {
+                clone = UnityEngine.Object.Instantiate(current);
+                clone.name = current.name + " audio";
+                length = Mathf.Max(current.length, 1f / 60f);
+            }
+            else
+            {
+                clone = new AnimationClip { name = SanitizeFileName($"{stateName} audio") };
+                length = 1f / 60f;
+            }
+            clone.hideFlags = HideFlags.None;
+            AnimationUtility.SetEditorCurve(clone,
+                EditorCurveBinding.FloatCurve(path, typeof(AudioSource), "m_Enabled"),
+                AnimationCurve.Constant(0f, length, value));
+            AudioWindowClones[key] = clone;
+            return clone;
+        }
+
+        static StateMachineBehaviour[] ConvertBehaviours(AnimatorController master, StateMachineBehaviour[] behaviours,
+            AnimatorState state, BridgeContext ctx, Dictionary<string, int> skipped, BodyControlStats bodyStats,
+            Dictionary<string, AnimatorControllerParameterType> parameterTypes)
+        {
+            if (behaviours == null || behaviours.Length == 0)
+            {
+                return behaviours;
+            }
+
+            var result = new List<StateMachineBehaviour>();
+            // One BodyControl per state: two run in undefined order and OnValidate cannot reconcile them.
+            BodyControl bodyControl = null;
+
+            foreach (var behaviour in behaviours)
+            {
+                if (behaviour == null)
+                {
+                    continue;
+                }
+                if (behaviour is VRCAvatarParameterDriver vrcDriver)
+                {
+                    var driver = ConvertParameterDriver(master, vrcDriver, ctx, parameterTypes);
+                    if (driver != null)
+                    {
+                        result.Add(driver);
+                    }
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else if (behaviour is VRCAnimatorTrackingControl tracking)
+                {
+                    ConvertTrackingControl(tracking, ref bodyControl, result, bodyStats);
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else if (behaviour is VRCAnimatorLocomotionControl locomotion)
+                {
+                    AddBodyTask(ref bodyControl, result, BodyControlTask.BodyMask.Locomotion,
+                        locomotion.disableLocomotion ? 0f : 1f, bodyStats);
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else if (behaviour is VRC.SDK3.Avatars.Components.VRCAnimatorPlayAudio playAudio)
+                {
+                    ConvertPlayAudio(ctx, state, playAudio);
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else if (behaviour is VRC.SDK3.Avatars.Components.VRCAnimatorLayerControl layerControl
+                         && layerControl.playable != VRC.SDKBase.VRC_AnimatorLayerControl.BlendableLayer.Action)
+                {
+                    // Action gates feed the emote transplant, which reads
+                    // the source layers itself; these are the FX-style
+                    // reaction gates, kept for the weight revival pass.
+                    CapturedLayerControls.Add(($"{layerControl.playable}:{layerControl.layer}",
+                        layerControl.goalWeight));
+                    if (state != null)
+                    {
+                        LayerControlGoals[state] = LayerControlGoals.TryGetValue(state, out float seen)
+                            ? Mathf.Max(seen, layerControl.goalWeight)
+                            : layerControl.goalWeight;
+                    }
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else if (behaviour.GetType().Name == "VRCAnimatorTemporaryPoseSpace")
+                {
+                    if (DroppedPoseSpace.Count < 4 && state != null)
+                    {
+                        DroppedPoseSpace.Add(state.name);
+                    }
+                    DroppedPoseSpaceCount++;
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else if (behaviour.GetType().Name.StartsWith("VRC"))
+                {
+                    skipped[behaviour.GetType().Name] = skipped.TryGetValue(behaviour.GetType().Name, out var n) ? n + 1 : 1;
+                    UnityEngine.Object.DestroyImmediate(behaviour, true);
+                }
+                else
+                {
+                    result.Add(behaviour);
+                }
+            }
+            // The same array back when nothing was converted, so the caller sets nothing.
+            return result.SequenceEqual(behaviours) ? behaviours : result.ToArray();
+        }
+
+        // Running totals so the report gets one line, not one per behaviour.
+        class BodyControlStats
+        {
+            public int Components;
+            public int Tasks;
+            public int DroppedEyes;
+            public int DroppedMouth;
+            public int DroppedFingers;
+
+            public void Report(BridgeContext ctx)
+            {
+                if (Components == 0)
+                {
+                    return;
+                }
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(Components, "tracking/locomotion behaviour", "tracking/locomotion behaviours")} converted to ChilloutVR Body Control",
+                    $"{BridgeElements.Count(Tasks, "body-mask task", "body-mask tasks")}: \"Animation\" hands a limb to the animation, \"Tracking\" back to IK.");
+
+                int unmapped = DroppedEyes + DroppedMouth + DroppedFingers;
+                if (unmapped > 0)
+                {
+                    var parts = new List<string>();
+                    if (DroppedEyes > 0) parts.Add($"eyes/eyelids ({DroppedEyes})");
+                    if (DroppedMouth > 0) parts.Add($"mouth/jaw ({DroppedMouth})");
+                    if (DroppedFingers > 0) parts.Add($"fingers ({DroppedFingers})");
+                    ctx.Report.Approximated(Category, "Some tracking targets have no ChilloutVR body mask",
+                        $"{string.Join(", ", parts)}: Body Control covers head, pelvis, arms, legs and locomotion only." +
+                        (DroppedFingers > 0
+                            ? " An emote's hand pose loses to your current gesture here; hold an open hand while it plays."
+                            : ""));
+                }
+            }
+        }
+
+        static void ConvertTrackingControl(VRCAnimatorTrackingControl tracking, ref BodyControl bodyControl,
+            List<StateMachineBehaviour> result, BodyControlStats stats)
+        {
+            // Written out rather than looped: a local function may not capture a ref parameter.
+            MapTracking(tracking.trackingHead, BodyControlTask.BodyMask.Head, ref bodyControl, result, stats);
+            MapTracking(tracking.trackingHip, BodyControlTask.BodyMask.Pelvis, ref bodyControl, result, stats);
+            MapTracking(tracking.trackingLeftHand, BodyControlTask.BodyMask.LeftArm, ref bodyControl, result, stats);
+            MapTracking(tracking.trackingRightHand, BodyControlTask.BodyMask.RightArm, ref bodyControl, result, stats);
+            MapTracking(tracking.trackingLeftFoot, BodyControlTask.BodyMask.LeftLeg, ref bodyControl, result, stats);
+            MapTracking(tracking.trackingRightFoot, BodyControlTask.BodyMask.RightLeg, ref bodyControl, result, stats);
+
+            if (Changes(tracking.trackingEyes)) stats.DroppedEyes++;
+            if (Changes(tracking.trackingMouth)) stats.DroppedMouth++;
+            if (Changes(tracking.trackingLeftFingers) || Changes(tracking.trackingRightFingers))
+            {
+                stats.DroppedFingers++;
+            }
+        }
+
+        static bool Changes(VRC.SDKBase.VRC_AnimatorTrackingControl.TrackingType type) =>
+            type != VRC.SDKBase.VRC_AnimatorTrackingControl.TrackingType.NoChange;
+
+        static void MapTracking(VRC.SDKBase.VRC_AnimatorTrackingControl.TrackingType type,
+            BodyControlTask.BodyMask mask, ref BodyControl bodyControl,
+            List<StateMachineBehaviour> result, BodyControlStats stats)
+        {
+            if (!Changes(type))
+            {
+                return;
+            }
+            AddBodyTask(ref bodyControl, result, mask,
+                type == VRC.SDKBase.VRC_AnimatorTrackingControl.TrackingType.Tracking ? 1f : 0f, stats);
+        }
+
+        static void AddBodyTask(ref BodyControl bodyControl, List<StateMachineBehaviour> result,
+            BodyControlTask.BodyMask mask, float weight, BodyControlStats stats)
+        {
+            if (bodyControl == null)
+            {
+                bodyControl = ScriptableObject.CreateInstance<BodyControl>();
+                bodyControl.name = "BodyControl";
+                result.Add(bodyControl);
+                stats.Components++;
+            }
+            bodyControl.EnterTasks.RemoveAll(t => t.target == mask);
+            bodyControl.EnterTasks.Add(new BodyControlTask
+            {
+                target = mask,
+                targetWeight = weight,
+                transitionDuration = 0f,
+                isBlend = false,
+            });
+            stats.Tasks++;
+        }
+
+        // Float scratch for ranged Copy drivers; "#" keeps it off the network.
+        internal const string DriverScratch = "#AB_DriverScratch";
+
+        // A Unity parameter type as a driver task spells it. One mapping for
+        // the builder and the final sync, so the two cannot disagree.
+        static AnimatorDriverTask.ParameterType DriverTypeOf(AnimatorControllerParameterType type)
+        {
+            switch (type)
+            {
+                case AnimatorControllerParameterType.Int: return AnimatorDriverTask.ParameterType.Int;
+                case AnimatorControllerParameterType.Bool: return AnimatorDriverTask.ParameterType.Bool;
+                case AnimatorControllerParameterType.Trigger: return AnimatorDriverTask.ParameterType.Trigger;
+                default: return AnimatorDriverTask.ParameterType.Float;
+            }
+        }
+
+        static AnimatorDriver ConvertParameterDriver(AnimatorController master, VRCAvatarParameterDriver vrcDriver,
+            BridgeContext ctx, Dictionary<string, AnimatorControllerParameterType> parameterTypes)
+        {
+            var driver = ScriptableObject.CreateInstance<AnimatorDriver>();
+            driver.name = "AnimatorDriver";
+            driver.hideFlags = HideFlags.HideInHierarchy;
+            driver.localOnly = vrcDriver.localOnly;
+
+            AnimatorDriverTask.ParameterType TypeOf(string parameterName) =>
+                parameterName != null && parameterTypes.TryGetValue(parameterName, out var type)
+                    ? DriverTypeOf(type) : AnimatorDriverTask.ParameterType.Float;
+
+            foreach (var p in vrcDriver.parameters)
+            {
+                switch (p.type)
+                {
+                    case VRC.SDKBase.VRC_AvatarParameterDriver.ChangeType.Set:
+                        driver.EnterTasks.Add(new AnimatorDriverTask
+                        {
+                            op = AnimatorDriverTask.Operator.Set,
+                            targetName = p.name,
+                            targetType = TypeOf(p.name),
+                            aType = AnimatorDriverTask.SourceType.Static,
+                            aValue = p.value
+                        });
+                        break;
+
+                    case VRC.SDKBase.VRC_AvatarParameterDriver.ChangeType.Add:
+                        driver.EnterTasks.Add(new AnimatorDriverTask
+                        {
+                            op = AnimatorDriverTask.Operator.Addition,
+                            targetName = p.name,
+                            targetType = TypeOf(p.name),
+                            aType = AnimatorDriverTask.SourceType.Parameter,
+                            aParamType = TypeOf(p.name),
+                            aName = p.name,
+                            bType = AnimatorDriverTask.SourceType.Static,
+                            bValue = p.value
+                        });
+                        break;
+
+                    case VRC.SDKBase.VRC_AvatarParameterDriver.ChangeType.Random:
+                        // Resolved by name: CCK versions spell it LessThan or LessThen,
+                        // and naming one fails to compile against the other.
+                        if (TypeOf(p.name) == AnimatorDriverTask.ParameterType.Bool
+                            && TryOperator(out var lessThan, "LessThan", "LessThen"))
+                        {
+                            // random < chance writes exactly 0 or 1, so the
+                            // chance survives however the client coerces a bool.
+                            driver.EnterTasks.Add(new AnimatorDriverTask
+                            {
+                                op = lessThan,
+                                targetName = p.name,
+                                targetType = TypeOf(p.name),
+                                aType = AnimatorDriverTask.SourceType.Random,
+                                aValue = 0f,
+                                aMax = 1f,
+                                bType = AnimatorDriverTask.SourceType.Static,
+                                bValue = p.chance
+                            });
+                            break;
+                        }
+                        // An Int is rounded on write, so min..max would give
+                        // each end half the weight; VRChat picks them evenly.
+                        bool randomInt = TypeOf(p.name) == AnimatorDriverTask.ParameterType.Int;
+                        bool randomBool = TypeOf(p.name) == AnimatorDriverTask.ParameterType.Bool;
+                        driver.EnterTasks.Add(new AnimatorDriverTask
+                        {
+                            op = AnimatorDriverTask.Operator.Set,
+                            targetName = p.name,
+                            targetType = TypeOf(p.name),
+                            aType = AnimatorDriverTask.SourceType.Random,
+                            aValue = randomBool ? 0f : randomInt ? p.valueMin - 0.4999f : p.valueMin,
+                            aMax = randomBool ? 1f : randomInt ? p.valueMax + 0.4999f : p.valueMax
+                        });
+                        if (randomBool)
+                        {
+                            ctx.Report.Approximated(Category, $"Random driver for \"{p.name}\"",
+                                "Random bool approximated with a random 0..1 set; chance weighting is not preserved.");
+                        }
+                        break;
+
+                    case VRC.SDKBase.VRC_AvatarParameterDriver.ChangeType.Copy:
+                        if (p.convertRange && !Mathf.Approximately(p.sourceMax - p.sourceMin, 0f))
+                        {
+                            float scale = (p.destMax - p.destMin) / (p.sourceMax - p.sourceMin);
+                            // dst = src * scale + (dstMin - srcMin * scale), in a Float scratch: writes
+                            // round an Int and threshold a Bool, so chaining on the target left an
+                            // inverter always true. Tasks run in order, so one scratch serves all.
+                            master.parameters = AppendScratch(master.parameters, DriverScratch);
+                            driver.EnterTasks.Add(new AnimatorDriverTask
+                            {
+                                op = AnimatorDriverTask.Operator.Multiplication,
+                                targetName = DriverScratch,
+                                targetType = AnimatorDriverTask.ParameterType.Float,
+                                aType = AnimatorDriverTask.SourceType.Parameter,
+                                aParamType = TypeOf(p.source),
+                                aName = p.source,
+                                bType = AnimatorDriverTask.SourceType.Static,
+                                bValue = scale
+                            });
+                            driver.EnterTasks.Add(new AnimatorDriverTask
+                            {
+                                op = AnimatorDriverTask.Operator.Addition,
+                                targetName = DriverScratch,
+                                targetType = AnimatorDriverTask.ParameterType.Float,
+                                aType = AnimatorDriverTask.SourceType.Parameter,
+                                aParamType = AnimatorDriverTask.ParameterType.Float,
+                                aName = DriverScratch,
+                                bType = AnimatorDriverTask.SourceType.Static,
+                                bValue = p.destMin - p.sourceMin * scale
+                            });
+                            driver.EnterTasks.Add(new AnimatorDriverTask
+                            {
+                                op = AnimatorDriverTask.Operator.Set,
+                                targetName = p.name,
+                                targetType = TypeOf(p.name),
+                                aType = AnimatorDriverTask.SourceType.Parameter,
+                                aParamType = AnimatorDriverTask.ParameterType.Float,
+                                aName = DriverScratch
+                            });
+                        }
+                        else
+                        {
+                            driver.EnterTasks.Add(new AnimatorDriverTask
+                            {
+                                op = AnimatorDriverTask.Operator.Set,
+                                targetName = p.name,
+                                targetType = TypeOf(p.name),
+                                aType = AnimatorDriverTask.SourceType.Parameter,
+                                aParamType = TypeOf(p.source),
+                                aName = p.source
+                            });
+                        }
+                        break;
+                }
+            }
+            return driver.EnterTasks.Count > 0 ? driver : null;
+        }
+
+        // ----------------------------------------------------------------- rename ----
+
+        static void RenamePass(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            // Spaces and the like break the CCK's controller autogeneration. A slash is legal:
+            // the CCK keeps it in names and strips it for files.
+            var sanitizedNames = new Dictionary<string, string>();
+            var takenNames = new HashSet<string>(master.parameters.Select(p => p.name));
+            var forcedKeys = new HashSet<string>();
+            // ponytail: renames by later passes are not recorded; add them if a report misleads.
+            ctx.RenamedFrom = ctx.RenamedFrom ?? new Dictionary<string, string>(StringComparer.Ordinal);
+
+            // Renames from the menu build: a Joystick2D needs its exact
+            // "-x"/"-y" axis names. Read before the core map, so these
+            // shadow it. A key the game drives is skipped and reported.
+            foreach (var forced in ctx.ForcedRenames)
+            {
+                if (CvrCoreParameters.Contains(forced.Key) || StreamFedParameters.Contains(forced.Key)
+                    || ParameterRenameMap.ContainsKey(forced.Key))
+                {
+                    ctx.Report.Warning(Category, $"Refused to rename \"{forced.Key}\"",
+                        $"A menu control asked for it to become \"{forced.Value}\", but the game drives " +
+                        "this parameter itself; renaming it would disconnect that system. The control " +
+                        "keeps its original parameters instead.");
+                    continue;
+                }
+                if (takenNames.Contains(forced.Value))
+                {
+                    ctx.Report.Warning(Category, $"Refused to rename \"{forced.Key}\" to \"{forced.Value}\"",
+                        "A parameter with the target name already exists, so the rename would have merged " +
+                        "two unrelated parameters. The control keeps its original parameters instead.");
+                    continue;
+                }
+                sanitizedNames[forced.Key] = forced.Value;
+                forcedKeys.Add(forced.Key);
+                takenNames.Add(forced.Value);
+            }
+            foreach (var entry in ctx.CvrAvatar.avatarSettings.settings)
+            {
+                string machineName = entry.machineName;
+                if (string.IsNullOrEmpty(machineName) || sanitizedNames.ContainsKey(machineName))
+                {
+                    continue;
+                }
+                if (machineName.IndexOfAny(new[] { ' ', '\\', '(', ')', '<', '>', '\'', '"', ',' }) < 0)
+                {
+                    continue; // already CCK-safe
+                }
+                string clean = SanitizeParameterName(string.IsNullOrEmpty(entry.name) ? machineName : entry.name);
+                string candidate = clean;
+                int suffix = 2;
+                while (takenNames.Contains(candidate) || sanitizedNames.ContainsValue(candidate))
+                {
+                    candidate = clean + suffix++;
+                }
+                sanitizedNames[machineName] = candidate;
+                ctx.Report.Converted(Category, $"Parameter \"{machineName}\"",
+                    $"Renamed to CCK-safe \"{candidate}\".");
+            }
+
+            string Rename(string name)
+            {
+                string result = Renamed(name);
+                if (!string.IsNullOrEmpty(name) && result != name && !ctx.RenamedFrom.ContainsKey(result))
+                {
+                    string bare = result.TrimStart('#');
+                    string why = forcedKeys.Contains(name) ? "a menu control needs this name"
+                        : sanitizedNames.ContainsKey(name) ? "made safe for the CCK"
+                        : ParameterRenameMap.ContainsKey(name) ? "ChilloutVR's own name for it"
+                        : ctx.ForcesLocal(bare) ? "kept on the wearer: a contact or stream drives it"
+                        : "not synced in VRChat, so kept local";
+                    ctx.RenamedFrom[result] = $"\"{name}\" ({why})";
+                }
+                return result;
+            }
+
+            string Renamed(string name)
+            {
+                if (string.IsNullOrEmpty(name))
+                {
+                    return name;
+                }
+                string result = sanitizedNames.TryGetValue(name, out var sanitized) ? sanitized
+                    : ParameterRenameMap.TryGetValue(name, out var mapped) ? mapped : name;
+                // Stream-fed parameters stay synced: the stream runs on
+                // the wearer's copy alone. Forced local wins anyway, or
+                // the stream overwrites what a contact just set.
+                if (ctx.ForcesLocal(result)
+                    && !result.StartsWith("#", StringComparison.Ordinal))
+                {
+                    return "#" + result;
+                }
+                bool preserved = CvrCoreParameters.Contains(result) ||
+                                 StreamFedParameters.Contains(result) ||
+                                 ctx.PreserveParameters.Contains(name) ||
+                                 ctx.PreserveParameters.Contains(result) ||
+                                 ctx.ContactParameters.Contains(name);
+                // Already-local names are left alone; no "##" doubling.
+                if (ctx.Settings.preserveParameterSyncState && !preserved
+                    && !result.StartsWith("#", StringComparison.Ordinal))
+                {
+                    result = "#" + result;
+                }
+                return result;
+            }
+
+            // Pre-rename names a clip may rewrite. Muscle curves share the binding shape;
+            // unfiltered they would get "#" prefixes and bind to nothing.
+            var animatableParameters = new HashSet<string>(master.parameters.Select(p => p.name));
+
+            // Parameters (dedupe after rename; e.g. Viseme folds into VisemeIdx).
+            var newParams = new List<AnimatorControllerParameter>();
+            var seenNames = new HashSet<string>();
+            foreach (var param in master.parameters)
+            {
+                string newName = Rename(param.name);
+                if (!seenNames.Add(newName))
+                {
+                    continue;
+                }
+                if (newName != param.name)
+                {
+                    param.name = newName;
+                }
+                newParams.Add(param);
+            }
+            master.parameters = newParams.ToArray();
+
+            var clipMap = new Dictionary<AnimationClip, AnimationClip>();
+            // Every state machine, not just vrcLayers, or outside references dangle.
+            var machines = master.layers.Select(l => l.stateMachine)
+                .Concat(vrcLayers.Select(l => l.stateMachine))
+                .Where(m => m != null)
+                .Distinct();
+            foreach (var stateMachine in machines)
+            {
+                RenameMachineReferences(stateMachine, Rename,
+                    motion => RenameInMotion(motion, Rename, clipMap, ctx, animatableParameters));
+            }
+
+            // Advanced settings + triggers created earlier also need matching names.
+            foreach (var setting in ctx.CvrAvatar.avatarSettings.settings)
+            {
+                setting.machineName = Rename(setting.machineName);
+            }
+            // And the record of entries this tool created: WithdrawSelfDrivenExposures compares
+            // it to the renamed machineNames, and a stale spelling leaves a menu entry fighting
+            // the animator's own driver.
+            if (ctx.AutoExposedParameters.Count > 0)
+            {
+                var moved = new HashSet<string>();
+                foreach (string exposed in ctx.AutoExposedParameters) moved.Add(Rename(exposed));
+                ctx.AutoExposedParameters.Clear();
+                foreach (string exposed in moved) ctx.AutoExposedParameters.Add(exposed);
+            }
+            // Same for the menu Buttons: UnlatchImpulsePingPongs reads them
+            // against post-rename names, so a renamed Button was skipped.
+            if (ctx.ImpulseParameters.Count > 0)
+            {
+                var moved = ctx.ImpulseParameters.Select(Rename).ToList();
+                ctx.ImpulseParameters.Clear();
+                ctx.ImpulseParameters.UnionWith(moved);
+            }
+            foreach (var trigger in ctx.CvrAvatar.GetComponentsInChildren<CVRAdvancedAvatarSettingsTrigger>(true))
+            {
+                trigger.settingName = Rename(trigger.settingName);
+                foreach (var task in trigger.enterTasks) task.settingName = Rename(task.settingName);
+                foreach (var task in trigger.exitTasks) task.settingName = Rename(task.settingName);
+                foreach (var task in trigger.stayTasks) task.settingName = Rename(task.settingName);
+            }
+
+            if (clipMap.Count > 0)
+            {
+                ctx.Report.Converted(Category, $"{clipMap.Count} animation clips cloned",
+                    "They animate renamed animator parameters (animated animator parameters).");
+            }
+        }
+
+        // Every parameter reference a machine tree holds, through one rename.
+        // The motion is the caller's, since only some passes may rewrite clip
+        // curves. One walker for every rename: three copies drifted apart.
+        static void RenameMachineReferences(AnimatorStateMachine root, Func<string, string> rename,
+            Func<Motion, Motion> renameMotion)
+        {
+            WalkMachines(root, machine =>
+            {
+                RenameConditions(machine.anyStateTransitions, rename);
+                RenameConditions(machine.entryTransitions, rename);
+                RenameConditions(SubMachineTransitions(machine), rename);
+                foreach (var behaviour in machine.behaviours)
+                {
+                    RenameInDriver(behaviour as AnimatorDriver, rename);
+                }
+                foreach (var child in machine.states)
+                {
+                    var state = child.state;
+                    state.timeParameter = rename(state.timeParameter);
+                    state.speedParameter = rename(state.speedParameter);
+                    state.mirrorParameter = rename(state.mirrorParameter);
+                    state.cycleOffsetParameter = rename(state.cycleOffsetParameter);
+                    state.motion = renameMotion(state.motion);
+                    RenameConditions(state.transitions, rename);
+                    foreach (var behaviour in state.behaviours)
+                    {
+                        RenameInDriver(behaviour as AnimatorDriver, rename);
+                    }
+                }
+            });
+        }
+
+        static void RenameConditions(AnimatorTransitionBase[] transitions, Func<string, string> rename)
+        {
+            foreach (var transition in transitions)
+            {
+                var conditions = transition.conditions;
+                bool changed = false;
+                for (int i = 0; i < conditions.Length; i++)
+                {
+                    string newName = rename(conditions[i].parameter);
+                    if (newName != conditions[i].parameter)
+                    {
+                        conditions[i].parameter = newName;
+                        changed = true;
+                    }
+                }
+                if (changed)
+                {
+                    transition.conditions = conditions;
+                }
+            }
+        }
+
+        static void RenameInDriver(AnimatorDriver driver, Func<string, string> rename)
+        {
+            if (driver == null)
+            {
+                return;
+            }
+            foreach (var task in driver.EnterTasks) RenameTask(task, rename);
+            foreach (var task in driver.ExitTasks) RenameTask(task, rename);
+        }
+
+        static void RenameTask(AnimatorDriverTask task, Func<string, string> rename)
+        {
+            task.targetName = rename(task.targetName);
+            if (task.aType == AnimatorDriverTask.SourceType.Parameter) task.aName = rename(task.aName);
+            if (task.bType == AnimatorDriverTask.SourceType.Parameter) task.bName = rename(task.bName);
+        }
+
+        static Motion RenameInMotion(Motion motion, Func<string, string> rename,
+            Dictionary<AnimationClip, AnimationClip> clipMap, BridgeContext ctx, HashSet<string> animatable)
+        {
+            if (motion is BlendTree tree)
+            {
+                tree.blendParameter = rename(tree.blendParameter);
+                if (tree.blendType != BlendTreeType.Simple1D && tree.blendType != BlendTreeType.Direct)
+                {
+                    tree.blendParameterY = rename(tree.blendParameterY);
+                }
+                var children = tree.children;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    if (tree.blendType == BlendTreeType.Direct)
+                    {
+                        children[i].directBlendParameter = rename(children[i].directBlendParameter);
+                    }
+                    children[i].motion = RenameInMotion(children[i].motion, rename, clipMap, ctx, animatable);
+                }
+                tree.children = children;
+                return tree;
+            }
+
+            if (motion is AnimationClip clip)
+            {
+                return RenameInClip(clip, rename, clipMap, animatable);
+            }
+            return motion;
+        }
+
+        static AnimationClip RenameInClip(AnimationClip clip, Func<string, string> rename,
+            Dictionary<AnimationClip, AnimationClip> clipMap, HashSet<string> animatable)
+        {
+            if (clip == null)
+            {
+                return null;
+            }
+            if (clipMap.TryGetValue(clip, out var existing))
+            {
+                return existing;
+            }
+
+            var bindings = AnimationUtility.GetCurveBindings(clip);
+            var renames = bindings
+                .Where(b => b.type == typeof(Animator) && string.IsNullOrEmpty(b.path) &&
+                            // Must actually be a parameter. Muscle and root curves share this
+                            // binding shape exactly, and renaming one destroys it.
+                            animatable.Contains(b.propertyName) &&
+                            rename(b.propertyName) != b.propertyName)
+                .ToArray();
+            if (renames.Length == 0)
+            {
+                clipMap[clip] = clip;
+                return clip;
+            }
+
+            var clone = UnityEngine.Object.Instantiate(clip);
+            clone.name = clip.name + "_cvr";
+            clone.hideFlags = HideFlags.None;
+            foreach (var binding in renames)
+            {
+                var curve = AnimationUtility.GetEditorCurve(clone, binding);
+                AnimationUtility.SetEditorCurve(clone, binding, null);
+                var newBinding = binding;
+                newBinding.propertyName = rename(binding.propertyName);
+                AnimationUtility.SetEditorCurve(clone, newBinding, curve);
+            }
+            clipMap[clip] = clone;
+            return clone;
+        }
+
+        // ----------------------------------------------------------------- extras ----
+
+        static void ApplyParameterDefaults(AnimatorController master, BridgeContext ctx)
+        {
+            var vrcParams = ctx.SourceDescriptor.expressionParameters;
+            var defaults = new Dictionary<string, float>();
+            if (vrcParams != null && vrcParams.parameters != null)
+            {
+                foreach (var p in vrcParams.parameters)
+                {
+                    if (!string.IsNullOrEmpty(p.name))
+                    {
+                        defaults[p.name] = p.defaultValue;
+                    }
+                }
+            }
+            // A CCK-safe renamed parameter is found by its new name only, so take its menu's
+            // default: "Hide Arm Fluff" started at 0, not its menu's 1.
+            foreach (var entry in ctx.CvrAvatar.avatarSettings.settings)
+            {
+                if (string.IsNullOrEmpty(entry.machineName) || defaults.ContainsKey(entry.machineName)) continue;
+                switch (entry.setting)
+                {
+                    case CVRAdvancesAvatarSettingGameObjectToggle toggle: defaults[entry.machineName] = toggle.defaultValue ? 1f : 0f; break;
+                    case CVRAdvancesAvatarSettingGameObjectDropdown dropdown: defaults[entry.machineName] = dropdown.defaultValue; break;
+                    case CVRAdvancesAvatarSettingSlider slider: defaults[entry.machineName] = slider.defaultValue; break;
+                }
+            }
+
+            var unsupportedPresent = new List<string>();
+            var parameters = master.parameters;
+            foreach (var param in parameters)
+            {
+                string bareName = param.name.TrimStart('#');
+                if (defaults.TryGetValue(bareName, out var value))
+                {
+                    param.defaultFloat = value;
+                    param.defaultInt = (int)value;
+                    param.defaultBool = value != 0;
+                }
+                if (KnownUnsupportedVrcParameters.Contains(bareName) && bareName != "VelocityMagnitude")
+                {
+                    unsupportedPresent.Add(bareName);
+                }
+            }
+            master.parameters = parameters;
+
+            if (unsupportedPresent.Count > 0)
+            {
+                ctx.Report.Skipped(Category, "VRC built-in parameters without CVR equivalent",
+                    string.Join(", ", unsupportedPresent.Distinct()) + ": nothing writes them in game, so " +
+                    "they hold one value forever. Those with a known resting reading are set to it (see " +
+                    "\"given a resting value\" below); the rest sit at 0, which is correct for them.");
+            }
+        }
+
+
+        static void DropStateMachinelessLayers(AnimatorController master, BridgeContext ctx)
+        {
+            var layers = master.layers;
+            var kept = layers.Where(l => l != null && l.stateMachine != null).ToArray();
+            if (kept.Length == layers.Length)
+            {
+                return;
+            }
+            var dropped = layers.Where(l => l == null || l.stateMachine == null)
+                                .Select(l => l == null ? "<null layer>" : $"\"{l.name}\"")
+                                .ToList();
+            master.layers = kept;
+            EditorUtility.SetDirty(master);
+            ctx.Report.Converted(Category,
+                $"Removed {BridgeElements.Count(dropped.Count, "animator layer", "animator layers")} with no state machine",
+                string.Join(", ", dropped) + ": empty, usually copied from another controller. They could play " +
+                "nothing and flooded the console.");
+        }
+
+        static void WriteRestoreClips(AnimatorController master, BridgeContext ctx)
+        {
+            // Shared registry of every restore clip this conversion writes.
+            // The state filler's sweep spares only clips it knows about.
+            // Also stops the passes overwriting each other's clip names.
+            var restoreClipPaths = new HashSet<string>();
+            RestorePartialOffStates(master, ctx, restoreClipPaths);
+            FillEmptyStatesWithRestoreClips(master, ctx, restoreClipPaths);
+            // After the state pass, whose sweep would delete these clips.
+            // Before FillEmptyMotionSlots, so off halves are still holes.
+            FillEmptyTreeSlotsWithRestoreClips(master, ctx, restoreClipPaths);
+            // After both fillers, topping only what is still missing.
+            // CVR never restores Write Defaults, so every binding
+            // must be asserted by real animation.
+            AssertOwnedBindingsEverywhere(master, ctx);
+        }
+
+        internal static void WriteRestoreClipsForTest(AnimatorController master, BridgeContext ctx)
+            => WriteRestoreClips(master, ctx);
+
+        static void RestorePartialOffStates(AnimatorController master, BridgeContext ctx,
+            HashSet<string> writtenPaths)
+        {
+            var topped = new List<string>();
+            int curvesAdded = 0;
+            string dir = $"{ctx.OutputDir}/RehomedAssets";
+            var pending = new List<(AnimationClip clip, string path)>();
+
+            // A binding two layers animate belongs to neither: dual restores fight. Stricter
+            // than the empty-state filler. master.layers copies per read; snapshot once.
+            var layers = master.layers;
+            var owner = new Dictionary<EditorCurveBinding, int>();
+            var contested = new HashSet<EditorCurveBinding>();
+            // Tree-driven elsewhere: a constant here would pin it. The other restore passes exempt these too.
+            BuildRestoreOwnership(layers, out _, out _, out var treeDriven, out _);
+            for (int i = 0; i < layers.Length; i++)
+            {
+                var l = layers[i];
+                if (l?.stateMachine == null) continue;
+                var here = new HashSet<EditorCurveBinding>();
+                // Same reachability rule as BuildRestoreOwnership.
+                // Orphan states never play, so they own nothing.
+                var onlyPlayable = LibraryDefaultState(l);
+                WalkMachines(l.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state?.motion is AnimationClip c
+                            && (onlyPlayable == null || child.state == onlyPlayable))
+                        {
+                            foreach (var binding in AnimationUtility.GetCurveBindings(c)) here.Add(binding);
+                        }
+                    }
+                });
+                foreach (var binding in here)
+                {
+                    if (owner.TryGetValue(binding, out int first) && first != i) contested.Add(binding);
+                    else owner[binding] = i;
+                }
+            }
+
+            for (int layerIndex = 0; layerIndex < layers.Length; layerIndex++)
+            {
+                var layer = layers[layerIndex];
+                if (layer?.stateMachine == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+
+                var states = new List<AnimatorState>();
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null) states.Add(child.state);
+                    }
+                });
+                if (states.Count != 2)
+                {
+                    continue;   // larger than two states is a machine, not a toggle
+                }
+                if (!(states[0].motion is AnimationClip a) || !(states[1].motion is AnimationClip b))
+                {
+                    continue;   // an empty half is the other pass's job
+                }
+
+                var setA = new HashSet<EditorCurveBinding>(AnimationUtility.GetCurveBindings(a));
+                var setB = new HashSet<EditorCurveBinding>(AnimationUtility.GetCurveBindings(b));
+
+                AnimatorState offState; AnimationClip offClip; HashSet<EditorCurveBinding> missing;
+                if (setA.Count > setB.Count && setB.IsProperSubsetOf(setA))
+                {
+                    offState = states[1]; offClip = b; missing = new HashSet<EditorCurveBinding>(setA); missing.ExceptWith(setB);
+                }
+                else if (setB.Count > setA.Count && setA.IsProperSubsetOf(setB))
+                {
+                    offState = states[0]; offClip = a; missing = new HashSet<EditorCurveBinding>(setB); missing.ExceptWith(setA);
+                }
+                else
+                {
+                    continue;   // neither is a subset: two different jobs, not on/off
+                }
+
+                var filled = new AnimationClip { name = SanitizeFileName($"{offClip.name} restore") };
+                // Same rule as the assertion pass's copies: settings travel with the curves, or a
+                // looping source comes back loop=False and freezes after one play.
+                AnimationUtility.SetAnimationClipSettings(filled,
+                    AnimationUtility.GetAnimationClipSettings(offClip));
+                filled.frameRate = offClip.frameRate;
+                filled.wrapMode = offClip.wrapMode;
+                foreach (var binding in AnimationUtility.GetCurveBindings(offClip))
+                {
+                    AnimationUtility.SetEditorCurve(filled, binding, AnimationUtility.GetEditorCurve(offClip, binding));
+                }
+                foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(offClip))
+                {
+                    AnimationUtility.SetObjectReferenceCurve(filled, binding,
+                        AnimationUtility.GetObjectReferenceCurve(offClip, binding));
+                }
+
+                int added = 0;
+                foreach (var binding in missing)
+                {
+                    if (binding.type == typeof(Animator))
+                    {
+                        continue;   // parameters, not properties; nothing to restore
+                    }
+                    if (contested.Contains(binding) || !owner.TryGetValue(binding, out int owns)
+                        || owns != layerIndex || TreeDrivenElsewhere(treeDriven, binding, layerIndex))
+                    {
+                        continue;   // another layer animates it too; leave arbitration to it
+                    }
+                    if (!AnimationUtility.GetFloatValue(ctx.Target, binding, out float value))
+                    {
+                        continue;   // property not present on this avatar; leave it alone
+                    }
+                    AnimationUtility.SetEditorCurve(filled, binding, AnimationCurve.Constant(0f, 0f, value));
+                    added++;
+                }
+                if (added == 0)
+                {
+                    continue;
+                }
+
+                // Same home and claiming as other generated clips, so reconversion replaces it.
+                // Listed, not deleted: CreateRestoreClips clears old files in one call.
+                string target = OutputAssetPaths.Claim($"{dir}/{SanitizeFileName(filled.name)}.anim", new List<string>());
+                pending.Add((filled, target));
+                // Register with the shared sweep-survivor list, or the
+                // filler's stale-clip sweep deletes this file.
+                writtenPaths.Add(target);
+                offState.motion = filled;
+                EditorUtility.SetDirty(offState);
+                curvesAdded += added;
+                topped.Add($"\"{layer.name}\" ({added})");
+            }
+            // Before the fillers run, whose sweep and batch expect these on disk.
+            CreateRestoreClips(dir, pending);
+
+            if (topped.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(topped.Count, "\"off\" state", "\"off\" states")} topped up to restore everything their layer animates",
+                    string.Join(", ", topped) + $": {BridgeElements.Count(curvesAdded, "property", "properties")}. Each now returns to its value at " +
+                    "conversion time instead of drifting. Set the avatar at rest before converting.");
+            }
+        }
+
+        static void AssertOwnedBindingsEverywhere(AnimatorController master, BridgeContext ctx)
+        {
+            // master.layers copies every layer per read; snapshot once.
+            var layers = master.layers;
+            string dir = $"{ctx.OutputDir}/RehomedAssets";
+            var pending = new List<(AnimationClip clip, string path)>();
+            BuildRestoreOwnership(layers, out var owner, out _, out var treeDriven, out _);
+
+            int curvesAddedTotal = 0;
+            var touched = new List<string>();
+
+            for (int layerIndex = 0; layerIndex < layers.Length; layerIndex++)
+            {
+                var layer = layers[layerIndex];
+                if (layer?.stateMachine == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                var onlyPlayable = LibraryDefaultState(layer);
+
+                // What this layer animates from plain clip states.
+                // Tree-driven bindings are exempt; ownership never holds them.
+                var stateFloats = new HashSet<EditorCurveBinding>();
+                var stateObjects = new HashSet<EditorCurveBinding>();
+                var states = new List<AnimatorState>();
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        var state = child.state;
+                        if (state == null || (onlyPlayable != null && state != onlyPlayable))
+                        {
+                            continue;
+                        }
+                        states.Add(state);
+                        if (state.motion is AnimationClip clip)
+                        {
+                            foreach (var b in AnimationUtility.GetCurveBindings(clip)) stateFloats.Add(b);
+                            foreach (var b in AnimationUtility.GetObjectReferenceCurveBindings(clip)) stateObjects.Add(b);
+                        }
+                    }
+                });
+
+                var ownedFloats = stateFloats.Where(b => b.type != typeof(Animator)
+                    && !TreeDrivenElsewhere(treeDriven, b, layerIndex)
+                    && owner.TryGetValue(b, out int by) && by == layerIndex).ToList();
+                var ownedObjects = stateObjects.Where(b => !TreeDrivenElsewhere(treeDriven, b, layerIndex)
+                    && owner.TryGetValue(b, out int by) && by == layerIndex).ToList();
+                if (ownedFloats.Count == 0 && ownedObjects.Count == 0)
+                {
+                    continue;
+                }
+
+                int addedThisLayer = 0;
+                foreach (var state in states)
+                {
+                    // A blend tree stands aside: a constant would fight
+                    // its parameter. Routers do not, since ownership only
+                    // works while the bottom layer keeps speaking.
+                    if (state.motion is BlendTree)
+                    {
+                        continue;
+                    }
+                    // Empty states too, same guards; FillEmptyMotionSlots' later placeholder asserts nothing.
+                    var current = state.motion as AnimationClip;
+                    var haveFloats = current != null
+                        ? new HashSet<EditorCurveBinding>(AnimationUtility.GetCurveBindings(current))
+                        : new HashSet<EditorCurveBinding>();
+                    var haveObjects = current != null
+                        ? new HashSet<EditorCurveBinding>(AnimationUtility.GetObjectReferenceCurveBindings(current))
+                        : new HashSet<EditorCurveBinding>();
+
+                    AnimationClip copy = null;
+                    int added = 0;
+                    AnimationClip Copy()
+                    {
+                        if (copy != null)
+                        {
+                            return copy;
+                        }
+                        copy = new AnimationClip
+                        {
+                            name = SanitizeFileName($"{layer.name} {state.name} restore")
+                        };
+                        if (current == null)
+                        {
+                            return copy;   // nothing to carry over; the state held no motion
+                        }
+                        // Settings travel with the curves: an 8.3 s loop topped here came back
+                        // loop=False, playing once and freezing.
+                        AnimationUtility.SetAnimationClipSettings(copy,
+                            AnimationUtility.GetAnimationClipSettings(current));
+                        copy.frameRate = current.frameRate;
+                        copy.wrapMode = current.wrapMode;
+                        foreach (var b in haveFloats)
+                        {
+                            AnimationUtility.SetEditorCurve(copy, b, AnimationUtility.GetEditorCurve(current, b));
+                        }
+                        foreach (var b in haveObjects)
+                        {
+                            AnimationUtility.SetObjectReferenceCurve(copy, b,
+                                AnimationUtility.GetObjectReferenceCurve(current, b));
+                        }
+                        return copy;
+                    }
+
+                    foreach (var binding in ownedFloats)
+                    {
+                        if (haveFloats.Contains(binding)
+                            || !AnimationUtility.GetFloatValue(ctx.Target, binding, out float value))
+                        {
+                            continue;
+                        }
+                        AnimationUtility.SetEditorCurve(Copy(), binding, AnimationCurve.Constant(0f, 0f, value));
+                        added++;
+                    }
+                    foreach (var binding in ownedObjects)
+                    {
+                        if (haveObjects.Contains(binding)
+                            || !AnimationUtility.GetObjectReferenceValue(ctx.Target, binding, out var value))
+                        {
+                            continue;
+                        }
+                        AnimationUtility.SetObjectReferenceCurve(Copy(), binding,
+                            new[] { new ObjectReferenceKeyframe { time = 0f, value = value } });
+                        added++;
+                    }
+                    if (added == 0)
+                    {
+                        continue;
+                    }
+
+                    // Same home, claiming and batch as the other restore writers. A refresh per file
+                    // was near half the merge on a toggle-heavy avatar.
+                    pending.Add((copy, OutputAssetPaths.Claim($"{dir}/{copy.name}.anim", new List<string>())));
+                    state.motion = copy;
+                    EditorUtility.SetDirty(state);
+                    addedThisLayer += added;
+                }
+
+                if (addedThisLayer > 0)
+                {
+                    curvesAddedTotal += addedThisLayer;
+                    touched.Add($"\"{layer.name}\" ({addedThisLayer})");
+                }
+            }
+            CreateRestoreClips(dir, pending);
+
+            if (touched.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(touched.Count, "layer now asserts everything it owns", "layers now assert everything they own")}, from every state",
+                    $"{string.Join(", ", touched.Take(8))}{(touched.Count > 8 ? ", …" : "")}: " +
+                    $"{BridgeElements.Count(curvesAddedTotal, "property", "properties")}. ChilloutVR does not restore defaults, so each is written " +
+                    "from every state, at its value at conversion time.");
+            }
+
+            ReportNoWdCoverage(master, ctx);
+        }
+
+        static void ReportNoWdCoverage(AnimatorController master, BridgeContext ctx)
+        {
+            // master.layers copies every layer per read; snapshot once.
+            var layers = master.layers;
+            BuildRestoreOwnership(layers, out var owner, out _, out var treeDriven, out _);
+
+            var violations = new SortedSet<string>(StableSampleOrder.Instance);
+            int violationCount = 0;
+            int deadCount = 0;
+
+            for (int layerIndex = 0; layerIndex < layers.Length; layerIndex++)
+            {
+                var layer = layers[layerIndex];
+                if (layer?.stateMachine == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                var onlyPlayable = LibraryDefaultState(layer);
+
+                var owned = new List<EditorCurveBinding>();
+                foreach (var pair in owner)
+                {
+                    if (pair.Value != layerIndex || pair.Key.type == typeof(Animator)
+                        || TreeDrivenElsewhere(treeDriven, pair.Key, layerIndex))
+                    {
+                        continue;
+                    }
+                    // A binding that no longer resolves is a toggle over
+                    // a ghost; its object went with a stripped system.
+                    // Not a coverage gap.
+                    if (!AnimationUtility.GetFloatValue(ctx.Target, pair.Key, out _)
+                        && !AnimationUtility.GetObjectReferenceValue(ctx.Target, pair.Key, out _))
+                    {
+                        deadCount++;
+                        continue;
+                    }
+                    owned.Add(pair.Key);
+                }
+                if (owned.Count == 0)
+                {
+                    continue;
+                }
+
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        var state = child.state;
+                        if (state == null || (onlyPlayable != null && state != onlyPlayable)
+                            || IsPassThroughState(state))
+                        {
+                            continue;
+                        }
+                        // A tree state asserts its whole union continuously; count it as covering
+                        // whatever it animates.
+                        var asserts = new HashSet<EditorCurveBinding>();
+                        CollectBindings(state.motion, asserts, asserts);
+                        bool empty = state.motion == null || IsCurveless(state.motion, null);
+                        foreach (var binding in owned)
+                        {
+                            if (!empty && asserts.Contains(binding))
+                            {
+                                continue;
+                            }
+                            violationCount++;
+                            // The filler's own account of this layer, so a violation arrives
+                            // explaining itself instead of costing a reconversion round-trip.
+                            string verdict = restoreVerdicts.TryGetValue(layer.name, out string why)
+                                ? why : "filler never reached this layer";
+                            violations.Add($"{layer.name}/{state.name}: {binding.path}:{PrettyProperty(binding)}"
+                                + (empty ? " (state asserts nothing)" : "") + $" [filler: {verdict}]");
+                        }
+                    }
+                });
+            }
+
+            if (violationCount > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(violationCount, "property", "properties")} can still fall back to the runtime",
+                    $"{string.Join("; ", violations.Take(6))}{(violations.Count > 6 ? "; …" : "")}: " +
+                    "ChilloutVR will not restore these, so a toggle over one may stick off in game. Please " +
+                    "report the avatar.");
+            }
+            if (deadCount > 0)
+            {
+                ctx.Report.Skipped(Category,
+                    $"{BridgeElements.Count(deadCount, "animated property points", "animated properties point")} at objects that were removed",
+                    "Their toggles controlled systems this conversion stripped: SPS sockets, " +
+                    "deleted physics hosts, so the animation now points at nothing, and nothing " +
+                    "shows in game either way. Not a coverage gap; there is nothing left to restore.");
+            }
+        }
+
+        static string PrettyProperty(EditorCurveBinding binding) =>
+            string.IsNullOrEmpty(binding.propertyName) ? "(property)" : binding.propertyName;
+
+        static void SyncDriverParameterTypes(AnimatorController master, BridgeContext ctx)
+        {
+            var types = new Dictionary<string, AnimatorControllerParameterType>();
+            foreach (var p in master.parameters)
+            {
+                types[p.name] = p.type;
+            }
+
+            int corrected = 0;
+            var names = new List<string>();
+
+            // A driver reads as well as writes. Operand types are stamped
+            // when the task is built, before ParameterTypeInference may
+            // retype. A mismatched read logs a warning and returns 0.
+            void FixSource(string name, ref AnimatorDriverTask.ParameterType paramType,
+                           AnimatorDriverTask.SourceType source)
+            {
+                if (source != AnimatorDriverTask.SourceType.Parameter || string.IsNullOrEmpty(name)
+                    || !types.TryGetValue(name, out var t))
+                {
+                    return;   // static/random operands read nothing; unknown names aren't ours to guess
+                }
+                var want = DriverTypeOf(t);
+                if (paramType != want)
+                {
+                    paramType = want;
+                    corrected++;
+                    if (names.Count < 6 && !names.Contains(name))
+                    {
+                        names.Add(name);
+                    }
+                }
+            }
+
+            void FixTasks(List<AnimatorDriverTask> tasks)
+            {
+                if (tasks == null)
+                {
+                    return;
+                }
+                foreach (var task in tasks)
+                {
+                    if (task != null)
+                    {
+                        FixSource(task.aName, ref task.aParamType, task.aType);
+                        FixSource(task.bName, ref task.bParamType, task.bType);
+                        FixSource(task.cName, ref task.cParamType, task.cType);
+                    }
+                    if (task == null || string.IsNullOrEmpty(task.targetName) ||
+                        !types.TryGetValue(task.targetName, out var type))
+                    {
+                        continue;
+                    }
+                    var want = DriverTypeOf(type);
+                    if (task.targetType != want)
+                    {
+                        task.targetType = want;
+                        corrected++;
+                        if (names.Count < 6 && !names.Contains(task.targetName))
+                        {
+                            names.Add(task.targetName);
+                        }
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var behaviour in machine.behaviours)
+                    {
+                        if (behaviour is AnimatorDriver machineDriver)
+                        {
+                            FixTasks(machineDriver.EnterTasks);
+                            FixTasks(machineDriver.ExitTasks);
+                        }
+                    }
+                    foreach (var child in machine.states)
+                    {
+                        foreach (var behaviour in child.state.behaviours)
+                        {
+                            if (behaviour is AnimatorDriver driver)
+                            {
+                                FixTasks(driver.EnterTasks);
+                                FixTasks(driver.ExitTasks);
+                            }
+                        }
+                    }
+                });
+            }
+
+            if (corrected > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(corrected, "parameter-driver task retyped to match its", "parameter-driver tasks retyped to match their")} parameter",
+                    $"{string.Join(", ", names)}{(corrected > names.Count ? ", …" : "")}: each parameter " +
+                    "changed type during conversion, after its driver was built.");
+            }
+        }
+
+        static void RepairUnconditionalDriverStates(AnimatorController master, BridgeContext ctx)
+        {
+            int removed = 0;
+            var notes = new List<string>();
+
+            bool RunsDriver(AnimatorState state) =>
+                state != null && state.behaviours != null &&
+                state.behaviours.Any(b => b is AnimatorDriver driver &&
+                    ((driver.EnterTasks != null && driver.EnterTasks.Count > 0) ||
+                     (driver.ExitTasks != null && driver.ExitTasks.Count > 0)));
+
+            // The single condition a transition rests on, or null when it has none or several.
+            AnimatorCondition? SoleCondition(AnimatorStateTransition transition) =>
+                transition.conditions != null && transition.conditions.Length == 1
+                    ? transition.conditions[0]
+                    : (AnimatorCondition?)null;
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    var transitions = machine.anyStateTransitions;
+                    if (transitions == null || transitions.Length < 2)
+                    {
+                        return;
+                    }
+                    var doomed = new HashSet<AnimatorStateTransition>();
+                    foreach (var negative in transitions)
+                    {
+                        var negativeCondition = SoleCondition(negative);
+                        if (negativeCondition == null ||
+                            negativeCondition.Value.mode != AnimatorConditionMode.IfNot ||
+                            !RunsDriver(negative.destinationState))
+                        {
+                            continue;
+                        }
+                        // Is the same destination also entered when the parameter IS true?
+                        bool complemented = transitions.Any(other =>
+                        {
+                            if (ReferenceEquals(other, negative) ||
+                                other.destinationState != negative.destinationState)
+                            {
+                                return false;
+                            }
+                            var condition = SoleCondition(other);
+                            return condition != null &&
+                                   condition.Value.mode == AnimatorConditionMode.If &&
+                                   condition.Value.parameter == negativeCondition.Value.parameter;
+                        });
+                        if (complemented)
+                        {
+                            doomed.Add(negative);
+                            if (notes.Count < 5)
+                            {
+                                notes.Add($"\"{negative.destinationState.name}\" on {negativeCondition.Value.parameter}");
+                            }
+                        }
+                    }
+                    if (doomed.Count > 0)
+                    {
+                        machine.anyStateTransitions = transitions.Where(t => !doomed.Contains(t)).ToArray();
+                        removed += doomed.Count;
+                    }
+                });
+            }
+
+            if (removed > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(removed, "always-true transition", "always-true transitions")} into parameter-driving states removed",
+                    $"{string.Join("; ", notes)}{(removed > notes.Count ? "; …" : "")}: entered on true and on " +
+                    "false alike, so toggles flipped straight back off. Now entered on true only. Check switching " +
+                    "between these options.");
+            }
+        }
+
+        static void ReconcileConditionModes(AnimatorController master, BridgeContext ctx)
+        {
+            var types = new Dictionary<string, AnimatorControllerParameterType>();
+            foreach (var p in master.parameters)
+            {
+                types[p.name] = p.type;
+            }
+
+            int fixedCount = 0;
+            int deadDropped = 0;
+            var touched = new HashSet<string>();
+
+            // Every parameter's Greater bound sits below its Less bound.
+            bool Satisfiable(List<AnimatorCondition> conditions)
+            {
+                foreach (var above in conditions)
+                {
+                    if (above.mode != AnimatorConditionMode.Greater) continue;
+                    foreach (var below in conditions)
+                    {
+                        if (below.mode == AnimatorConditionMode.Less && below.parameter == above.parameter
+                            && below.threshold <= above.threshold)
+                        {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            T[] Reconcile<T>(T[] transitions) where T : AnimatorTransitionBase, new()
+            {
+                var survivors = new List<T>(transitions.Length);
+                foreach (var transition in transitions)
+                {
+                    if (transition == null) continue;
+                    var conditions = transition.conditions;
+                    bool changed = false;
+                    // Rebuilt so a tautology can leave: "> -0.001" on a bool kept as If says the opposite.
+                    var kept = new List<AnimatorCondition>(conditions.Length);
+                    // Float NotEqual: either side of the value, so the transition splits.
+                    var sides = new List<(AnimatorCondition below, AnimatorCondition above)>();
+                    bool dead = false;
+                    for (int i = 0; i < conditions.Length; i++)
+                    {
+                        if (!types.TryGetValue(conditions[i].parameter, out var type))
+                        {
+                            kept.Add(conditions[i]);
+                            continue;
+                        }
+                        var mode = conditions[i].mode;
+                        float threshold = conditions[i].threshold;
+                        var newMode = mode;
+                        float newThreshold = threshold;
+                        bool drop = false, impossible = false;
+
+                        switch (type)
+                        {
+                            // Bool / Trigger accept only If / IfNot.
+                            case AnimatorControllerParameterType.Bool:
+                            case AnimatorControllerParameterType.Trigger:
+                                switch (mode)
+                                {
+                                    case AnimatorConditionMode.If:
+                                    case AnimatorConditionMode.IfNot:
+                                        break;
+                                    // Out of range on a 0/1 bool is a tautology, not an If;
+                                    // VRCFury bands remote branches that way.
+                                    case AnimatorConditionMode.Greater:
+                                        if (threshold < 0f) { drop = true; break; }          // > -0.001: always
+                                        if (threshold >= 1f) { impossible = true; break; }   // > 1: never
+                                        newMode = AnimatorConditionMode.If; newThreshold = 0f; break;
+                                    case AnimatorConditionMode.Less:
+                                        if (threshold > 1f) { drop = true; break; }          // < 2: always
+                                        if (threshold <= 0f) { impossible = true; break; }   // < 0: never
+                                        newMode = AnimatorConditionMode.IfNot; newThreshold = 0f; break;
+                                    case AnimatorConditionMode.Equals:
+                                        newMode = threshold != 0f ? AnimatorConditionMode.If : AnimatorConditionMode.IfNot;
+                                        newThreshold = 0f; break;
+                                    case AnimatorConditionMode.NotEqual:
+                                        newMode = threshold != 0f ? AnimatorConditionMode.IfNot : AnimatorConditionMode.If;
+                                        newThreshold = 0f; break;
+                                }
+                                break;
+
+                            // Float accepts only Greater / Less.
+                            case AnimatorControllerParameterType.Float:
+                                switch (mode)
+                                {
+                                    case AnimatorConditionMode.Greater:
+                                    case AnimatorConditionMode.Less:
+                                        break;
+                                    case AnimatorConditionMode.If:
+                                        newMode = AnimatorConditionMode.Greater; newThreshold = 0.5f; break;
+                                    case AnimatorConditionMode.IfNot:
+                                        newMode = AnimatorConditionMode.Less; newThreshold = 0.5f; break;
+                                    // A whole-number compare kept on a float: a band
+                                    // around the value. "> 0.5" made every selector
+                                    // value above 0 match the first one listed.
+                                    case AnimatorConditionMode.Equals:
+                                        kept.Add(new AnimatorCondition
+                                        {
+                                            parameter = conditions[i].parameter,
+                                            mode = AnimatorConditionMode.Greater,
+                                            threshold = threshold - 0.5f
+                                        });
+                                        newMode = AnimatorConditionMode.Less; newThreshold = threshold + 0.5f; break;
+                                    case AnimatorConditionMode.NotEqual:
+                                        sides.Add((
+                                            new AnimatorCondition
+                                            {
+                                                parameter = conditions[i].parameter,
+                                                mode = AnimatorConditionMode.Less,
+                                                threshold = threshold - 0.5f
+                                            },
+                                            new AnimatorCondition
+                                            {
+                                                parameter = conditions[i].parameter,
+                                                mode = AnimatorConditionMode.Greater,
+                                                threshold = threshold + 0.5f
+                                            }));
+                                        drop = true; break;
+                                }
+                                break;
+
+                            // Int accepts Greater / Less / Equals / NotEqual (not If / IfNot).
+                            case AnimatorControllerParameterType.Int:
+                                switch (mode)
+                                {
+                                    case AnimatorConditionMode.If:
+                                        newMode = AnimatorConditionMode.NotEqual; newThreshold = 0f; break;
+                                    case AnimatorConditionMode.IfNot:
+                                        newMode = AnimatorConditionMode.Equals; newThreshold = 0f; break;
+                                }
+                                break;
+                        }
+
+                        if (drop)
+                        {
+                            // Constrains nothing: the transition keeps its other conditions and
+                            // fires on those alone, which is what the float band meant.
+                            changed = true;
+                            touched.Add(conditions[i].parameter);
+                            fixedCount++;
+                            continue;
+                        }
+
+                        var rebuilt = conditions[i];
+                        if (impossible)
+                        {
+                            // Unsatisfiable ("> 1" or "< 0" on 0/1): drop it. VRCFury's OR pairs leave a dead twin.
+                            dead = true;
+                            break;
+                        }
+
+                        if (newMode != mode || !Mathf.Approximately(newThreshold, threshold))
+                        {
+                            rebuilt.mode = newMode;
+                            rebuilt.threshold = newThreshold;
+                            changed = true;
+                            touched.Add(rebuilt.parameter);
+                            fixedCount++;
+                        }
+                        kept.Add(rebuilt);
+                    }
+                    if (dead)
+                    {
+                        deadDropped++;
+                        touched.Add("(unreachable transition removed)");
+                        continue;
+                    }
+                    // One transition per side, contradictory pairs left out, so
+                    // NotEqual 1 and NotEqual 2 give two branches, not four.
+                    var branches = new List<List<AnimatorCondition>> { kept };
+                    foreach (var (below, above) in sides)
+                    {
+                        var next = new List<List<AnimatorCondition>>();
+                        foreach (var branch in branches)
+                        {
+                            foreach (var side in new[] { below, above })
+                            {
+                                var combined = new List<AnimatorCondition>(branch) { side };
+                                if (Satisfiable(combined)) next.Add(combined);
+                            }
+                        }
+                        branches = next;
+                    }
+                    if (branches.Count == 0)
+                    {
+                        deadDropped++;
+                        touched.Add("(unreachable transition removed)");
+                        continue;
+                    }
+                    if (changed)
+                    {
+                        transition.conditions = branches[0].ToArray();
+                    }
+                    survivors.Add(transition);
+                    foreach (var branch in branches.Skip(1))
+                    {
+                        var clone = CloneForBranch(transition);
+                        clone.conditions = branch.ToArray();
+                        survivors.Add(clone);
+                    }
+                }
+                return survivors.ToArray();
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    machine.anyStateTransitions = Reconcile(machine.anyStateTransitions);
+                    machine.entryTransitions = Reconcile(machine.entryTransitions);
+                    foreach (var child in machine.states)
+                    {
+                        child.state.transitions = Reconcile(child.state.transitions);
+                    }
+                    foreach (var childMachine in machine.stateMachines)
+                    {
+                        var leaving = machine.GetStateMachineTransitions(childMachine.stateMachine);
+                        if (leaving != null && leaving.Length > 0)
+                        {
+                            machine.SetStateMachineTransitions(childMachine.stateMachine, Reconcile(leaving));
+                        }
+                    }
+                });
+            }
+
+            if (fixedCount > 0 || deadDropped > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Reconciled {BridgeElements.Count(fixedCount, "transition condition", "transition conditions")} to their parameter's type"
+                    + (deadDropped > 0 ? $", and removed {BridgeElements.Count(deadDropped, "transition", "transitions")} that could never fire" : ""),
+                    $"{string.Join(", ", touched.OrderBy(n => n))}: ChilloutVR rejects a comparison its " +
+                    "parameter type can't express, so those states never switched. Always-true comparisons are " +
+                    "removed; a transition that could never fire goes with its condition.");
+            }
+        }
+
+        static readonly System.Text.RegularExpressions.Regex IllegalMenuNameChars =
+            new System.Text.RegularExpressions.Regex(@"[^a-zA-Z0-9/\-_#]");
+
+        static void VerifyMenuParameterNames(AnimatorController master, BridgeContext ctx)
+        {
+            var settings = ctx.CvrAvatar.avatarSettings.settings;
+            if (settings == null)
+            {
+                return;
+            }
+
+            var taken = new HashSet<string>(master.parameters.Select(p => p.name));
+            var renames = new Dictionary<string, string>();
+            foreach (var entry in settings)
+            {
+                string name = entry?.machineName;
+                if (string.IsNullOrEmpty(name) || !IllegalMenuNameChars.IsMatch(name) ||
+                    renames.ContainsKey(name))
+                {
+                    continue;
+                }
+                string clean = IllegalMenuNameChars.Replace(name, "");
+                if (string.IsNullOrEmpty(clean))
+                {
+                    clean = "Param";
+                }
+                string candidate = clean;
+                int suffix = 2;
+                while (taken.Contains(candidate))
+                {
+                    candidate = clean + suffix++;
+                }
+                taken.Add(candidate);
+                renames[name] = candidate;
+            }
+            if (renames.Count == 0)
+            {
+                return;
+            }
+
+            string Rename(string n) => n != null && renames.TryGetValue(n, out var r) ? r : n;
+
+            // Pre-rename spellings, for the same muscle-curve filter RenamePass uses.
+            var animatableParameters = new HashSet<string>(master.parameters.Select(p => p.name));
+            var clipMap = new Dictionary<AnimationClip, AnimationClip>();
+
+            // Hold the array: each read is a fresh copy, so edits through the property are lost.
+            var parameters = master.parameters;
+            foreach (var param in parameters)
+            {
+                param.name = Rename(param.name);
+            }
+            master.parameters = parameters;
+
+            foreach (var layer in master.layers)
+            {
+                RenameMachineReferences(layer.stateMachine, Rename, motion =>
+                {
+                    RenameMotionParameters(motion, Rename);
+                    // A clip writing the parameter must follow it, or it binds to nothing.
+                    return RenameInMotion(motion, Rename, clipMap, ctx, animatableParameters);
+                });
+            }
+
+            foreach (var entry in settings)
+            {
+                if (entry != null)
+                {
+                    entry.machineName = Rename(entry.machineName);
+                }
+            }
+            // WithdrawSelfDrivenExposures matches this record against the
+            // machineNames above; see the same step in RenamePass.
+            if (ctx.AutoExposedParameters.Count > 0)
+            {
+                var moved = new HashSet<string>(ctx.AutoExposedParameters.Select(Rename));
+                ctx.AutoExposedParameters.Clear();
+                ctx.AutoExposedParameters.UnionWith(moved);
+            }
+            foreach (var trigger in ctx.CvrAvatar.GetComponentsInChildren<CVRAdvancedAvatarSettingsTrigger>(true))
+            {
+                trigger.settingName = Rename(trigger.settingName);
+                foreach (var task in trigger.enterTasks) task.settingName = Rename(task.settingName);
+                foreach (var task in trigger.exitTasks) task.settingName = Rename(task.settingName);
+                foreach (var task in trigger.stayTasks) task.settingName = Rename(task.settingName);
+            }
+            EditorUtility.SetDirty(ctx.CvrAvatar);
+
+            foreach (var pair in renames)
+            {
+                ctx.Report.Warning(Category, $"Parameter \"{pair.Key}\" renamed to \"{pair.Value}\"",
+                    "ChilloutVR only accepts letters, digits, '/', '-', '_' and '#' in a menu parameter " +
+                    "name; the original would have broken the Advanced Settings inspector.");
+            }
+        }
+
+        static void RenameMotionParameters(Motion motion, Func<string, string> rename)
+        {
+            if (!(motion is BlendTree tree))
+            {
+                return;
+            }
+            tree.blendParameter = rename(tree.blendParameter);
+            tree.blendParameterY = rename(tree.blendParameterY);
+            var children = tree.children;
+            for (int i = 0; i < children.Length; i++)
+            {
+                children[i].directBlendParameter = rename(children[i].directBlendParameter);
+                RenameMotionParameters(children[i].motion, rename);
+            }
+            tree.children = children;
+        }
+
+        static void PruneDeadMenuEntries(AnimatorController master, BridgeContext ctx)
+        {
+            var settings = ctx.CvrAvatar.avatarSettings.settings;
+            if (settings == null || settings.Count == 0)
+            {
+                return;
+            }
+            var known = new HashSet<string>(master.parameters.Select(p => p.name));
+            // A parameter can exist and still be inert: nothing
+            // conditions on it, nothing reads or writes it.
+            var referenced = CollectReferencedParameters(master);
+
+            // A joystick's machineName is not a parameter; CVR derives "<machineName>-x"/"-y"/"-z".
+            string[] AxesOf(ABI.CCK.Scripts.CVRAdvancedSettingsEntry entry)
+            {
+                switch (entry.type)
+                {
+                    case ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.Joystick2D:
+                    case ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.InputVector2:
+                        return new[] { entry.machineName + "-x", entry.machineName + "-y" };
+                    case ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.Joystick3D:
+                    case ABI.CCK.Scripts.CVRAdvancedSettingsEntry.SettingsType.InputVector3:
+                        return new[]
+                        {
+                            entry.machineName + "-x", entry.machineName + "-y", entry.machineName + "-z"
+                        };
+                    default:
+                        return new[] { entry.machineName };
+                }
+            }
+
+            // Alive if any axis is declared and read. A native toggle is read by the CCK's own layer.
+            var dead = settings
+                .Where(e => e != null && !string.IsNullOrEmpty(e.machineName)
+                            && !AvatarSurvey.DrivesTargets(e)
+                            && !AxesOf(e).Any(n => known.Contains(n) && referenced.Contains(n)))
+                .ToList();
+            if (dead.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var entry in dead)
+            {
+                settings.Remove(entry);
+                ctx.Report.Skipped(Category, $"Menu entry \"{entry.name}\" removed",
+                    $"Nothing in the converted animator {(known.Contains(entry.machineName) ? "reads or writes" : "declares")} " +
+                    $"\"{entry.machineName}\": the parameter belongs to a layer that wasn't converted " +
+                    "(Action/emotes) or to a stripped system, so the control would have sat in your menu " +
+                    "doing nothing.");
+            }
+            EditorUtility.SetDirty(ctx.CvrAvatar);
+            ctx.Report.Converted(Category, $"Removed {BridgeElements.Count(dead.Count, "dead menu entry", "dead menu entries")}",
+                "Their parameter is either missing from the animator or present but never read, written or " +
+                "compared anywhere in it, so they could never have done anything.");
+        }
+
+        static void CompactIntDropdowns(AnimatorController master, BridgeContext ctx)
+        {
+            var settings = ctx.CvrAvatar.avatarSettings.settings;
+            if (settings == null)
+            {
+                return;
+            }
+
+            int compactedEntries = 0, removedOptions = 0;
+            foreach (var entry in settings)
+            {
+                if (entry == null ||
+                    !(entry.setting is ABI.CCK.Scripts.CVRAdvancesAvatarSettingGameObjectDropdown dropdown) ||
+                    dropdown.options == null || dropdown.options.Count <= 2)
+                {
+                    continue;
+                }
+                var declared = master.parameters.FirstOrDefault(p => p.name == entry.machineName);
+                if (declared == null || declared.type != AnimatorControllerParameterType.Int)
+                {
+                    continue;
+                }
+
+                string param = entry.machineName;
+                if (!TryCollectSelectorValues(master, param, out var use, out string blockedBy))
+                {
+                    // Used as a quantity somewhere; renumbering would
+                    // change behaviour. The placeholders stay, reported.
+                    int stuck = dropdown.options.Count(o => o != null && o.name == ParameterMenuConverter.UnusedOption);
+                    if (stuck > 0)
+                    {
+                        ctx.Report.Approximated(Category, $"Dropdown \"{entry.name}\" keeps {stuck} \"{ParameterMenuConverter.UnusedOption}\" {(stuck == 1 ? "option" : "options")}",
+                            $"ChilloutVR selects dropdown options by position, so \"{param}\" needs an entry per " +
+                            $"value up to its highest. It's normally renumbered to close those gaps, but {blockedBy} " +
+                            ": renumbering would change how the avatar behaves. Deleting the spare entries by hand " +
+                            "would shift every option after them onto the wrong value.");
+                    }
+                    continue;
+                }
+                var oldOptions = dropdown.options;
+                var kept = new HashSet<int>(use.Exact) { 0, dropdown.defaultValue };
+
+                // Values split only by "> t" or "< t" are interchangeable, but the menu must reach
+                // each side: keep one option per side, a named one over a placeholder.
+                int PickRepresentative(int from, int to)
+                {
+                    from = Mathf.Max(0, from);
+                    to = Mathf.Min(oldOptions.Count - 1, to);
+                    int fallback = -1;
+                    for (int v = from; v <= to; v++)
+                    {
+                        if (oldOptions[v] == null)
+                        {
+                            continue;
+                        }
+                        if (fallback < 0)
+                        {
+                            fallback = v;
+                        }
+                        if (oldOptions[v].name != ParameterMenuConverter.UnusedOption)
+                        {
+                            return v;
+                        }
+                    }
+                    return fallback;
+                }
+                foreach (int t in use.GreaterCuts)
+                {
+                    if (!kept.Any(v => v > t))
+                    {
+                        int rep = PickRepresentative(t + 1, oldOptions.Count - 1);
+                        if (rep >= 0) kept.Add(rep);
+                    }
+                }
+                foreach (int t in use.LessCuts)
+                {
+                    if (!kept.Any(v => v < t))
+                    {
+                        int rep = PickRepresentative(0, t - 1);
+                        if (rep >= 0) kept.Add(rep);
+                    }
+                }
+
+                var ordered = kept.Where(v => v >= 0 && v < oldOptions.Count).Distinct().OrderBy(v => v).ToList();
+                if (ordered.Count == 0 || ordered.Count >= oldOptions.Count)
+                {
+                    continue; // already dense, nothing to gain
+                }
+
+                // Order-preserving, so relative comparisons keep their meaning.
+                var map = new Dictionary<int, int>();
+                for (int i = 0; i < ordered.Count; i++)
+                {
+                    map[ordered[i]] = i;
+                }
+
+                RemapIntConditions(master, param, map, ordered);
+                RemapIntDrivers(master, param, map);
+                RemapTriggerValues(ctx, param, map);
+
+                dropdown.options = ordered.Select(v => oldOptions[v]).ToList();
+                dropdown.defaultValue = map.TryGetValue(dropdown.defaultValue, out var newDefault) ? newDefault : 0;
+                declared.defaultInt = dropdown.defaultValue;
+                declared.defaultFloat = dropdown.defaultValue;
+
+                removedOptions += oldOptions.Count - dropdown.options.Count;
+                compactedEntries++;
+                ctx.Report.Converted(Category, $"Dropdown \"{entry.name}\" compacted",
+                    $"{oldOptions.Count} options -> {dropdown.options.Count}; the parameter's values were " +
+                    "renumbered to match, so every entry now does something.");
+            }
+
+            if (compactedEntries > 0)
+            {
+                EditorUtility.SetDirty(ctx.CvrAvatar);
+                ctx.Report.Converted(Category,
+                    $"Removed {BridgeElements.Count(removedOptions, "placeholder dropdown option", "placeholder dropdown options")} across {BridgeElements.Count(compactedEntries, "menu entry", "menu entries")}",
+                    "ChilloutVR dropdowns select by position, so gaps in the VRChat parameter's values would " +
+                    "otherwise appear as dead entries; the animator was renumbered instead.");
+            }
+        }
+
+        // How a dropdown parameter is used: exact matches and
+        // the boundaries it is compared across.
+        class SelectorUse
+        {
+            public readonly HashSet<int> Exact = new HashSet<int>();
+            public readonly HashSet<int> GreaterCuts = new HashSet<int>();  // "> t"
+            public readonly HashSet<int> LessCuts = new HashSet<int>();     // "< t"
+        }
+
+        static bool TryCollectSelectorValues(AnimatorController master, string param,
+            out SelectorUse use, out string blockedBy)
+        {
+            var found = new SelectorUse();
+            use = found;
+            bool safe = true;
+            string reason = null;
+
+            bool CollectTransitions(AnimatorTransitionBase[] transitions)
+            {
+                foreach (var transition in transitions)
+                {
+                    foreach (var condition in transition.conditions)
+                    {
+                        if (condition.parameter != param)
+                        {
+                            continue;
+                        }
+                        int threshold = Mathf.RoundToInt(condition.threshold);
+                        switch (condition.mode)
+                        {
+                            case AnimatorConditionMode.Equals:
+                            case AnimatorConditionMode.NotEqual:
+                                found.Exact.Add(threshold);
+                                break;
+                            case AnimatorConditionMode.Greater:
+                                found.GreaterCuts.Add(threshold);
+                                break;
+                            case AnimatorConditionMode.Less:
+                                found.LessCuts.Add(threshold);
+                                break;
+                            default:
+                                // If/IfNot on an int: treated as a flag, leave well alone.
+                                reason = "a transition treats it as an on/off flag rather than a selector";
+                                return false;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            bool CollectDriver(StateMachineBehaviour behaviour)
+            {
+                if (!(behaviour is AnimatorDriver driver))
+                {
+                    return true;
+                }
+                foreach (var task in driver.EnterTasks.Concat(driver.ExitTasks))
+                {
+                    // Read as an operand: whatever it's feeding expects the original numbers.
+                    if (task.aName == param || task.bName == param)
+                    {
+                        reason = "a driver reads it as an operand, so its numbers are passed on elsewhere";
+                        return false;
+                    }
+                    if (task.targetName != param)
+                    {
+                        continue;
+                    }
+                    if (task.op != AnimatorDriverTask.Operator.Set)
+                    {
+                        reason = "a driver does arithmetic on it, where the numbers themselves matter";
+                        return false;
+                    }
+                    if (task.aType != AnimatorDriverTask.SourceType.Static)
+                    {
+                        // Set from another parameter: that source would need renumbering too.
+                        reason = "a driver sets it from another parameter, which would keep the old numbering";
+                        return false;
+                    }
+                    found.Exact.Add(Mathf.RoundToInt(task.aValue));
+                }
+                return true;
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    if (!safe)
+                    {
+                        return;
+                    }
+                    if (!CollectTransitions(machine.anyStateTransitions) ||
+                        !CollectTransitions(machine.entryTransitions) ||
+                        !CollectTransitions(SubMachineTransitions(machine)))
+                    {
+                        safe = false;
+                        return;
+                    }
+                    foreach (var behaviour in machine.behaviours)
+                    {
+                        if (!CollectDriver(behaviour)) { safe = false; return; }
+                    }
+                    foreach (var child in machine.states)
+                    {
+                        var state = child.state;
+                        if ((state.timeParameterActive && state.timeParameter == param) ||
+                            (state.speedParameterActive && state.speedParameter == param) ||
+                            (state.mirrorParameterActive && state.mirrorParameter == param) ||
+                            (state.cycleOffsetParameterActive && state.cycleOffsetParameter == param) ||
+                            MotionUsesParameter(state.motion, param))
+                        {
+                            reason = "a blend tree or motion time reads it as a quantity";
+                            safe = false;
+                            return;
+                        }
+                        if (!CollectTransitions(state.transitions)) { safe = false; return; }
+                        foreach (var behaviour in state.behaviours)
+                        {
+                            if (!CollectDriver(behaviour)) { safe = false; return; }
+                        }
+                    }
+                });
+                if (!safe)
+                {
+                    blockedBy = reason ?? "the value is used in a way renumbering would change";
+                    return false;
+                }
+            }
+            blockedBy = null;
+            return true;
+        }
+
+        static void SafeguardBlendParameters(AnimatorController master, BridgeContext ctx)
+        {
+            var declared = new HashSet<string>(master.parameters.Select(p => p.name));
+            var added = new List<AnimatorControllerParameter>();
+            var repointed = new SortedSet<string>(StableSampleOrder.Instance);
+            var map = new Dictionary<string, string>();
+            var seen = new HashSet<BlendTree>();
+
+            // Every dangling field is repointed (the measured crash guard), but only fields the
+            // blend type reads warn: a leftover "Blend" in a 1D Y field is on nearly every avatar.
+            string Safe(string name, bool read)
+            {
+                string key = name ?? "";
+                if (key.Length > 0 && declared.Contains(key))
+                {
+                    return key;
+                }
+                if (read)
+                {
+                    repointed.Add(key.Length == 0 ? "(blank)" : key);
+                }
+                if (map.TryGetValue(key, out string already))
+                {
+                    return already;
+                }
+                string basis = key.Length == 0 ? "AvatarBridgeUnused" : key.TrimStart('#');
+                string candidate = "#" + basis;
+                for (int n = 2; declared.Contains(candidate); n++)
+                {
+                    candidate = $"#{basis} {n}";
+                }
+                declared.Add(candidate);
+                added.Add(new AnimatorControllerParameter
+                {
+                    name = candidate,
+                    type = AnimatorControllerParameterType.Float,
+                    defaultFloat = 0f
+                });
+                map[key] = candidate;
+                return candidate;
+            }
+
+            void Walk(Motion motion)
+            {
+                if (!(motion is BlendTree tree) || !seen.Add(tree))
+                {
+                    return;
+                }
+                // The CollectReferencedParameters rule: Direct trees read neither
+                // axis, 1D trees ignore Y.
+                bool direct = tree.blendType == BlendTreeType.Direct;
+                tree.blendParameter = Safe(tree.blendParameter, !direct);
+                tree.blendParameterY = Safe(tree.blendParameterY,
+                    !direct && tree.blendType != BlendTreeType.Simple1D);
+                var kids = tree.children;
+                bool changed = false;
+                for (int i = 0; i < kids.Length; i++)
+                {
+                    string safe = Safe(kids[i].directBlendParameter, direct);
+                    if (safe != kids[i].directBlendParameter)
+                    {
+                        kids[i].directBlendParameter = safe;
+                        changed = true;
+                    }
+                    Walk(kids[i].motion);
+                }
+                if (changed)
+                {
+                    // children is a value-type copy, and the setter re-derives thresholds unless
+                    // automatic thresholds are off across the write.
+                    bool auto = tree.useAutomaticThresholds;
+                    tree.useAutomaticThresholds = false;
+                    tree.children = kids;
+                    tree.useAutomaticThresholds = auto;
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            Walk(child.state.motion);
+                        }
+                    }
+                });
+            }
+
+            if (added.Count == 0)
+            {
+                return;
+            }
+            // Deliberately not declared: a blank name crashes the graph builder, and declaring
+            // them brings a reproducible crash back. Measured twice; measure before redeclaring.
+            EditorUtility.SetDirty(master);
+
+            if (repointed.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Warning(Category,
+                $"{BridgeElements.Count(repointed.Count, "blend tree parameter", "blend tree parameters")} named something the controller never declared",
+                $"{string.Join(", ", repointed)}: a blank one crashes Unity. Each now has a \"#\" name, left " +
+                "undeclared on purpose. Nothing about the avatar's behaviour changes.");
+        }
+
+        static void WithdrawSelfDrivenExposures(AnimatorController master, BridgeContext ctx)
+        {
+            var settings = ctx.CvrAvatar != null && ctx.CvrAvatar.avatarSettings != null
+                ? ctx.CvrAvatar.avatarSettings.settings : null;
+            if (settings == null || ctx.AutoExposedParameters.Count == 0)
+            {
+                return;
+            }
+
+            // What CCK AnimatorDrivers write (BehaviourPass converted the VRChat ones); a
+            // machine's driver runs for each state inside it.
+            var driven = new HashSet<string>();
+            void NoteDrivers(StateMachineBehaviour[] behaviours)
+            {
+                foreach (var behaviour in behaviours ?? new StateMachineBehaviour[0])
+                {
+                    if (!(behaviour is AnimatorDriver driver))
+                    {
+                        continue;
+                    }
+                    foreach (var task in (driver.EnterTasks ?? Enumerable.Empty<AnimatorDriverTask>())
+                             .Concat(driver.ExitTasks ?? Enumerable.Empty<AnimatorDriverTask>()))
+                    {
+                        if (task != null && !string.IsNullOrEmpty(task.targetName))
+                        {
+                            driven.Add(task.targetName);
+                        }
+                    }
+                }
+            }
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    NoteDrivers(machine.behaviours);
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            NoteDrivers(child.state.behaviours);
+                        }
+                    }
+                });
+            }
+            if (driven.Count == 0)
+            {
+                return;
+            }
+
+            var withdrawn = new SortedSet<string>(StableSampleOrder.Instance);
+            for (int i = settings.Count - 1; i >= 0; i--)
+            {
+                var entry = settings[i];
+                if (entry == null || string.IsNullOrEmpty(entry.machineName)
+                    || !ctx.AutoExposedParameters.Contains(entry.machineName)
+                    || !driven.Contains(entry.machineName))
+                {
+                    continue;
+                }
+                withdrawn.Add($"\"{entry.name}\" ({entry.machineName})");
+                settings.RemoveAt(i);
+            }
+            if (withdrawn.Count == 0)
+            {
+                return;
+            }
+            EditorUtility.SetDirty(ctx.CvrAvatar);
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(withdrawn.Count, "menu control", "menu controls")} withdrawn: the avatar sets these itself",
+                $"{string.Join(", ", withdrawn)}. A driver writes each, so a menu control would only fight it. " +
+                "The parameters still sync.");
+        }
+
+        static void ReplaceAnimatorBlink(AnimatorController master, BridgeContext ctx)
+        {
+            if (!ctx.AnimatorBlinkPending || ctx.CvrAvatar == null || ctx.CvrAvatar.bodyMesh == null)
+            {
+                return;
+            }
+            var mesh = ctx.CvrAvatar.bodyMesh.sharedMesh;
+            if (mesh == null)
+            {
+                return;
+            }
+
+            var stripped = new List<string>();
+            string blinkShape = null;
+            var layers = master.layers.ToList();
+            for (int i = layers.Count - 1; i >= 0; i--)
+            {
+                var layer = layers[i];
+                if (layer == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                string raised = null;      // the one shape this layer raises, if it qualifies
+                bool pureBlink = true, sawAnything = false;
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        var motion = child.state != null ? child.state.motion : null;
+                        foreach (var clip in CollectClips(motion))
+                        {
+                            if (AnimationUtility.GetObjectReferenceCurveBindings(clip).Length > 0)
+                            {
+                                pureBlink = false;
+                            }
+                            foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                            {
+                                sawAnything = true;
+                                if (!binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal))
+                                {
+                                    pureBlink = false;
+                                    continue;
+                                }
+                                var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                                if (curve == null || !curve.keys.Any(k => Mathf.Abs(k.value) > 0.001f))
+                                {
+                                    continue; // held at zero: the receiver resetting a co-shape
+                                }
+                                string shape = binding.propertyName.Substring("blendShape.".Length);
+                                if (shape.IndexOf("blink", StringComparison.OrdinalIgnoreCase) < 0
+                                    || (raised != null && raised != shape))
+                                {
+                                    pureBlink = false; // raises a non-blink shape, or two shapes
+                                }
+                                else
+                                {
+                                    raised = shape;
+                                }
+                            }
+                        }
+                    }
+                });
+                if (pureBlink && sawAnything && raised != null && mesh.GetBlendShapeIndex(raised) >= 0)
+                {
+                    blinkShape = raised;
+                    stripped.Add(layer.name);
+                    layers.RemoveAt(i);
+                }
+            }
+
+            if (blinkShape == null)
+            {
+                // Nothing safely strippable: keep the avatar's system, as native blink on top
+                // doubles the eyes. Slots filled anyway, inert until the tick the report names.
+                AvatarFeatureDetect.DetectBlinkShapes(mesh, out string fbLeft, out string fbRight,
+                    out string fbCombined);
+                string prefilled = null;
+                if (fbLeft != null || fbRight != null || fbCombined != null)
+                {
+                    if (ctx.CvrAvatar.blinkBlendshape == null || ctx.CvrAvatar.blinkBlendshape.Length < 4)
+                    {
+                        ctx.CvrAvatar.blinkBlendshape = new string[4];
+                    }
+                    if (fbLeft != null && fbRight != null)
+                    {
+                        ctx.CvrAvatar.blinkBlendshape[0] = fbLeft;
+                        ctx.CvrAvatar.blinkBlendshape[1] = fbRight;
+                        prefilled = $"\"{fbLeft}\" / \"{fbRight}\"";
+                    }
+                    else
+                    {
+                        var single = fbCombined ?? fbLeft ?? fbRight;
+                        ctx.CvrAvatar.blinkBlendshape[0] = single;
+                        prefilled = $"\"{single}\"";
+                    }
+                    EditorUtility.SetDirty(ctx.CvrAvatar);
+                }
+
+                ctx.Report.Approximated(Category, "Blink left to the avatar's own animation",
+                    "No layer is only blinking, so nothing was removed and native blink stays off. If the eyes " +
+                    "stick closed in game, " +
+                    (prefilled != null
+                        ? $"tick \"Use Blink Blendshapes\" on the CVRAvatar; the shapes are filled in ({prefilled})."
+                        : "name a blink shape on the CVRAvatar and tick \"Use Blink Blendshapes\"."));
+                return;
+            }
+
+            master.layers = layers.ToArray();
+            EditorUtility.SetDirty(master);
+
+            // CVR's blink is not a layer: the client writes the weight in
+            // LateUpdate and owns the shape. A contested shape gets the
+            // native blink moved onto a family nothing else drives.
+            var contested = RaisedFaceShapes(master, ctx.CvrAvatar);
+            string pairLeft = null, pairRight = null;
+            string chosen = blinkShape;
+            string movedTo = null;
+            if (contested.Contains(blinkShape))
+            {
+                AvatarFeatureDetect.DetectBlinkShapes(mesh, out string spareLeft, out string spareRight,
+                    out string spareCombined);
+                if (spareLeft != null && spareRight != null
+                    && !contested.Contains(spareLeft) && !contested.Contains(spareRight))
+                {
+                    pairLeft = spareLeft;
+                    pairRight = spareRight;
+                    movedTo = $"\"{spareLeft}\" / \"{spareRight}\"";
+                }
+                else if (spareCombined != null && spareCombined != blinkShape
+                    && !contested.Contains(spareCombined))
+                {
+                    chosen = spareCombined;
+                    movedTo = $"\"{spareCombined}\"";
+                }
+            }
+
+            var cvrAvatar = ctx.CvrAvatar;
+            cvrAvatar.useBlinkBlendshapes = true;
+            if (cvrAvatar.blinkBlendshape == null || cvrAvatar.blinkBlendshape.Length < 4)
+            {
+                cvrAvatar.blinkBlendshape = new string[4];
+            }
+            // Cleared first: Combined mode drives ALL FOUR slots at once, so a leftover name in a
+            // slot this conversion did not fill would be driven along with the blink.
+            for (int slot = 0; slot < cvrAvatar.blinkBlendshape.Length; slot++)
+            {
+                cvrAvatar.blinkBlendshape[slot] = null;
+            }
+            if (pairLeft != null)
+            {
+                cvrAvatar.blinkBlendshape[0] = pairLeft;
+                cvrAvatar.blinkBlendshape[1] = pairRight;
+                AvatarFeatureDetect.SetBlinkMode(cvrAvatar, "Separate");
+            }
+            else
+            {
+                cvrAvatar.blinkBlendshape[0] = chosen;
+                AvatarFeatureDetect.SetBlinkMode(cvrAvatar, "Combined");
+            }
+            // Live weights may be whatever the old system last wrote.
+            // Native blink owns these now, and its rest is open.
+            // The removed layer's shape is zeroed too.
+            foreach (string shape in new[] { blinkShape, chosen, pairLeft, pairRight })
+            {
+                int index = string.IsNullOrEmpty(shape) ? -1 : mesh.GetBlendShapeIndex(shape);
+                if (index >= 0)
+                {
+                    cvrAvatar.bodyMesh.SetBlendShapeWeight(index, 0f);
+                }
+            }
+            EditorUtility.SetDirty(cvrAvatar);
+
+            const string why =
+                "This system existed because VRChat has no built-in blink, and it cannot survive " +
+                "conversion: its \"eyes open\" states are EMPTY in VRChat and rely on Write Defaults " +
+                "reopening the lids. Empty states crash Unity's graph builder, the filler that " +
+                "prevents that is a motion, and a state with a motion stops writing defaults, so the " +
+                "first blink closed the eyes for good.";
+
+            if (movedTo != null)
+            {
+                ctx.Report.Converted(Category,
+                    $"Blink converted to ChilloutVR's native blink: {movedTo}, {BridgeElements.Count(stripped.Count, "layer", "layers")} removed",
+                    $"{string.Join(", ", stripped)} blinked \"{blinkShape}\". {why} Expressions use that shape " +
+                    $"too, so blink went to {movedTo}, which nothing else animates.");
+            }
+            else if (contested.Contains(blinkShape))
+            {
+                ctx.Report.Warning(Category,
+                    $"Blink and expressions share \"{blinkShape}\"",
+                    $"{string.Join(", ", stripped)} blinked \"{blinkShape}\", and ChilloutVR's native blink " +
+                    $"now drives it. {why} Expressions using it will not close the eyes. A spare eyelid shape " +
+                    "can take the blink in the CVRAvatar's Eye Blink Settings.");
+            }
+            else
+            {
+                ctx.Report.Converted(Category,
+                    $"Blink converted to ChilloutVR's native blink: \"{blinkShape}\", {BridgeElements.Count(stripped.Count, "layer", "layers")} removed",
+                    $"{string.Join(", ", stripped)} blinked \"{blinkShape}\". {why} Native blink drives it now.");
+            }
+        }
+
+        static HashSet<string> RaisedFaceShapes(AnimatorController master, CVRAvatar cvrAvatar)
+        {
+            var raised = new HashSet<string>(StringComparer.Ordinal);
+            var face = cvrAvatar != null ? cvrAvatar.bodyMesh : null;
+            if (face == null)
+            {
+                return raised;
+            }
+            string facePath = face.transform.IsChildOf(cvrAvatar.transform)
+                ? AnimationUtility.CalculateTransformPath(face.transform, cvrAvatar.transform)
+                : null;
+
+            foreach (var clip in master.animationClips)
+            {
+                if (clip == null)
+                {
+                    continue;
+                }
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    const string prefix = "blendShape.";
+                    if (!binding.propertyName.StartsWith(prefix, StringComparison.Ordinal)
+                        || (facePath != null && binding.path != facePath))
+                    {
+                        continue;
+                    }
+                    var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                    if (curve == null || !curve.keys.Any(k => Mathf.Abs(k.value) > 0.001f))
+                    {
+                        continue;
+                    }
+                    raised.Add(binding.propertyName.Substring(prefix.Length));
+                }
+            }
+            return raised;
+        }
+
+        static HashSet<string> LayerOffStates(AnimatorControllerLayer source)
+            => LayerWeightStates(source, on: false);
+
+        static HashSet<string> LayerOnStates(AnimatorControllerLayer source)
+            => LayerWeightStates(source, on: true);
+
+        static HashSet<string> LayerWeightStates(AnimatorControllerLayer source, bool on)
+        {
+            var found = new HashSet<string>();
+            if (source == null || source.stateMachine == null)
+            {
+                return found;
+            }
+            WalkMachines(source.stateMachine, machine =>
+            {
+                foreach (var child in machine.states)
+                {
+                    var state = child.state;
+                    if (state == null || state.behaviours == null)
+                    {
+                        continue;
+                    }
+                    foreach (var behaviour in state.behaviours)
+                    {
+                        // Both behaviour types count, Action playable only.
+                        // FX or Gesture weights say nothing about this
+                        // layer's visibility.
+                        bool matches =
+                            (behaviour is VRC.SDK3.Avatars.Components.VRCPlayableLayerControl playable
+                                && playable.layer == VRC.SDKBase.VRC_PlayableLayerControl.BlendableLayer.Action
+                                && (on ? playable.goalWeight >= 0.999f : playable.goalWeight <= 0.001f))
+                            || (behaviour is VRC.SDK3.Avatars.Components.VRCAnimatorLayerControl animator
+                                && animator.playable == VRC.SDKBase.VRC_AnimatorLayerControl.BlendableLayer.Action
+                                && (on ? animator.goalWeight >= 0.999f : animator.goalWeight <= 0.001f));
+                        if (matches)
+                        {
+                            found.Add(state.name);
+                        }
+                    }
+                }
+            });
+            return found;
+        }
+
+        static int TransplantActionFeature(AnimatorController master, List<AnimatorControllerLayer> masterLayers,
+            AnimatorControllerLayer clone, AnimatorControllerLayer source, BridgeContext ctx)
+        {
+            try
+            {
+                var locomotion = masterLayers.FirstOrDefault(l =>
+                    l != null && l.name == "Locomotion/Emotes" && l.stateMachine != null);
+                var locoDefault = locomotion != null ? locomotion.stateMachine.defaultState : null;
+                if (locoDefault == null || clone.stateMachine == null)
+                {
+                    return 0;
+                }
+
+                var on = LayerWeightStates(source, on: true);
+                var off = LayerWeightStates(source, on: false);
+                if (on.Count == 0)
+                {
+                    return 0;
+                }
+
+                // The clone's states, flat. Names are unique within a VRChat layer in practice;
+                // a duplicate would only shadow a state of the same name, not corrupt anything.
+                var byName = new Dictionary<string, AnimatorState>();
+                WalkMachines(clone.stateMachine, m =>
+                {
+                    foreach (var child in m.states)
+                    {
+                        if (child.state != null && !byName.ContainsKey(child.state.name))
+                        {
+                            byName[child.state.name] = child.state;
+                        }
+                    }
+                });
+
+                var live = new HashSet<string>(on.Where(byName.ContainsKey));
+                if (live.Count == 0)
+                {
+                    return 0;
+                }
+                var queue = new Queue<string>(live);
+                while (queue.Count > 0)
+                {
+                    var state = byName[queue.Dequeue()];
+                    foreach (var transition in state.transitions)
+                    {
+                        var next = transition != null ? transition.destinationState : null;
+                        if (next != null && !off.Contains(next.name) && byName.ContainsKey(next.name)
+                            && live.Add(next.name))
+                        {
+                            queue.Enqueue(next.name);
+                        }
+                    }
+                }
+
+                // Rebuild the window inside the locomotion machine.
+                var locoMachine = locomotion.stateMachine;
+                var copies = new Dictionary<string, AnimatorState>();
+                foreach (var name in live)
+                {
+                    var src = byName[name];
+                    var copy = locoMachine.AddState($"[AB] {name}");
+                    // No baked travel: it would move the camera with no input. Root motion that
+                    // returns home stays; vertical is height, not travel. Rotation dropped: the capsule stays upright.
+                    copy.motion = src.motion is AnimationClip poseClip
+                        ? LocomotionGrafter.WithoutRootMotion(poseClip, onlyIfTravels: true,
+                            keepPose: true)
+                        : src.motion;
+                    copy.speed = src.speed;
+                    copy.writeDefaultValues = src.writeDefaultValues;
+                    copies[name] = copy;
+                }
+
+                // These copies leave the clone before GesturePass, which never sees
+                // the locomotion or arming layers, so gesture conditions are rebuilt
+                // here. Raw, GestureRight Equals 3 would end up as "> 0.5" on the float.
+                List<AnimatorCondition[]> Branches(AnimatorCondition[] conditions) =>
+                    RewriteConditions(conditions, ctx) ?? new List<AnimatorCondition[]> { conditions };
+
+                void CopyTransition(AnimatorStateTransition from, AnimatorStateTransition to,
+                    AnimatorCondition[] conditions)
+                {
+                    to.hasExitTime = from.hasExitTime;
+                    to.exitTime = from.exitTime;
+                    to.hasFixedDuration = from.hasFixedDuration;
+                    to.duration = from.duration;
+                    to.offset = from.offset;
+                    foreach (var condition in conditions)
+                    {
+                        to.AddCondition(condition.mode, condition.threshold, condition.parameter);
+                    }
+                }
+
+                foreach (var name in live)
+                {
+                    var src = byName[name];
+                    foreach (var transition in src.transitions)
+                    {
+                        if (transition == null)
+                        {
+                            continue;
+                        }
+                        var dst = transition.destinationState;
+                        bool inner = dst != null && copies.ContainsKey(dst.name);
+                        foreach (var branch in Branches(transition.conditions))
+                        {
+                            if (inner)
+                            {
+                                CopyTransition(transition, copies[name].AddTransition(copies[dst.name]), branch);
+                                continue;
+                            }
+                            // Leaving the window (the fade state, or anywhere else): hand the
+                            // body back to locomotion, blending rather than snapping.
+                            var exit = copies[name].AddTransition(locoDefault);
+                            CopyTransition(transition, exit, branch);
+                            exit.hasFixedDuration = true;
+                            exit.duration = 0.25f;
+                        }
+                    }
+                }
+
+                // Arming: every outside entry into the window becomes an
+                // AnyState transition with the same conditions.
+                // Unconditional entries would fire every frame; skipped.
+                int armed = 0;
+                var armedSignatures = new HashSet<string>();
+                var armedEntries = new List<(AnimatorStateTransition entry, AnimatorCondition[] conditions)>();
+                void Arm(AnimatorStateTransition transition)
+                {
+                    var dst = transition != null ? transition.destinationState : null;
+                    if (dst == null || !on.Contains(dst.name) || !copies.TryGetValue(dst.name, out var target))
+                    {
+                        return;
+                    }
+                    foreach (var conditions in Branches(transition.conditions))
+                    {
+                        if (conditions.Length == 0)
+                        {
+                            continue;
+                        }
+                        // From the resting state, never AnyState, which re-fires inside the window
+                        // and loops visibly. Nothing re-fires until hand-back plus a fresh rise.
+                        string signature = dst.name + "|" + string.Join(",",
+                            conditions.Select(c => $"{c.parameter}{(int)c.mode}{c.threshold}"));
+                        if (!armedSignatures.Add(signature))
+                        {
+                            continue;
+                        }
+                        var entry = locoDefault.AddTransition(target);
+                        entry.hasExitTime = false;
+                        entry.hasFixedDuration = true;
+                        entry.duration = 0.1f;
+                        foreach (var condition in conditions)
+                        {
+                            entry.AddCondition(condition.mode, condition.threshold, condition.parameter);
+                        }
+                        armedEntries.Add((entry, conditions));
+                        armed++;
+                    }
+                }
+                WalkMachines(clone.stateMachine, m =>
+                {
+                    foreach (var child in m.states)
+                    {
+                        if (child.state == null || live.Contains(child.state.name))
+                        {
+                            continue;
+                        }
+                        foreach (var transition in child.state.transitions)
+                        {
+                            Arm(transition);
+                        }
+                    }
+                    foreach (var transition in m.anyStateTransitions)
+                    {
+                        Arm(transition);
+                    }
+                });
+                if (armed == 0)
+                {
+                    // No way in: remove what was added rather than leave dead states around.
+                    foreach (var copy in copies.Values)
+                    {
+                        locoMachine.RemoveState(copy);
+                    }
+                    return 0;
+                }
+
+                // ---- edge-triggered arming ----
+                // A held dropdown would replay forever; a "#" ready flag on a weight-0 layer fires once per rise.
+                string readyName = "#AB_Ready_" + SanitizeParameterName(clone.name);
+                if (master.parameters.All(p => p.name != readyName))
+                {
+                    var withReady = master.parameters.ToList();
+                    withReady.Add(new AnimatorControllerParameter
+                    {
+                        name = readyName,
+                        // Disarmed at load; see the Rest prologue below.
+                        type = AnimatorControllerParameterType.Float,
+                        defaultFloat = 0f
+                    });
+                    master.parameters = withReady.ToArray();
+                }
+                foreach (var (entry, _) in armedEntries)
+                {
+                    entry.AddCondition(AnimatorConditionMode.Greater, 0.5f, readyName);
+                }
+
+                AnimatorDriverTask Task(string targetName, AnimatorDriverTask.Operator op,
+                    string aParam, float aStatic, string bParam)
+                {
+                    var task = new AnimatorDriverTask
+                    {
+                        targetType = AnimatorDriverTask.ParameterType.Float,
+                        targetName = targetName,
+                        op = op
+                    };
+                    if (aParam != null)
+                    {
+                        task.aType = AnimatorDriverTask.SourceType.Parameter;
+                        task.aParamType = AnimatorDriverTask.ParameterType.Float;
+                        task.aName = aParam;
+                    }
+                    else
+                    {
+                        task.aType = AnimatorDriverTask.SourceType.Static;
+                        task.aValue = aStatic;
+                    }
+                    if (bParam != null)
+                    {
+                        task.bType = AnimatorDriverTask.SourceType.Parameter;
+                        task.bParamType = AnimatorDriverTask.ParameterType.Float;
+                        task.bName = bParam;
+                    }
+                    return task;
+                }
+                string deltaName = readyName + "_delta";
+                string compareName = readyName + "_cmp";
+                var scratches = new List<string> { deltaName, compareName };
+                string PrevName(string parameter) => readyName + "_prev_" + SanitizeParameterName(parameter);
+
+                // The tick that gives Engaged states a length, so their exit-time self-loop
+                // re-runs the change check every cycle. Same idiom as the velocity feed.
+                var armingTick = new AnimationClip { name = "Arming Tick" };
+                armingTick.SetCurve("", typeof(Animator), compareName + "Tick",
+                    AnimationCurve.Constant(0f, 1f / 60f, 0f));
+
+                var memory = new AnimatorStateMachine
+                {
+                    name = $"{clone.name} Arming",
+                    hideFlags = HideFlags.HideInHierarchy
+                };
+                var ready = memory.AddState("Ready");
+                ready.writeDefaultValues = false;
+                ready.motion = armingTick;
+                memory.defaultState = ready;
+                var readyDriver = ready.AddStateMachineBehaviour<AnimatorDriver>();
+                readyDriver.localOnly = false;
+                readyDriver.EnterTasks.Add(Task(readyName, AnimatorDriverTask.Operator.Set, null, 1f, null));
+                int engagedCount = 0;
+                foreach (var (_, conditions) in armedEntries)
+                {
+                    engagedCount++;
+                    var parameters = conditions.Select(c => c.parameter).Distinct().ToList();
+
+                    // Separate from Engaged, which re-enters every tick and would re-baseline.
+                    var capture = memory.AddState($"Capture {engagedCount}");
+                    capture.writeDefaultValues = false;
+                    capture.motion = armingTick;
+                    var captureDriver = capture.AddStateMachineBehaviour<AnimatorDriver>();
+                    captureDriver.localOnly = false;
+                    captureDriver.EnterTasks.Add(Task(readyName, AnimatorDriverTask.Operator.Set, null, 0f, null));
+                    foreach (var parameter in parameters)
+                    {
+                        scratches.Add(PrevName(parameter));
+                        captureDriver.EnterTasks.Add(Task(PrevName(parameter),
+                            AnimatorDriverTask.Operator.Set, parameter, 0f, null));
+                    }
+
+                    // Engaged: every cycle, delta = OR over parameters of (value != captured).
+                    var engaged = memory.AddState($"Engaged {engagedCount}");
+                    engaged.writeDefaultValues = false;
+                    engaged.motion = armingTick;
+                    var engagedDriver = engaged.AddStateMachineBehaviour<AnimatorDriver>();
+                    engagedDriver.localOnly = false;
+                    engagedDriver.EnterTasks.Add(Task(deltaName, AnimatorDriverTask.Operator.Set, null, 0f, null));
+                    foreach (var parameter in parameters)
+                    {
+                        engagedDriver.EnterTasks.Add(Task(compareName,
+                            AnimatorDriverTask.Operator.NotEqual, parameter, 0f, PrevName(parameter)));
+                        engagedDriver.EnterTasks.Add(Task(deltaName,
+                            AnimatorDriverTask.Operator.Addition, deltaName, 0f, compareName));
+                    }
+
+                    var hold = ready.AddTransition(capture);
+                    hold.hasExitTime = false;
+                    hold.hasFixedDuration = true;
+                    hold.duration = 0f;
+                    foreach (var condition in conditions)
+                    {
+                        hold.AddCondition(condition.mode, condition.threshold, condition.parameter);
+                    }
+                    var settle = capture.AddTransition(engaged);
+                    settle.hasExitTime = true;
+                    settle.exitTime = 1f;
+                    settle.hasFixedDuration = true;
+                    settle.duration = 0f;
+                    var loop = engaged.AddTransition(engaged);
+                    loop.hasExitTime = true;
+                    loop.exitTime = 1f;
+                    loop.hasFixedDuration = true;
+                    loop.duration = 0f;
+
+                    // Release on arming false (one transition per negation) or on an armed value
+                    // changing, so a held menu can switch emotes directly.
+                    foreach (var condition in conditions)
+                    {
+                        var release = engaged.AddTransition(ready);
+                        release.hasExitTime = false;
+                        release.hasFixedDuration = true;
+                        release.duration = 0f;
+                        var (mode, threshold) = InvertCondition(condition);
+                        release.AddCondition(mode, threshold, condition.parameter);
+                    }
+                    var changed = engaged.AddTransition(ready);
+                    changed.hasExitTime = false;
+                    changed.hasFixedDuration = true;
+                    changed.duration = 0f;
+                    changed.AddCondition(AnimatorConditionMode.Greater, 0.5f, deltaName);
+                }
+                // ---- disarmed until something actually changes ----
+                // Arming can hold at load (VRChat's Action sits at weight 0), so arm only on departure from the snapshot.
+                var restParameters = armedEntries
+                    .SelectMany(e => e.Item2.Select(c => c.parameter))
+                    .Distinct()
+                    .ToList();
+
+                var rest = memory.AddState("Rest");
+                rest.writeDefaultValues = false;
+                rest.motion = armingTick;
+                var restDriver = rest.AddStateMachineBehaviour<AnimatorDriver>();
+                restDriver.localOnly = false;
+                restDriver.EnterTasks.Add(Task(readyName, AnimatorDriverTask.Operator.Set, null, 0f, null));
+                foreach (var parameter in restParameters)
+                {
+                    scratches.Add(PrevName(parameter));
+                    restDriver.EnterTasks.Add(Task(PrevName(parameter),
+                        AnimatorDriverTask.Operator.Set, parameter, 0f, null));
+                }
+
+                // Same split as Capture/Engaged, or the baseline is rewritten every tick.
+                var watch = memory.AddState("Rest Watch");
+                watch.writeDefaultValues = false;
+                watch.motion = armingTick;
+                var watchDriver = watch.AddStateMachineBehaviour<AnimatorDriver>();
+                watchDriver.localOnly = false;
+                watchDriver.EnterTasks.Add(Task(deltaName, AnimatorDriverTask.Operator.Set, null, 0f, null));
+                foreach (var parameter in restParameters)
+                {
+                    watchDriver.EnterTasks.Add(Task(compareName,
+                        AnimatorDriverTask.Operator.NotEqual, parameter, 0f, PrevName(parameter)));
+                    watchDriver.EnterTasks.Add(Task(deltaName,
+                        AnimatorDriverTask.Operator.Addition, deltaName, 0f, compareName));
+                }
+
+                memory.defaultState = rest;
+
+                var settleRest = rest.AddTransition(watch);
+                settleRest.hasExitTime = true;
+                settleRest.exitTime = 1f;
+                settleRest.hasFixedDuration = true;
+                settleRest.duration = 0f;
+
+                var watchLoop = watch.AddTransition(watch);
+                watchLoop.hasExitTime = true;
+                watchLoop.exitTime = 1f;
+                watchLoop.hasFixedDuration = true;
+                watchLoop.duration = 0f;
+
+                var wake = watch.AddTransition(ready);
+                wake.hasExitTime = false;
+                wake.hasFixedDuration = true;
+                wake.duration = 0f;
+                wake.AddCondition(AnimatorConditionMode.Greater, 0.5f, deltaName);
+
+                var withScratches = master.parameters.ToList();
+                foreach (var scratch in scratches.Distinct())
+                {
+                    if (withScratches.All(p => p.name != scratch))
+                    {
+                        withScratches.Add(new AnimatorControllerParameter
+                        {
+                            name = scratch,
+                            type = AnimatorControllerParameterType.Float,
+                            defaultFloat = 0f
+                        });
+                    }
+                }
+                master.parameters = withScratches.ToArray();
+                masterLayers.Add(new AnimatorControllerLayer
+                {
+                    name = MakeUniqueLayerName(masterLayers, $"[AB] {clone.name} Arming"),
+                    defaultWeight = 0f, // drivers run regardless of weight; nothing to show
+                    stateMachine = memory
+                });
+
+                return copies.Count;
+            }
+            catch (Exception e)
+            {
+                ctx.Report.Warning(Category, $"Could not move \"{clone.name}\"'s poses into the locomotion layer",
+                    $"{e.GetType().Name}: {e.Message}, the layer stays at weight 0; its visible FX still work.");
+                return 0;
+            }
+        }
+
+        static (AnimatorConditionMode mode, float threshold) InvertCondition(AnimatorCondition condition)
+        {
+            switch (condition.mode)
+            {
+                case AnimatorConditionMode.If: return (AnimatorConditionMode.IfNot, 0f);
+                case AnimatorConditionMode.IfNot: return (AnimatorConditionMode.If, 0f);
+                case AnimatorConditionMode.Greater:
+                    return (AnimatorConditionMode.Less, condition.threshold + 0.0001f);
+                case AnimatorConditionMode.Less:
+                    return (AnimatorConditionMode.Greater, condition.threshold - 0.0001f);
+                case AnimatorConditionMode.Equals:
+                    return (AnimatorConditionMode.NotEqual, condition.threshold);
+                default:
+                    return (AnimatorConditionMode.Equals, condition.threshold);
+            }
+        }
+
+        static readonly HashSet<string> EmotePlayerParameters = new HashSet<string>
+        {
+            "VRCEmote", "VRCFaceBlendH", "VRCFaceBlendV", "AFK", "Seated", "InStation",
+            "IsLocal", "Upright", "Grounded", "Supine", "Voice", "Sitting", "TrackingType",
+        };
+
+        static bool ActionLayerDrivesOwnFeature(AnimatorControllerLayer layer, out string byWhat)
+        {
+            byWhat = null;
+            var own = new SortedSet<string>(StableSampleOrder.Instance);
+            WalkMachines(layer.stateMachine, machine =>
+            {
+                void Note(AnimatorTransitionBase transition)
+                {
+                    if (transition == null || transition.conditions == null)
+                    {
+                        return;
+                    }
+                    foreach (var condition in transition.conditions)
+                    {
+                        if (!string.IsNullOrEmpty(condition.parameter)
+                            && !EmotePlayerParameters.Contains(condition.parameter)
+                            && !condition.parameter.StartsWith("#", StringComparison.Ordinal))
+                        {
+                            own.Add(condition.parameter);
+                        }
+                    }
+                }
+                foreach (var child in machine.states)
+                {
+                    if (child.state != null)
+                    {
+                        foreach (var transition in child.state.transitions)
+                        {
+                            Note(transition);
+                        }
+                    }
+                }
+                foreach (var transition in machine.anyStateTransitions)
+                {
+                    Note(transition);
+                }
+                foreach (var transition in machine.entryTransitions)
+                {
+                    Note(transition);
+                }
+            });
+            if (own.Count == 0)
+            {
+                return false;
+            }
+            byWhat = string.Join(", ", own.Take(4)) + (own.Count > 4 ? ", …" : "");
+            return true;
+        }
+        static bool MotionUsesParameter(Motion motion, string param)
+        {
+            if (motion is BlendTree tree)
+            {
+                // Same vestigial-field rule as CollectReferencedParameters: Direct reads neither axis, 1D only X.
+                bool usesX = tree.blendType != BlendTreeType.Direct;
+                bool usesY = usesX && tree.blendType != BlendTreeType.Simple1D;
+                if ((usesX && tree.blendParameter == param) || (usesY && tree.blendParameterY == param))
+                {
+                    return true;
+                }
+                foreach (var child in tree.children)
+                {
+                    if (child.directBlendParameter == param || MotionUsesParameter(child.motion, param))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if (motion is AnimationClip clip)
+            {
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type == typeof(Animator) && string.IsNullOrEmpty(binding.path) &&
+                        binding.propertyName == param)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        static readonly Dictionary<string, float> UnsupportedBuiltInDefaults = new Dictionary<string, float>
+        {
+            { "IsLocal", 1f },
+            { "TrackingType", 3f },
+            { "Upright", 1f },
+            { "AvatarVersion", 3f },
+            { "IsAnimatorEnabled", 1f },
+            { "ScaleFactor", 1f },
+            { "ScaleFactorInverse", 1f },
+            { "EyeHeightAsPercent", 1f },
+            { "EyeHeightAsMeters", 1.6f },
+        };
+
+        static void DefaultUnsupportedBuiltIns(AnimatorController master, BridgeContext ctx)
+        {
+            var parameters = master.parameters;
+            var changed = new List<string>();
+            // Both spellings are live: CVR marks local-only parameters with a leading "#", and an
+            // avatar can carry the prefixed and unprefixed copy at once.
+            foreach (var param in parameters)
+            {
+                string bare = param.name.StartsWith("#") ? param.name.Substring(1) : param.name;
+                if (UnsupportedBuiltInDefaults.TryGetValue(bare, out float value)
+                    && ApplyRestingValue(master, param, value))
+                {
+                    changed.Add($"{param.name} = {value:0.##}");
+                }
+            }
+            if (changed.Count == 0)
+            {
+                return;
+            }
+            master.parameters = parameters;
+            ctx.Report.Converted(Category, $"{BridgeElements.Count(changed.Count, "VRChat built-in", "VRChat built-ins")} given a resting value",
+                $"{string.Join(", ", changed)}: 0 means untracked or lying flat. These are VRChat's values, for " +
+                "the first frame only.");
+        }
+
+        static bool ApplyRestingValue(AnimatorController master, AnimatorControllerParameter param, float value)
+        {
+            // Per type: defaultBool/Int/Float are independent, so an Int default of 2 reads defaultFloat 0.
+            bool alreadySet;
+            switch (param.type)
+            {
+                case AnimatorControllerParameterType.Trigger:
+                    return false; // A trigger has no resting value to give it.
+                case AnimatorControllerParameterType.Bool:
+                    alreadySet = param.defaultBool;
+                    break;
+                case AnimatorControllerParameterType.Int:
+                    alreadySet = param.defaultInt != 0;
+                    break;
+                default:
+                    alreadySet = !Mathf.Approximately(param.defaultFloat, 0f);
+                    break;
+            }
+            if (alreadySet)
+            {
+                return false;
+            }
+
+            bool written = false;
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var behaviour in machine.behaviours.OfType<AnimatorDriver>())
+                    {
+                        foreach (var task in behaviour.EnterTasks.Concat(behaviour.ExitTasks))
+                        {
+                            written |= task.targetName == param.name;
+                        }
+                    }
+                    foreach (var child in machine.states)
+                    {
+                        foreach (var behaviour in child.state.behaviours.OfType<AnimatorDriver>())
+                        {
+                            foreach (var task in behaviour.EnterTasks.Concat(behaviour.ExitTasks))
+                            {
+                                written |= task.targetName == param.name;
+                            }
+                        }
+                    }
+                });
+            }
+            if (written)
+            {
+                return false;
+            }
+
+            param.defaultBool = value > 0.5f;
+            param.defaultInt = Mathf.RoundToInt(value);
+            param.defaultFloat = value;
+            return true;
+        }
+
+        static void DeclareDanglingParameters(AnimatorController master, BridgeContext ctx)
+        {
+            var declared = new HashSet<string>(master.parameters.Select(p => p.name));
+            var missing = CollectReferencedParameters(master)
+                .Where(n => !string.IsNullOrEmpty(n) && !declared.Contains(n))
+                .OrderBy(n => n)
+                .ToList();
+            if (missing.Count == 0)
+            {
+                return;
+            }
+
+            var parameters = master.parameters.ToList();
+            var mirrored = new List<string>();
+            foreach (string name in missing)
+            {
+                float value = MirroredDefault(name, master, ctx);
+                if (value != 0f)
+                {
+                    mirrored.Add($"{name} = {value:0.###}");
+                }
+                parameters.Add(new AnimatorControllerParameter
+                {
+                    name = name,
+                    type = AnimatorControllerParameterType.Float,
+                    defaultFloat = value
+                });
+            }
+            master.parameters = parameters.ToArray();
+            // The reconcile ran before these existed, so an If or IfNot on one still sat on a
+            // Float, which ChilloutVR drops.
+            ReconcileConditionModes(master, ctx);
+
+            if (mirrored.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Took {BridgeElements.Count(mirrored.Count, "missing parameter default", "missing parameter defaults")} from the parameter each mirrors",
+                    $"{string.Join(", ", mirrored.Take(10))}{(mirrored.Count > 10 ? ", …" : "")}: " +
+                    "at 0, a slider centred on 0.5 comes out deformed.");
+            }
+
+            ctx.Report.Warning(Category, $"Declared {BridgeElements.Count(missing.Count, "referenced parameter that was missing", "referenced parameters that were missing")}",
+                $"{string.Join(", ", missing.Take(12))}{(missing.Count > 12 ? ", …" : "")}: added as Float 0 so " +
+                "their transitions survive. Nothing drives them; if a feature is dead, start here.");
+        }
+
+        static float MirroredDefault(string name, AnimatorController master, BridgeContext ctx)
+        {
+            string bare = name.StartsWith("#", StringComparison.Ordinal) ? name.Substring(1) : name;
+            var tag = System.Text.RegularExpressions.Regex.Match(bare, @"^VF\d+_(.+)$");
+            if (!tag.Success)
+            {
+                return 0f;
+            }
+            string source = tag.Groups[1].Value;
+
+            // The real parameter, however the rename pass ended up spelling it.
+            foreach (var p in master.parameters)
+            {
+                if ((p.name == source || p.name == "#" + source) &&
+                    p.type == AnimatorControllerParameterType.Float)
+                {
+                    return p.defaultFloat;
+                }
+            }
+
+            // Otherwise what the avatar itself declared, which is where the 0.5 actually lives.
+            var expressions = ctx.SourceDescriptor != null ? ctx.SourceDescriptor.expressionParameters : null;
+            if (expressions != null && expressions.parameters != null)
+            {
+                foreach (var p in expressions.parameters)
+                {
+                    if (p != null && p.name == source)
+                    {
+                        return p.defaultValue;
+                    }
+                }
+            }
+            return 0f;
+        }
+
+        static void RepairPrefixedReferences(AnimatorController master, BridgeContext ctx)
+        {
+            var declared = new HashSet<string>(master.parameters.Select(p => p.name));
+            var fixes = new Dictionary<string, string>();
+            foreach (string name in declared)
+            {
+                if (name.StartsWith("#") && !declared.Contains(name.Substring(1)))
+                {
+                    fixes[name.Substring(1)] = name;
+                }
+            }
+            if (fixes.Count == 0)
+            {
+                return;
+            }
+
+            var repaired = new HashSet<string>();
+            string Fix(string n)
+            {
+                if (n != null && fixes.TryGetValue(n, out var prefixed))
+                {
+                    repaired.Add(n);
+                    return prefixed;
+                }
+                return n;
+            }
+
+            foreach (var layer in master.layers)
+            {
+                RenameMachineReferences(layer.stateMachine, Fix, motion =>
+                {
+                    RenameMotionParameters(motion, Fix);
+                    return motion;
+                });
+            }
+
+            if (repaired.Count > 0)
+            {
+                ctx.Report.Converted(Category, $"Repointed {BridgeElements.Count(repaired.Count, "reference name", "reference names")} at their local parameter",
+                    $"{string.Join(", ", repaired.OrderBy(r => r).Take(12))}{(repaired.Count > 12 ? ", …" : "")}: " +
+                    "they were named without their \"#\", so they read 0.");
+            }
+        }
+
+        static void PruneOrphanedParameters(AnimatorController master, BridgeContext ctx)
+        {
+            var referenced = CollectReferencedParameters(master);
+            var menuNames = new HashSet<string>(ctx.CvrAvatar.avatarSettings.settings
+                .Where(e => e != null && !string.IsNullOrEmpty(e.machineName))
+                .Select(e => e.machineName));
+
+            var parameters = master.parameters;
+            var kept = parameters
+                .Where(p => referenced.Contains(p.name) ||
+                            menuNames.Contains(p.name) ||
+                            IsGameDrivenParameter(p.name) ||
+                            GestureMap.GestureParameters.Contains(p.name) ||
+                            ctx.ContactParameters.Contains(p.name))
+                .ToArray();
+
+            int removed = parameters.Length - kept.Length;
+            if (removed == 0)
+            {
+                return;
+            }
+            var names = parameters.Select(p => p.name).Except(kept.Select(p => p.name)).ToList();
+            master.parameters = kept;
+            ctx.Report.Converted(Category, $"Removed {BridgeElements.Count(removed, "orphaned animator parameter", "orphaned animator parameters")}",
+                $"{string.Join(", ", names.Take(12))}{(names.Count > 12 ? ", …" : "")}: nothing reads them, and " +
+                "removing them gives their sync bits back.");
+        }
+
+        static HashSet<string> CollectReferencedParameters(AnimatorController master)
+        {
+            var referenced = new HashSet<string>();
+            // Muscle curves bind like animated animator parameters.
+            // Requiring a declared name separates them; a clip writing
+            // an undeclared parameter does nothing anyway.
+            var declaredNames = new HashSet<string>(master.parameters.Select(p => p.name));
+
+            void NoteMotion(Motion motion)
+            {
+                if (motion is BlendTree tree)
+                {
+                    // Only fields this blend type reads: Direct keeps a leftover "Blend", 1D ignores Y.
+                    if (tree.blendType != BlendTreeType.Direct)
+                    {
+                        referenced.Add(tree.blendParameter);
+                        if (tree.blendType != BlendTreeType.Simple1D)
+                        {
+                            referenced.Add(tree.blendParameterY);
+                        }
+                    }
+                    foreach (var child in tree.children)
+                    {
+                        if (tree.blendType == BlendTreeType.Direct)
+                        {
+                            referenced.Add(child.directBlendParameter);
+                        }
+                        NoteMotion(child.motion);
+                    }
+                }
+                else if (motion is AnimationClip clip)
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        if (binding.type == typeof(Animator) && string.IsNullOrEmpty(binding.path)
+                            && declaredNames.Contains(binding.propertyName))
+                        {
+                            referenced.Add(binding.propertyName);
+                        }
+                    }
+                }
+            }
+
+            void NoteConditions(AnimatorTransitionBase[] transitions)
+            {
+                foreach (var transition in transitions)
+                {
+                    foreach (var condition in transition.conditions)
+                    {
+                        referenced.Add(condition.parameter);
+                    }
+                }
+            }
+
+            void NoteDrivers(IEnumerable<StateMachineBehaviour> behaviours)
+            {
+                foreach (var driver in behaviours.OfType<AnimatorDriver>())
+                {
+                    foreach (var task in driver.EnterTasks.Concat(driver.ExitTasks))
+                    {
+                        referenced.Add(task.targetName);
+                        referenced.Add(task.aName);
+                        referenced.Add(task.bName);
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    NoteConditions(machine.anyStateTransitions);
+                    NoteConditions(machine.entryTransitions);
+                    NoteConditions(SubMachineTransitions(machine));
+                    NoteDrivers(machine.behaviours);
+                    foreach (var child in machine.states)
+                    {
+                        var state = child.state;
+                        if (state.timeParameterActive) referenced.Add(state.timeParameter);
+                        if (state.speedParameterActive) referenced.Add(state.speedParameter);
+                        if (state.mirrorParameterActive) referenced.Add(state.mirrorParameter);
+                        if (state.cycleOffsetParameterActive) referenced.Add(state.cycleOffsetParameter);
+                        NoteMotion(state.motion);
+                        NoteConditions(state.transitions);
+                        NoteDrivers(state.behaviours);
+                    }
+                });
+            }
+            return referenced;
+        }
+
+        static void RemapIntConditions(AnimatorController master, string param,
+            Dictionary<int, int> map, List<int> ordered)
+        {
+            void Remap(AnimatorTransitionBase[] transitions)
+            {
+                foreach (var transition in transitions)
+                {
+                    var conditions = transition.conditions;
+                    bool changed = false;
+                    for (int i = 0; i < conditions.Length; i++)
+                    {
+                        if (conditions[i].parameter != param)
+                        {
+                            continue;
+                        }
+                        int value = Mathf.RoundToInt(conditions[i].threshold);
+                        int mapped;
+                        switch (conditions[i].mode)
+                        {
+                            case AnimatorConditionMode.Greater:
+                                mapped = ordered.Count(v => v <= value) - 1;
+                                break;
+                            case AnimatorConditionMode.Less:
+                                mapped = ordered.Count(v => v < value);
+                                break;
+                            default:
+                                if (!map.TryGetValue(value, out mapped))
+                                {
+                                    continue;
+                                }
+                                break;
+                        }
+                        if (mapped != value)
+                        {
+                            conditions[i].threshold = mapped;
+                            changed = true;
+                        }
+                    }
+                    if (changed)
+                    {
+                        transition.conditions = conditions;
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    Remap(machine.anyStateTransitions);
+                    Remap(machine.entryTransitions);
+                    Remap(SubMachineTransitions(machine));
+                    foreach (var child in machine.states)
+                    {
+                        Remap(child.state.transitions);
+                    }
+                });
+            }
+        }
+
+        static void RemapIntDrivers(AnimatorController master, string param, Dictionary<int, int> map)
+        {
+            void RemapBehaviours(StateMachineBehaviour[] behaviours)
+            {
+                foreach (var behaviour in behaviours)
+                {
+                    if (!(behaviour is AnimatorDriver driver))
+                    {
+                        continue;
+                    }
+                    foreach (var task in driver.EnterTasks.Concat(driver.ExitTasks))
+                    {
+                        if (task.targetName == param &&
+                            task.aType == AnimatorDriverTask.SourceType.Static &&
+                            map.TryGetValue(Mathf.RoundToInt(task.aValue), out var mapped))
+                        {
+                            task.aValue = mapped;
+                        }
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    RemapBehaviours(machine.behaviours);
+                    foreach (var child in machine.states)
+                    {
+                        RemapBehaviours(child.state.behaviours);
+                    }
+                });
+            }
+        }
+
+        static void RemapTriggerValues(BridgeContext ctx, string param, Dictionary<int, int> map)
+        {
+            foreach (var trigger in ctx.CvrAvatar.GetComponentsInChildren<CVRAdvancedAvatarSettingsTrigger>(true))
+            {
+                foreach (var task in trigger.enterTasks.Concat(trigger.exitTasks))
+                {
+                    if (task.settingName == param &&
+                        map.TryGetValue(Mathf.RoundToInt(task.settingValue), out var mapped))
+                    {
+                        task.settingValue = mapped;
+                    }
+                }
+                EditorUtility.SetDirty(trigger);
+            }
+        }
+
+        static void CreateParameterStreams(AnimatorController master, BridgeContext ctx)
+        {
+            // "app"/"lo"/"hi" describe how the raw stream value reaches the parameter. Override
+            // passes it through; Remap runs the CCK's Remap(value, 0, 1, lo, hi), which is how a
+            // ChilloutVR boolean becomes one of VRChat's numbered states.
+            var streamables = new[]
+            {
+                (bare: "MuteSelf", streamType: "LocalPlayerMuted", app: "Override", lo: 0f, hi: 0f),
+                (bare: "VRMode", streamType: "DeviceMode", app: "Override", lo: 0f, hi: 0f),
+
+                // AvatarUpright matches VRChat's Upright exactly.
+                // Same range, same meaning, no conversion needed.
+                (bare: "Upright", streamType: "AvatarUpright", app: "Override", lo: 0f, hi: 0f),
+
+                // CVR only reports full-body on/off, so VRChat's six states collapse to 3 and 6,
+                // both above zero as most avatars test. VelocityX/Y/Z are core, never streamed.
+                (bare: "TrackingType", streamType: "LocalPlayerFullBodyEnabled", app: "Remap", lo: 3f, hi: 6f),
+
+                // AvatarHeight is the calibrated height in metres, the
+                // closest reading of EyeHeightAsMeters. The rest of the
+                // scale family derives from it in FeedScaleParameters.
+                (bare: "EyeHeightAsMeters", streamType: "AvatarHeight", app: "Override", lo: 0f, hi: 0f)
+            };
+            var wanted = new List<(string paramName, string streamType, string bare, string app, float lo, float hi)>();
+            foreach (var param in master.parameters)
+            {
+                string bare = param.name.TrimStart('#');
+                foreach (var s in streamables)
+                {
+                    if (bare == s.bare)
+                    {
+                        wanted.Add((param.name, s.streamType, s.bare, s.app, s.lo, s.hi));
+                    }
+                }
+            }
+            if (wanted.Count == 0)
+            {
+                return;
+            }
+
+            var entryType = typeof(CVRParameterStream).Assembly.GetType("ABI.CCK.Components.CVRParameterStreamEntry");
+            var typeEnum = entryType?.GetNestedType("Type");
+            var targetEnum = entryType?.GetNestedType("TargetType");
+            var appEnum = entryType?.GetNestedType("ApplicationType");
+            if (entryType == null || typeEnum == null)
+            {
+                ctx.Report.Warning(Category, "CVRParameterStream entries unavailable on this CCK version",
+                    "MuteSelf/VRMode parameters keep their defaults.");
+                return;
+            }
+
+            // An int the client reads: its numbers are the contract, even when the CCK enum predates a name.
+            var clientEnumValues = new Dictionary<string, int>
+            {
+                { "Override", 0 }, { "Remap", 201 }, { "ClampRemap", 202 },
+                { "DeviceMode", 20 }, { "LocalPlayerMuted", 210 },
+                { "LocalPlayerFullBodyEnabled", 260 },
+                { "AvatarHeight", 400 }, { "AvatarUpright", 401 },
+                { "AvatarAnimator", 2 },
+            };
+            object ParseEnum(Type enumType, string name)
+            {
+                if (enumType == null)
+                {
+                    return null;
+                }
+                try { return Enum.Parse(enumType, name, true); }
+                catch
+                {
+                    if (clientEnumValues.TryGetValue(name, out int clientValue))
+                    {
+                        try { return Enum.ToObject(enumType, clientValue); } catch { }
+                    }
+                    return null;
+                }
+            }
+            void SetField(object target, string fieldName, object value)
+            {
+                var field = entryType.GetField(fieldName, BindingFlags.Public | BindingFlags.Instance);
+                if (field != null && value != null)
+                {
+                    try { field.SetValue(target, value); } catch { }
+                }
+            }
+
+            var stream = ctx.Target.GetComponent<CVRParameterStream>();
+            if (stream == null)
+            {
+                stream = ctx.Target.AddComponent<CVRParameterStream>();
+            }
+            var entriesField = stream.GetType().GetField("entries", BindingFlags.Public | BindingFlags.Instance);
+            var entries = entriesField?.GetValue(stream) as System.Collections.IList;
+            if (entries == null && entriesField != null)
+            {
+                entries = (System.Collections.IList)Activator.CreateInstance(entriesField.FieldType);
+                entriesField.SetValue(stream, entries);
+            }
+            if (entries == null)
+            {
+                ctx.Report.Warning(Category, "CVRParameterStream has no entries list on this CCK version",
+                    "Stream-fed parameters keep their defaults.");
+                return;
+            }
+
+            foreach (var w in wanted)
+            {
+                var streamTypeValue = ParseEnum(typeEnum, w.streamType);
+                if (streamTypeValue == null)
+                {
+                    ctx.Report.Skipped(Category, $"Parameter stream {w.streamType}",
+                        $"Stream type not found on this CCK version; \"{w.paramName}\" keeps its default.");
+                    continue;
+                }
+                var appValue = ParseEnum(appEnum, w.app);
+                if (appValue == null)
+                {
+                    // Without the arithmetic this entry would feed a raw 0/1 into a parameter
+                    // that means something else entirely. Leaving the default alone is safer.
+                    ctx.Report.Skipped(Category, $"Parameter stream {w.streamType}",
+                        $"This CCK version has no \"{w.app}\" application type; \"{w.paramName}\" keeps its default.");
+                    continue;
+                }
+                var entry = Activator.CreateInstance(entryType);
+                SetField(entry, "type", streamTypeValue);
+                if (w.app == "Remap")
+                {
+                    SetField(entry, "staticValue", w.lo);
+                    SetField(entry, "staticValue2", w.hi);
+                }
+                // Never TargetType.Animator: that is the CCK's "Sub Animator", needing a nominated
+                // target. The client value covers an older enum.
+                SetField(entry, "targetType", ParseEnum(targetEnum, "AvatarAnimator"));
+                SetField(entry, "applicationType", appValue);
+                SetField(entry, "parameterName", w.paramName);
+                entries.Add(entry);
+                ctx.Report.Converted(Category, $"\"{w.paramName}\" fed by CVR Parameter Stream ({w.streamType})",
+                    (w.app == "Remap"
+                        ? $"Behaves like the VRChat built-in parameter, remapped to {w.lo:0.##}–{w.hi:0.##}. "
+                        : "Behaves like the VRChat built-in parameter. ") +
+                    (w.paramName.StartsWith("#", StringComparison.Ordinal)
+                        ? "Local, as its \"#\" name says, and the stream runs on the wearer's machine only, " +
+                          "so other players see its default."
+                        : "Synced, since the stream runs on the wearer's machine only."));
+            }
+            EditorUtility.SetDirty(stream);
+        }
+
+        // Two states pointing at each other on the SAME condition: a pulse idiom for a VRChat
+        // menu Button's one-frame flick. CVR has no button; the toggle holds the condition and
+        // the pair ping-pongs several times a second. Not the AnyState self-restart: A to B to A.
+        static void UnlatchImpulsePingPongs(AnimatorController master, BridgeContext ctx)
+        {
+            if (ctx.ImpulseParameters.Count == 0)
+            {
+                return;
+            }
+            var types = new Dictionary<string, AnimatorControllerParameterType>();
+            foreach (var p in master.parameters) types[p.name] = p.type;
+
+            var unlatched = new List<string>();
+            var left = new List<string>();
+
+            foreach (var layer in master.layers)
+            {
+                if (layer == null || layer.stateMachine == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                string layerName = layer.name;
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    var handled = new HashSet<AnimatorState>();
+                    foreach (var child in machine.states)
+                    {
+                        var a = child.state;
+                        if (a == null || a.transitions == null || !handled.Add(a))
+                        {
+                            continue;
+                        }
+                        foreach (var out_ in a.transitions)
+                        {
+                            var forward = SoleCondition(out_);
+                            if (forward == null)
+                            {
+                                continue;
+                            }
+                            string param = forward.Value.parameter;
+                            var mode = forward.Value.mode;
+                            if (!ctx.ImpulseParameters.Contains(param)
+                                || (mode != AnimatorConditionMode.If && mode != AnimatorConditionMode.IfNot))
+                            {
+                                continue;
+                            }
+                            // A Trigger consumes itself on use, which is what
+                            // the idiom was built around. Nothing to fix.
+                            AnimatorControllerParameterType type;
+                            if (!types.TryGetValue(param, out type)
+                                || type != AnimatorControllerParameterType.Bool)
+                            {
+                                continue;
+                            }
+                            var b = out_.destinationState;
+                            if (b == a || b.transitions == null)
+                            {
+                                continue;
+                            }
+                            AnimatorStateTransition back = null;
+                            foreach (var candidate in b.transitions)
+                            {
+                                var c = SoleCondition(candidate);
+                                if (c != null && candidate.destinationState == a
+                                    && c.Value.parameter == param && c.Value.mode == mode)
+                                {
+                                    back = candidate;
+                                    break;
+                                }
+                            }
+                            if (back == null)
+                            {
+                                continue;
+                            }
+                            handled.Add(b);
+                            string label = $"\"{param}\" ({layerName})";
+
+                            // Fixed even with a contact: a loop is worse than a contact needing a
+                            // rewire, which HoldUnlatchedContacts does. The way out lands on the
+                            // resting state; without one, no telling which side is off.
+                            var exit = machine.defaultState == a ? back
+                                : machine.defaultState == b ? out_ : null;
+                            if (exit == null)
+                            {
+                                left.Add(label + ", neither state is the layer's resting one");
+                                break;
+                            }
+                            ctx.UnlatchedParameters.Add(param);
+                            exit.RemoveCondition(exit.conditions[0]);
+                            exit.AddCondition(mode == AnimatorConditionMode.If
+                                ? AnimatorConditionMode.IfNot
+                                : AnimatorConditionMode.If, 0f, param);
+                            EditorUtility.SetDirty(exit);
+                            unlatched.Add(label);
+                            break;
+                        }
+                    }
+                });
+            }
+
+            if (unlatched.Count > 0)
+            {
+                EditorUtility.SetDirty(master);
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(unlatched.Count, "control that would have looped now switches", "controls that would have looped now switch")} off instead",
+                    string.Join("; ", unlatched) + ". VRChat Buttons whose states swapped on one condition; " +
+                    "as held toggles they would loop. Each is now a plain on/off toggle.");
+            }
+            if (left.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(left.Count, "control", "controls")} may loop while switched on",
+                    string.Join("; ", left) + ". Their states swap on one condition, which a held toggle loops. " +
+                    "If one flickers in game, give its way back the opposite condition.");
+            }
+        }
+
+        // The transition's single condition, or null: more than one is not the idiom.
+        static AnimatorCondition? SoleCondition(AnimatorStateTransition transition)
+        {
+            if (transition == null || transition.isExit || transition.mute
+                || transition.destinationState == null)
+            {
+                return null;
+            }
+            var conditions = transition.conditions;
+            if (conditions == null || conditions.Length != 1)
+            {
+                return null;
+            }
+            return conditions[0];
+        }
+
+        static void SuppressAnyStateSelfRestarts(AnimatorController master, BridgeContext ctx)
+        {
+            var triggers = new HashSet<string>(master.parameters
+                .Where(p => p.type == AnimatorControllerParameterType.Trigger)
+                .Select(p => p.name));
+            int flipped = 0;
+            foreach (var layer in master.layers)
+            {
+                if (layer == null || layer.stateMachine == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var transition in machine.anyStateTransitions)
+                    {
+                        if (transition == null || !transition.canTransitionToSelf
+                            || transition.conditions.Any(c => triggers.Contains(c.parameter)))
+                        {
+                            continue;
+                        }
+                        // Only still states: a frame-0 pin on a real clip is shipped behaviour; the
+                        // strobe comes from constant or added motions, where pin and play match.
+                        var destination = transition.destinationState;
+                        if (destination != null && !MotionHoldsStill(destination.motion))
+                        {
+                            continue;
+                        }
+                        // A destination with an exit-time transition
+                        // depends on the restart to stay alive; every
+                        // re-entry resets the clock. Clearing the flag
+                        // would set it cycling at clip length.
+                        if (destination != null
+                            && destination.transitions.Any(t => t != null && t.hasExitTime))
+                        {
+                            continue;
+                        }
+                        transition.canTransitionToSelf = false;
+                        EditorUtility.SetDirty(transition);
+                        flipped++;
+                    }
+                });
+            }
+            if (flipped == 0)
+            {
+                return;
+            }
+            EditorUtility.SetDirty(master);
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(flipped, "AnyState transition stopped restarting its", "AnyState transitions stopped restarting their")} own state every frame",
+                "\"Can Transition To Self\" made them strobe, often only for other players. Animated states " +
+                "and Trigger transitions keep it.");
+        }
+
+        static bool MotionHoldsStill(Motion motion)
+        {
+            if (motion == null)
+            {
+                return true; // empty in VRChat; the filler this pass protects against comes later
+            }
+            if (motion is BlendTree tree)
+            {
+                return tree.children.All(child => MotionHoldsStill(child.motion));
+            }
+            if (!(motion is AnimationClip clip))
+            {
+                return false;
+            }
+            foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+            {
+                var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                if (curve == null || curve.keys.Length < 2)
+                {
+                    continue;
+                }
+                float first = curve.keys[0].value;
+                for (int i = 1; i < curve.keys.Length; i++)
+                {
+                    if (Mathf.Abs(curve.keys[i].value - first) > 1e-5f)
+                    {
+                        return false;
+                    }
+                }
+            }
+            foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+            {
+                var keys = AnimationUtility.GetObjectReferenceCurve(clip, binding);
+                if (keys == null || keys.Length < 2)
+                {
+                    continue;
+                }
+                for (int i = 1; i < keys.Length; i++)
+                {
+                    if (keys[i].value != keys[0].value)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        static void FeedScaleParameters(AnimatorController master, BridgeContext ctx)
+        {
+            var derived = new[] { "ScaleFactor", "ScaleFactorInverse", "EyeHeightAsPercent", "ScaleModified" };
+            var present = new Dictionary<string, AnimatorControllerParameter>();
+            foreach (var p in master.parameters)
+            {
+                string bare = p.name.TrimStart('#');
+                if (derived.Contains(bare) && !present.ContainsKey(bare))
+                {
+                    present[bare] = p;
+                }
+            }
+            if (present.Count == 0)
+            {
+                return;
+            }
+
+            float baseline = ctx.CvrAvatar != null ? ctx.CvrAvatar.viewPosition.y : 0f;
+            if (baseline < 0.05f)
+            {
+                baseline = 1.6f; // no believable viewpoint to measure against; VRChat's default
+            }
+
+            var parameters = master.parameters.ToList();
+            void Ensure(string name)
+            {
+                if (parameters.All(p => p.name != name))
+                {
+                    parameters.Add(new AnimatorControllerParameter
+                    {
+                        name = name,
+                        type = AnimatorControllerParameterType.Float,
+                        // The resting value, so the first frames before the stream fires read
+                        // "unscaled" rather than "0.05 m tall".
+                        defaultFloat = baseline
+                    });
+                }
+            }
+            const string Factor = "#ScaleFactorCalc";
+            const string Delta = "#ScaleDeltaCalc";
+            const string Shift = "#EyeHeightShiftCalc";
+            // Unprefixed, so it syncs: remotes recompute from it. Only a declaration added
+            // here is a new sync cost.
+            bool addedEyeHeight = parameters.All(p => p.name != "EyeHeightAsMeters");
+            Ensure("EyeHeightAsMeters");
+            master.parameters = AppendScratch(parameters.ToArray(), Factor);
+
+            AnimatorDriverTask Task(string targetName, AnimatorDriverTask.ParameterType targetType,
+                AnimatorDriverTask.Operator op,
+                string aParam, float aStatic, string bParam, float bStatic)
+            {
+                var task = new AnimatorDriverTask
+                {
+                    targetType = targetType,
+                    targetName = targetName,
+                    op = op
+                };
+                if (aParam != null)
+                {
+                    task.aType = AnimatorDriverTask.SourceType.Parameter;
+                    task.aParamType = AnimatorDriverTask.ParameterType.Float;
+                    task.aName = aParam;
+                }
+                else
+                {
+                    task.aType = AnimatorDriverTask.SourceType.Static;
+                    task.aValue = aStatic;
+                }
+                if (bParam != null)
+                {
+                    task.bType = AnimatorDriverTask.SourceType.Parameter;
+                    task.bParamType = AnimatorDriverTask.ParameterType.Float;
+                    task.bName = bParam;
+                }
+                else
+                {
+                    task.bType = AnimatorDriverTask.SourceType.Static;
+                    task.bValue = bStatic;
+                }
+                return task;
+            }
+
+            var tick = new AnimationClip { name = "Scale Feed Tick" };
+            tick.SetCurve("", typeof(Animator), Factor + "Tick", AnimationCurve.Constant(0f, 1f / 60f, 0f));
+
+            var machine = new AnimatorStateMachine
+            {
+                name = "Scale Feed",
+                hideFlags = HideFlags.HideInHierarchy
+            };
+            var state = machine.AddState("Recompute");
+            state.writeDefaultValues = false;
+            state.motion = tick;
+            machine.defaultState = state;
+            var loop = state.AddTransition(state);
+            loop.hasExitTime = true;
+            loop.exitTime = 1f;
+            loop.hasFixedDuration = true;
+            loop.duration = 0f;
+
+            var driver = state.AddStateMachineBehaviour<AnimatorDriver>();
+            driver.localOnly = false; // remotes recompute from the synced EyeHeightAsMeters
+            var tasks = driver.EnterTasks;
+            var Float = AnimatorDriverTask.ParameterType.Float;
+            tasks.Add(Task(Factor, Float, AnimatorDriverTask.Operator.Division,
+                "EyeHeightAsMeters", 0f, null, baseline));
+            if (present.TryGetValue("ScaleFactor", out var scaleFactor))
+            {
+                tasks.Add(Task(scaleFactor.name, Float, AnimatorDriverTask.Operator.Set,
+                    Factor, 0f, null, 0f));
+            }
+            if (present.TryGetValue("ScaleFactorInverse", out var inverse))
+            {
+                tasks.Add(Task(inverse.name, Float, AnimatorDriverTask.Operator.Division,
+                    null, baseline, "EyeHeightAsMeters", 0f));
+            }
+            if (present.TryGetValue("EyeHeightAsPercent", out var percent))
+            {
+                master.parameters = AppendScratch(master.parameters, Shift);
+                tasks.Add(Task(Shift, Float, AnimatorDriverTask.Operator.Subtraction,
+                    "EyeHeightAsMeters", 0f, null, 0.2f));
+                tasks.Add(Task(percent.name, Float, AnimatorDriverTask.Operator.Division,
+                    Shift, 0f, null, 4.8f));
+            }
+            if (present.TryGetValue("ScaleModified", out var modified))
+            {
+                master.parameters = AppendScratch(master.parameters, Delta);
+                // Squared distance from 1, compared against one percent
+                // squared. Exact equality on a streamed float flickers.
+                tasks.Add(Task(Delta, Float, AnimatorDriverTask.Operator.Subtraction,
+                    Factor, 0f, null, 1f));
+                tasks.Add(Task(Delta, Float, AnimatorDriverTask.Operator.Multiplication,
+                    Delta, 0f, Delta, 0f));
+                // Resolved by name. The CCK has shipped both spellings,
+                // "MoreThan" and "MoreThen"; naming either directly
+                // fails to compile against the other.
+                if (TryOperator(out var moreThan, "MoreThan", "MoreThen"))
+                {
+                    tasks.Add(Task(modified.name,
+                        modified.type == AnimatorControllerParameterType.Bool
+                            ? AnimatorDriverTask.ParameterType.Bool
+                            : Float,
+                        moreThan,
+                        Delta, 0f, null, 0.0001f));
+                }
+                else
+                {
+                    ctx.Report.Warning(Category, $"Scale feed for \"{modified.name}\" is incomplete",
+                        "This CCK spells its driver operators in a way AvatarBridge does not know, so it will not " +
+                        "update when you scale. Please report the CCK version.");
+                }
+            }
+
+            var layers = master.layers.ToList();
+            layers.Add(new AnimatorControllerLayer
+            {
+                name = "Scale Feed",
+                defaultWeight = 1f,
+                stateMachine = machine
+            });
+            master.layers = layers.ToArray();
+
+            ctx.Report.Converted(Category,
+                $"VRChat's avatar-scale parameters are live: {string.Join(", ", present.Keys)}",
+                $"From EyeHeightAsMeters against {baseline:0.00} m as scale 1, computed on every client" +
+                (addedEyeHeight
+                    ? ". EyeHeightAsMeters was added for it and syncs, at 32 bits."
+                    : " at no extra sync cost.") +
+                " ScaleModified flips at 1% off.");
+        }
+
+        static AnimatorControllerParameter[] AppendScratch(AnimatorControllerParameter[] parameters, string name)
+        {
+            if (parameters.Any(p => p.name == name))
+            {
+                return parameters;
+            }
+            var list = parameters.ToList();
+            list.Add(new AnimatorControllerParameter
+            {
+                name = name,
+                type = AnimatorControllerParameterType.Float,
+                defaultFloat = 0f
+            });
+            return list.ToArray();
+        }
+
+        internal static void FeedGameParametersForTest(AnimatorController master, BridgeContext ctx)
+        {
+            CreateParameterStreams(master, ctx);
+            FeedVelocityMagnitude(master, ctx);
+            FeedGestureWeights(master, ctx);
+        }
+
+        static void FeedVelocityMagnitude(AnimatorController master, BridgeContext ctx)
+        {
+            AnimatorControllerParameter target = null;
+            foreach (var p in master.parameters)
+            {
+                if (p.name.TrimStart('#') == "VelocityMagnitude")
+                {
+                    target = p;
+                    break;
+                }
+            }
+            if (target == null)
+            {
+                return;
+            }
+
+            // The driver reads the native components and one scratch cell; declare what the
+            // avatar didn't. The natives are Floats the client feeds by exact name.
+            var parameters = master.parameters.ToList();
+            void Ensure(string name)
+            {
+                if (parameters.All(p => p.name != name))
+                {
+                    parameters.Add(new AnimatorControllerParameter
+                    {
+                        name = name,
+                        type = AnimatorControllerParameterType.Float,
+                        defaultFloat = 0f
+                    });
+                }
+            }
+            const string Scratch = "#VelocityMagnitudeCalc";
+            Ensure("VelocityX");
+            Ensure("VelocityY");
+            Ensure("VelocityZ");
+            Ensure(Scratch);
+            master.parameters = parameters.ToArray();
+
+            AnimatorDriverTask Task(string targetName, AnimatorDriverTask.Operator op,
+                string aParam, string bParam, float bStatic = 0f)
+            {
+                var task = new AnimatorDriverTask
+                {
+                    targetType = AnimatorDriverTask.ParameterType.Float,
+                    targetName = targetName,
+                    op = op,
+                    aType = AnimatorDriverTask.SourceType.Parameter,
+                    aParamType = AnimatorDriverTask.ParameterType.Float,
+                    aName = aParam
+                };
+                if (bParam != null)
+                {
+                    task.bType = AnimatorDriverTask.SourceType.Parameter;
+                    task.bParamType = AnimatorDriverTask.ParameterType.Float;
+                    task.bName = bParam;
+                }
+                else
+                {
+                    task.bType = AnimatorDriverTask.SourceType.Static;
+                    task.bValue = bStatic;
+                }
+                return task;
+            }
+
+            // A 1/60 s clip targeting an undeclared parameter. It gives
+            // the state a length, so the exit-time self-transition
+            // cycles and the enter tasks re-run.
+            var tick = new AnimationClip { name = "VelocityMagnitude Tick" };
+            tick.SetCurve("", typeof(Animator), Scratch + "Tick", AnimationCurve.Constant(0f, 1f / 60f, 0f));
+
+            var machine = new AnimatorStateMachine
+            {
+                name = "VelocityMagnitude Feed",
+                hideFlags = HideFlags.HideInHierarchy
+            };
+            var state = machine.AddState("Recompute");
+            state.writeDefaultValues = false;
+            state.motion = tick;
+            machine.defaultState = state;
+
+            var loop = state.AddTransition(state);
+            loop.hasExitTime = true;
+            loop.exitTime = 1f;
+            loop.hasFixedDuration = true;
+            loop.duration = 0f;
+
+            var driver = state.AddStateMachineBehaviour<AnimatorDriver>();
+            driver.localOnly = false; // remote copies must compute too, their VelocityX/Y/Z are fed
+            driver.EnterTasks.Add(Task(Scratch, AnimatorDriverTask.Operator.Multiplication, "VelocityX", "VelocityX"));
+            driver.EnterTasks.Add(Task(target.name, AnimatorDriverTask.Operator.Multiplication, "VelocityY", "VelocityY"));
+            driver.EnterTasks.Add(Task(Scratch, AnimatorDriverTask.Operator.Addition, Scratch, target.name));
+            driver.EnterTasks.Add(Task(target.name, AnimatorDriverTask.Operator.Multiplication, "VelocityZ", "VelocityZ"));
+            driver.EnterTasks.Add(Task(Scratch, AnimatorDriverTask.Operator.Addition, Scratch, target.name));
+            driver.EnterTasks.Add(Task(target.name, AnimatorDriverTask.Operator.Power, Scratch, null, 0.5f));
+
+            var layers = master.layers.ToList();
+            layers.Add(new AnimatorControllerLayer
+            {
+                name = "VelocityMagnitude Feed",
+                defaultWeight = 1f,
+                stateMachine = machine
+            });
+            master.layers = layers.ToArray();
+
+            ctx.Report.Converted(Category, $"\"{target.name}\" computed from the native velocity",
+                "From VelocityX/Y/Z on every client, local and free.");
+        }
+
+        // Fist weight follows whatever closes the fist (grip on most controllers, trigger on Index
+        // and Vive), as CVR's gesture float does. From the trigger stream, a grip fist read 0.
+        static void FeedGestureWeights(AnimatorController master, BridgeContext ctx)
+        {
+            var weights = master.parameters
+                .Where(p => p.type == AnimatorControllerParameterType.Float
+                            && GestureMap.GestureWeightParameters.Contains(p.name.TrimStart('#')))
+                .Select(p => p.name)
+                .ToList();
+            if (weights.Count == 0)
+            {
+                return;
+            }
+            if (!TryOperator(out var moreThan, "MoreThan", "MoreThen")
+                || !TryOperator(out var lessThan, "LessThan", "LessThen"))
+            {
+                ctx.Report.Warning(Category, "Gesture weights left at 0",
+                    "This CCK's Animator Driver has no comparison operators, so GestureLeftWeight/RightWeight keep their defaults.");
+                return;
+            }
+
+            var parameters = master.parameters.ToList();
+            void Ensure(string name)
+            {
+                if (parameters.All(p => p.name != name))
+                {
+                    parameters.Add(new AnimatorControllerParameter
+                    {
+                        name = name,
+                        type = AnimatorControllerParameterType.Float,
+                        defaultFloat = 0f
+                    });
+                }
+            }
+
+            AnimatorDriverTask Task(string targetName, AnimatorDriverTask.Operator op,
+                string aParam, string bParam, float bStatic = 0f)
+            {
+                var task = new AnimatorDriverTask
+                {
+                    targetType = AnimatorDriverTask.ParameterType.Float,
+                    targetName = targetName,
+                    op = op,
+                    aType = AnimatorDriverTask.SourceType.Parameter,
+                    aParamType = AnimatorDriverTask.ParameterType.Float,
+                    aName = aParam
+                };
+                if (bParam != null)
+                {
+                    task.bType = AnimatorDriverTask.SourceType.Parameter;
+                    task.bParamType = AnimatorDriverTask.ParameterType.Float;
+                    task.bName = bParam;
+                }
+                else
+                {
+                    task.bType = AnimatorDriverTask.SourceType.Static;
+                    task.bValue = bStatic;
+                }
+                return task;
+            }
+
+            var tick = new AnimationClip { name = "Gesture Weight Tick" };
+            tick.SetCurve("", typeof(Animator), "#GestureWeightTick", AnimationCurve.Constant(0f, 1f / 60f, 0f));
+
+            var machine = new AnimatorStateMachine
+            {
+                name = "Gesture Weight Feed",
+                hideFlags = HideFlags.HideInHierarchy
+            };
+            var state = machine.AddState("Recompute");
+            state.writeDefaultValues = false;
+            state.motion = tick;
+            machine.defaultState = state;
+
+            var loop = state.AddTransition(state);
+            loop.hasExitTime = true;
+            loop.exitTime = 1f;
+            loop.hasFixedDuration = true;
+            loop.duration = 0f;
+
+            var driver = state.AddStateMachineBehaviour<AnimatorDriver>();
+            driver.localOnly = false; // remote copies receive the gesture float, so they compute it too
+            foreach (string w in weights)
+            {
+                string bare = w.TrimStart('#');
+                string g = bare.Replace("Weight", "");
+                string s = "#" + bare + "Calc";
+                Ensure(g);
+                Ensure(s);
+                // W = G + S * (1 - G), S = 1 outside the fist's 0 to 1: VRChat gives 1 in any other pose.
+                driver.EnterTasks.Add(Task(s, moreThan, g, null, 1f));
+                driver.EnterTasks.Add(Task(w, lessThan, g, null, 0f));
+                driver.EnterTasks.Add(Task(s, AnimatorDriverTask.Operator.Addition, s, w));
+                driver.EnterTasks.Add(Task(w, AnimatorDriverTask.Operator.Multiplication, g, null, -1f));
+                driver.EnterTasks.Add(Task(w, AnimatorDriverTask.Operator.Addition, w, null, 1f));
+                driver.EnterTasks.Add(Task(w, AnimatorDriverTask.Operator.Multiplication, s, w));
+                driver.EnterTasks.Add(Task(w, AnimatorDriverTask.Operator.Addition, w, g));
+                ctx.Report.Converted(Category, $"\"{w}\" follows the fist's own squeeze",
+                    $"Worked out on every copy from \"{g}\", which ChilloutVR fills from the grip on most " +
+                    "controllers and the trigger on Index and Vive, as VRChat does. Needs no sync.");
+            }
+            master.parameters = parameters.ToArray();
+
+            var layers = master.layers.ToList();
+            layers.Add(new AnimatorControllerLayer
+            {
+                name = "Gesture Weight Feed",
+                defaultWeight = 1f,
+                stateMachine = machine
+            });
+            master.layers = layers.ToArray();
+        }
+
+        internal static string SanitizeParameterName(string source)
+        {
+            var parts = System.Text.RegularExpressions.Regex
+                .Split(source ?? "", "[^A-Za-z0-9]+")
+                .Where(p => p.Length > 0)
+                .Select(p => char.ToUpperInvariant(p[0]) + p.Substring(1));
+            string result = string.Concat(parts);
+            if (string.IsNullOrEmpty(result))
+            {
+                result = "Param";
+            }
+            if (char.IsDigit(result[0]))
+            {
+                result = "P" + result;
+            }
+            return result;
+        }
+
+        static UnityEngine.Object RehomeReferencedAsset(UnityEngine.Object value, BridgeContext ctx,
+            Dictionary<UnityEngine.Object, UnityEngine.Object> done)
+        {
+            if (value == null)
+            {
+                return value;
+            }
+            if (done.TryGetValue(value, out var already))
+            {
+                return already;
+            }
+            // Through the scene pass's map, so a material both renderers and a swap clip name
+            // becomes one copy, not Body.mat and Body 1.mat.
+            if (SceneAssetRehomer.TryRehome(ctx, value, out var shared))
+            {
+                done[value] = shared;
+                if (shared != value)
+                {
+                    ReportRehomed(ctx, value);
+                }
+                return shared;
+            }
+
+            string source = AssetDatabase.GetAssetPath(value);
+            if (string.IsNullOrEmpty(source) || !IsDoomedGeneratedPath(source))
+            {
+                done[value] = value;
+                return value; // a permanent project asset, leave it where it is
+            }
+
+            string dir = ctx.OutputDir.TrimEnd('/') + "/RehomedAssets";
+            if (!AssetDatabase.IsValidFolder(dir))
+            {
+                AssetDatabase.CreateFolder(ctx.OutputDir.TrimEnd('/'), "RehomedAssets");
+            }
+            UnityEngine.Object copy = value;
+            if (AssetDatabase.IsMainAsset(value))
+            {
+                string target = OutputAssetPaths.Claim(
+                    dir + "/" + System.IO.Path.GetFileName(source));
+                if (AssetDatabase.CopyAsset(source, target))
+                {
+                    AssetDatabase.ImportAsset(target, ImportAssetOptions.ForceSynchronousImport);
+                    copy = AssetDatabase.LoadAssetAtPath(target, value.GetType()) ?? value;
+                }
+            }
+            else
+            {
+                // Embedded in something else. Clone the object itself,
+                // not its whole container.
+                var clone = UnityEngine.Object.Instantiate(value);
+                clone.name = value.name;
+                string extension = value is AnimationClip ? ".anim" : ".asset";
+                string target = OutputAssetPaths.Claim(
+                    dir + "/" + SanitizeFileName(value.name) + extension);
+                AssetDatabase.CreateAsset(clone, target);
+                copy = clone;
+            }
+
+            done[value] = copy;
+            if (copy != value)
+            {
+                ReportRehomed(ctx, value);
+            }
+            return copy;
+        }
+
+        // Per asset: the scene pass reports only when a renderer wore temp, so a copy made for a
+        // clip alone would otherwise go unmentioned.
+        static void ReportRehomed(BridgeContext ctx, UnityEngine.Object value) =>
+            ctx.Report.Converted("Assets", $"Re-homed \"{value.name}\" out of temp",
+                "An animation clip assigns this, which is a reference the clip copy alone " +
+                "doesn't rescue: VRCFury's next build would delete it and the clip would " +
+                "assign nothing.");
+
+        static void RehomeVolatileAssets(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            var clipMap = new Dictionary<AnimationClip, AnimationClip>();
+            var volatileAssets = new Dictionary<UnityEngine.Object, UnityEngine.Object>();
+
+            bool IsVolatile(UnityEngine.Object obj)
+            {
+                if (obj == null)
+                {
+                    return false;
+                }
+                // A Fury bake that errors partway leaves clips DontSave;
+                // Unity refuses those at save time and references dangle.
+                if ((obj.hideFlags & HideFlags.DontSave) != 0)
+                {
+                    return true;
+                }
+                // In-memory objects are embedded by the saver; counting them re-cloned every generated clip.
+                string path = AssetDatabase.GetAssetPath(obj);
+                return !string.IsNullOrEmpty(path) && IsDoomedGeneratedPath(path);
+            }
+
+            var scannedInMemory = new HashSet<AnimationClip>();
+            // Log only: where this step's time goes on a big VRCFury avatar.
+            System.Diagnostics.Stopwatch walkClock = System.Diagnostics.Stopwatch.StartNew(), copyClock = new System.Diagnostics.Stopwatch(),
+                refClock = new System.Diagnostics.Stopwatch(), assetClock = new System.Diagnostics.Stopwatch();
+            int scans = 0, keyCount = 0;
+            var byKind = new Dictionary<string, long>();
+            AnimationClip RehomeClip(AnimationClip clip)
+            {
+                if (clip == null)
+                {
+                    return clip;
+                }
+                if (!IsVolatile(clip))
+                {
+                    // Kept, but its keys still need rescuing: a renamed
+                    // parameter's clone of a temp clip swaps temp materials.
+                    if (!AssetDatabase.Contains(clip) && scannedInMemory.Add(clip))
+                    {
+                        RehomeClipReferences(clip);
+                    }
+                    return clip;
+                }
+                if (!clipMap.TryGetValue(clip, out var clone))
+                {
+                    copyClock.Start();
+                    clone = UnityEngine.Object.Instantiate(clip);
+                    copyClock.Stop();
+                    clone.name = clip.name;
+                    // The whole point of the clone is that it CAN persist; a copied DontSave flag
+                    // would recreate exactly the amputation this exists to prevent.
+                    clone.hideFlags = HideFlags.None;
+                    clipMap[clip] = clone;
+                    RehomeClipReferences(clone);
+                }
+                return clone;
+            }
+
+            // A material-swap clip's reference still points into Fury's temp: magenta on use.
+            void RehomeClipReferences(AnimationClip clone)
+            {
+                scans++;
+                bool outer = !refClock.IsRunning;
+                refClock.Start();
+                try { RehomeReferences(clone); }
+                finally { if (outer) refClock.Stop(); }
+            }
+
+            void RehomeReferences(AnimationClip clone)
+            {
+                foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clone))
+                {
+                    var keys = AnimationUtility.GetObjectReferenceCurve(clone, binding);
+                    if (keys == null)
+                    {
+                        continue;
+                    }
+                    bool changed = false;
+                    for (int i = 0; i < keys.Length; i++)
+                    {
+                        long was = assetClock.ElapsedMilliseconds;
+                        assetClock.Start();
+                        var rescued = RehomeReferencedAsset(keys[i].value, ctx, volatileAssets);
+                        assetClock.Stop();
+                        string kind = keys[i].value == null ? "none" : keys[i].value.GetType().Name;
+                        byKind[kind] = (byKind.TryGetValue(kind, out long had) ? had : 0) + assetClock.ElapsedMilliseconds - was;
+                        keyCount++;
+                        if (rescued != keys[i].value)
+                        {
+                            keys[i].value = rescued;
+                            changed = true;
+                        }
+                    }
+                    if (changed)
+                    {
+                        AnimationUtility.SetObjectReferenceCurve(clone, binding, keys);
+                    }
+                }
+            }
+
+            var treeMap = new Dictionary<BlendTree, BlendTree>();
+
+            Motion RehomeMotion(Motion motion)
+            {
+                if (motion is AnimationClip clip)
+                {
+                    return RehomeClip(clip);
+                }
+                if (motion is BlendTree tree)
+                {
+                    // Cloned, not repaired in place: nothing may reference Fury's temp folder.
+                    if (IsVolatile(tree))
+                    {
+                        if (!treeMap.TryGetValue(tree, out var cloneTree))
+                        {
+                            cloneTree = new BlendTree
+                            {
+                                name = tree.name,
+                                blendType = tree.blendType,
+                                blendParameter = tree.blendParameter,
+                                blendParameterY = tree.blendParameterY,
+                                hideFlags = HideFlags.HideInHierarchy
+                            };
+                            treeMap[tree] = cloneTree;
+                            // Same threshold discipline as AnimatorDeepCopier.
+                            // Unity clamps child thresholds into [min,max]
+                            // on assignment, and manual trees ship 0/0.
+                            cloneTree.useAutomaticThresholds = false;
+                            if (tree.useAutomaticThresholds)
+                            {
+                                cloneTree.minThreshold = tree.minThreshold;
+                                cloneTree.maxThreshold = tree.maxThreshold;
+                            }
+                            var kids = tree.children;
+                            for (int i = 0; i < kids.Length; i++)
+                            {
+                                kids[i].motion = RehomeMotion(kids[i].motion);
+                            }
+                            cloneTree.children = kids;
+                            if (tree.useAutomaticThresholds)
+                            {
+                                cloneTree.useAutomaticThresholds = true;
+                            }
+                        }
+                        return cloneTree;
+                    }
+
+                    var children = tree.children;
+                    for (int i = 0; i < children.Length; i++)
+                    {
+                        children[i].motion = RehomeMotion(children[i].motion);
+                    }
+                    tree.children = children;
+                }
+                return motion;
+            }
+
+            // Every layer: any can reference a Fury temp motion, which the temp wipe kills.
+            SceneAssetRehomer.Batched(ctx, () =>
+            {
+                foreach (var layer in master.layers)
+                {
+                    WalkMachines(layer.stateMachine, machine =>
+                    {
+                        foreach (var child in machine.states)
+                        {
+                            child.state.motion = RehomeMotion(child.state.motion);
+                        }
+                    });
+                }
+            });
+
+            Debug.Log($"[AvatarBridge] Rehome steps (ms): walk {walkClock.ElapsedMilliseconds}, clip copies {copyClock.ElapsedMilliseconds} " +
+                      $"({clipMap.Count}), reference scans {refClock.ElapsedMilliseconds} ({scans} clips), " +
+                      $"of them rescuing assets {assetClock.ElapsedMilliseconds} ({keyCount} keys, {volatileAssets.Count} assets: " +
+                      string.Join(", ", byKind.Select(k => $"{k.Key} {k.Value}")) + ")");
+            var layers = master.layers;
+            int rehomedMasks = 0;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                var mask = layers[i].avatarMask;
+                if (mask != null && IsVolatile(mask))
+                {
+                    var clone = UnityEngine.Object.Instantiate(mask);
+                    clone.name = mask.name;
+                    layers[i].avatarMask = clone;
+                    rehomedMasks++;
+                }
+            }
+            if (rehomedMasks > 0)
+            {
+                master.layers = layers;
+            }
+
+            if (clipMap.Count > 0 || rehomedMasks > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Re-homed {BridgeElements.Count(clipMap.Count, "clip", "clips")} and {BridgeElements.Count(rehomedMasks, "mask", "masks")} out of VRCFury's temp assets",
+                    "Fury deletes Packages/com.vrcfury.temp on its next build; without copies, motions would turn to 'None'.");
+            }
+        }
+
+        static void ReconcileAasInputTypes(AnimatorController master, BridgeContext ctx)
+        {
+            var types = new Dictionary<string, AnimatorControllerParameterType>();
+            foreach (var param in master.parameters)
+            {
+                types[param.name] = param.type;
+            }
+
+            int retyped = 0;
+            foreach (var entry in ctx.CvrAvatar.avatarSettings.settings)
+            {
+                if (entry.setting == null || string.IsNullOrEmpty(entry.machineName))
+                {
+                    continue;
+                }
+                if (!types.TryGetValue(entry.machineName, out var animatorType))
+                {
+                    continue;
+                }
+                ABI.CCK.Scripts.CVRAdvancesAvatarSettingBase.ParameterType desired;
+                switch (animatorType)
+                {
+                    case AnimatorControllerParameterType.Int:
+                        desired = ABI.CCK.Scripts.CVRAdvancesAvatarSettingBase.ParameterType.Int;
+                        break;
+                    case AnimatorControllerParameterType.Bool:
+                        desired = ABI.CCK.Scripts.CVRAdvancesAvatarSettingBase.ParameterType.Bool;
+                        break;
+                    default:
+                        desired = ABI.CCK.Scripts.CVRAdvancesAvatarSettingBase.ParameterType.Float;
+                        break;
+                }
+                if (entry.setting.usedType != desired)
+                {
+                    entry.setting.usedType = desired;
+                    retyped++;
+                }
+            }
+            if (retyped > 0)
+            {
+                EditorUtility.SetDirty(ctx.CvrAvatar);
+                ctx.Report.Converted(Category, $"{BridgeElements.Count(retyped, "menu entry", "menu entries")} retyped to match animator parameters",
+                    "Prevents dead toggles when VRCFury bakes bool parameters as floats.");
+            }
+        }
+
+        static readonly HashSet<string> MuscleCurveNames = new HashSet<string>(HumanTrait.MuscleName.Select(name =>
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(name, @"^(Left|Right) (Thumb|Index|Middle|Ring|Little) (.*)$");
+            return match.Success ? $"{match.Groups[1].Value}Hand.{match.Groups[2].Value}.{match.Groups[3].Value}" : name;
+        }));
+
+        static bool IsFingerCurve(string property) => property.Contains("Hand.");
+
+        static bool IsRootCurve(string property) =>
+            property.StartsWith("RootT") || property.StartsWith("RootQ") ||
+            property.StartsWith("MotionT") || property.StartsWith("MotionQ");
+
+        static void InspectLayerCurves(AnimatorControllerLayer layer, out bool body, out bool fingers)
+        {
+            bool foundBody = false, foundFingers = false;
+            WalkMachines(layer.stateMachine, machine =>
+            {
+                foreach (var child in machine.states)
+                {
+                    foreach (var clip in CollectClips(child.state.motion))
+                    {
+                        foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                        {
+                            if (binding.type != typeof(Animator) || !string.IsNullOrEmpty(binding.path))
+                            {
+                                continue;
+                            }
+                            if (IsRootCurve(binding.propertyName))
+                            {
+                                foundBody = true;
+                            }
+                            else if (MuscleCurveNames.Contains(binding.propertyName))
+                            {
+                                if (IsFingerCurve(binding.propertyName)) { foundFingers = true; } else { foundBody = true; }
+                            }
+                        }
+                    }
+                }
+            });
+            body = foundBody;
+            fingers = foundFingers;
+        }
+
+        static void MaskMergedLayers(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            // By machine, not name: vrcLayers are detached copies, and
+            // ToggleNativizer renames toggle layers after the merge.
+            var vrcMachines = new HashSet<AnimatorStateMachine>(vrcLayers.Select(l => l.stateMachine));
+            var layers = master.layers;
+            int masked = 0, handed = 0, stripped = 0;
+            var maskedBaseBody = new SortedSet<string>(StableSampleOrder.Instance);
+            var maskedFxBody = new SortedSet<string>(StableSampleOrder.Instance);
+            var noMuscles = new Dictionary<AvatarMask, AvatarMask>();
+
+            foreach (var layer in layers)
+            {
+                if (!vrcMachines.Contains(layer.stateMachine))
+                {
+                    continue;
+                }
+                bool fxLayer = FxMachines.Contains(layer.stateMachine);
+                if (layer.avatarMask != null)
+                {
+                    // An authored mask that lets the body through changes nothing on FX: VRChat
+                    // never applied the pose either way. Its transforms stay as written.
+                    if (fxLayer && MaskReachesBody(layer.avatarMask))
+                    {
+                        InspectLayerCurves(layer, out bool posed, out _);
+                        if (posed)
+                        {
+                            var mask = layer.avatarMask;
+                            if (!noMuscles.TryGetValue(mask, out var copy))
+                            {
+                                noMuscles[mask] = copy = WithoutMuscles(mask);
+                            }
+                            layer.avatarMask = copy;
+                            maskedFxBody.Add(layer.name);
+                            stripped++;
+                        }
+                    }
+                    continue;
+                }
+                InspectLayerCurves(layer, out bool body, out bool fingers);
+                // [Base] is masked even when it animates the body: above CVR's Locomotion/Emotes
+                // on Override at weight 1 it could only replace locomotion. FX too: VRChat's FX
+                // cannot drive muscles, and unmasked here a pose held the body and root curves
+                // pinned it into the floor. By machine, as toggle layers are renamed later.
+                bool baseLayer = layer.name.StartsWith("[Base]", StringComparison.Ordinal);
+                if (body && !baseLayer && !fxLayer)
+                {
+                    continue; // deliberate body animation; reported separately
+                }
+                if (body)
+                {
+                    (fxLayer ? maskedFxBody : maskedBaseBody).Add(layer.name);
+                }
+                // Fingers too: they never moved in VRChat's FX, and would overwrite the gesture pose.
+                layer.avatarMask = GetNoMuscleMask(ctx);
+                masked++;
+                if (fingers)
+                {
+                    handed++;
+                }
+            }
+
+            if (masked == 0 && stripped == 0)
+            {
+                return;
+            }
+            master.layers = layers;
+            if (masked > 0)
+            {
+                ctx.Report.Converted(Category, $"{BridgeElements.Count(masked, "merged layer", "merged layers")} masked off the humanoid rig",
+                    "FX could not move the body in VRChat. Toggles, blendshapes and materials are unaffected." +
+                    (handed > 0 ? $" {handed} had finger curves, blocked so gestures still work." : ""));
+            }
+
+            if (maskedBaseBody.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(maskedBaseBody.Count, "\"Base / locomotion\" layer", "\"Base / locomotion\" layers")} blocked from driving the body",
+                    $"{string.Join(", ", maskedBaseBody)}: above ChilloutVR's locomotion they would replace it. " +
+                    "Everything else in them still converts. Clearing a layer's mask lets it drive the body and " +
+                    "stops the stances.");
+            }
+            if (maskedFxBody.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(maskedFxBody.Count, "FX layer", "FX layers")} kept off the body, as in VRChat",
+                    $"{string.Join(", ", maskedFxBody.Take(6))}{(maskedFxBody.Count > 6 ? ", …" : "")}: their animations " +
+                    "pose the body, which VRChat's FX layer never applies. Unmasked, they would hold the avatar in " +
+                    "that pose over its locomotion. Toggles and blendshapes in them still work; one that also " +
+                    "swaps materials across several slots gets its own warning.");
+            }
+        }
+
+        static void UnmaskObjectSwapLayers(AnimatorController master, BridgeContext ctx)
+        {
+            var layers = master.layers;
+            var freed = new SortedSet<string>(StableSampleOrder.Instance);
+            var authored = new SortedSet<string>(StableSampleOrder.Instance);
+            var conflicted = new SortedSet<string>(StableSampleOrder.Instance);
+            bool changed = false;
+            foreach (var layer in layers)
+            {
+                if (layer.avatarMask == null || !LayerSwapsObjectReferences(layer))
+                {
+                    continue;
+                }
+                if (!layer.avatarMask.name.StartsWith("AvatarBridge_", StringComparison.Ordinal))
+                {
+                    authored.Add(layer.name);
+                    continue;
+                }
+                InspectLayerCurves(layer, out bool body, out bool fingers);
+                if (body || fingers)
+                {
+                    // Unmasked, its humanoid curves would drive the rig; clips are shared, so not edited.
+                    conflicted.Add(layer.name);
+                    continue;
+                }
+                layer.avatarMask = null;
+                freed.Add(layer.name);
+                changed = true;
+            }
+            if (changed)
+            {
+                master.layers = layers;
+            }
+            if (freed.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(freed.Count, "material-swap layer", "material-swap layers")} unmasked so every slot applies",
+                    $"{string.Join(", ", freed)}: a masked layer silently applies only the first material " +
+                    "slot of a swap in game, so these keep no mask. They drive no muscles, so locomotion " +
+                    "and hand gestures are unaffected.");
+            }
+            if (authored.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(authored.Count, "layer swaps", "layers swap")} materials from behind a mask you authored",
+                    $"{string.Join(", ", authored)}: with an avatar mask on the layer, only the first " +
+                    "material slot of a swap applies in game. If a swap from one of these layers misses " +
+                    "slots, remove the layer's mask in the Animator window and reconvert.");
+            }
+            if (conflicted.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(conflicted.Count, "layer both swaps materials and animates", "layers both swap materials and animate")} the rig",
+                    $"{string.Join(", ", conflicted)}: masked, so only a swap's first material slot applies. " +
+                    "Move a swap that misses slots into a layer of its own.");
+            }
+        }
+
+        static bool LayerSwapsObjectReferences(AnimatorControllerLayer layer)
+        {
+            if (layer.stateMachine == null)
+            {
+                return false;
+            }
+            bool found = false;
+            WalkMachines(layer.stateMachine, machine =>
+            {
+                foreach (var child in machine.states)
+                {
+                    if (found || child.state == null)
+                    {
+                        continue;
+                    }
+                    foreach (var clip in CollectClips(child.state.motion))
+                    {
+                        if (AnimationUtility.GetObjectReferenceCurveBindings(clip).Length > 0)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            });
+            return found;
+        }
+
+        internal static void AuditHandPoseConflictsForTest(AnimatorController master, BridgeContext ctx)
+            => AuditHandPoseConflicts(master, ctx);
+
+        static void AuditHandPoseConflicts(AnimatorController master, BridgeContext ctx)
+        {
+            // Even when the gesture layer converts: a layer above the promoted hand layers can
+            // overwrite their fingers. VRChat's FX never shows this, as it cannot drive muscles.
+            var layers = master.layers;
+            int handTop = -1;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                if (AvatarFeatureDetect.IsHandLayer(layers[i].name))
+                {
+                    handTop = i;
+                }
+            }
+            if (handTop < 0)
+            {
+                return;
+            }
+
+            var repaired = new List<string>();
+            var warned = new List<string>();
+            bool changed = false;
+            // A weight-gated layer sits at 0 here, and ReviveWeightGatedLayers raises it to 1
+            // later. Judge it at the weight it will play at.
+            var raised = RaisedLayerMachines();
+            for (int i = handTop + 1; i < layers.Length; i++)
+            {
+                var layer = layers[i];
+                var mask = layer.avatarMask;
+                if ((layer.defaultWeight <= 0f && !raised.Contains(layer.stateMachine))
+                    || layer.blendingMode != AnimatorLayerBlendingMode.Override)
+                {
+                    continue;
+                }
+                if (mask != null
+                    && !mask.GetHumanoidBodyPartActive(AvatarMaskBodyPart.LeftFingers)
+                    && !mask.GetHumanoidBodyPartActive(AvatarMaskBodyPart.RightFingers))
+                {
+                    continue; // already cannot reach fingers
+                }
+                InspectLayerCurves(layer, out bool body, out bool fingers);
+                if (body)
+                {
+                    // A layer that deliberately drives the body.
+                    // Stripping its fingers is the user's call, not the tool's.
+                    warned.Add(layer.name);
+                    continue;
+                }
+                if (mask == null)
+                {
+                    // No mask: add one only if the layer really animates fingers.
+                    if (!fingers)
+                    {
+                        continue;
+                    }
+                    layer.avatarMask = GetNoFingersMask(ctx);
+                    repaired.Add(layer.name);
+                    changed = true;
+                    continue;
+                }
+                var stripped = new AvatarMask { name = mask.name + "_NoFingers" };
+                for (int part = 0; part < (int)AvatarMaskBodyPart.LastBodyPart; part++)
+                {
+                    var bodyPart = (AvatarMaskBodyPart)part;
+                    stripped.SetHumanoidBodyPartActive(bodyPart,
+                        bodyPart != AvatarMaskBodyPart.LeftFingers
+                        && bodyPart != AvatarMaskBodyPart.RightFingers
+                        && mask.GetHumanoidBodyPartActive(bodyPart));
+                }
+                stripped.transformCount = mask.transformCount;
+                for (int t = 0; t < mask.transformCount; t++)
+                {
+                    stripped.SetTransformPath(t, mask.GetTransformPath(t));
+                    stripped.SetTransformActive(t, mask.GetTransformActive(t));
+                }
+                layer.avatarMask = stripped;
+                repaired.Add(layer.name);
+                changed = true;
+            }
+
+            if (changed)
+            {
+                master.layers = layers;
+            }
+            if (repaired.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(repaired.Count, "layer", "layers")} above the hand-pose layers stopped from overwriting gestures",
+                    $"{string.Join(", ", repaired.Take(6))}{(repaired.Count > 6 ? ", …" : "")}: fingers masked " +
+                    "off, so gestures are not overwritten. Nothing else changed.");
+            }
+            if (warned.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(warned.Count, "body layer", "body layers")} above the hand-pose layers can write finger muscles",
+                    $"{string.Join(", ", warned.Take(6))}{(warned.Count > 6 ? ", …" : "")}: left alone. If gestures " +
+                    "don't move your fingers, mask fingers off these.");
+            }
+        }
+
+        static void HoistContestedTreeToggles(AnimatorController master, BridgeContext ctx)
+        {
+            var hoisted = new List<string>();
+            int liftedHere = 0;
+
+            // Lifted layers are inserted right above their source and
+            // skipped by the step, so the loop never revisits one.
+            for (int li = 0; li < master.layers.Length; li += 1 + liftedHere)
+            {
+                liftedHere = 0;
+                var layer = master.layers[li];
+                if (layer?.stateMachine == null || IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+
+                var directStates = new List<AnimatorState>();
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state?.motion is BlendTree bt && bt.blendType == BlendTreeType.Direct)
+                        {
+                            directStates.Add(child.state);
+                        }
+                    }
+                });
+                if (directStates.Count == 0)
+                {
+                    continue;
+                }
+
+                // What the layer animates OUTSIDE the toggle-shaped children, so a binding shared
+                // with a radial or a gesture state never triggers a hoist.
+                var candidates = new List<ToggleTree>();
+                var seen = new HashSet<BlendTree>();
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            CollectToggleTrees(child.state.motion, seen, candidates);
+                        }
+                    }
+                });
+                if (candidates.Count < 2)
+                {
+                    continue;   // a contest takes two
+                }
+                var toggleTrees = new HashSet<BlendTree>(candidates.Select(c => c.Tree));
+                var outside = new HashSet<EditorCurveBinding>();
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            CollectOutsideToggles(child.state.motion, toggleTrees, outside);
+                        }
+                    }
+                });
+                var usage = new Dictionary<EditorCurveBinding, int>();
+                foreach (var candidate in candidates)
+                {
+                    foreach (var binding in candidate.Floats.Concat(candidate.Objects))
+                    {
+                        usage.TryGetValue(binding, out int n);
+                        usage[binding] = n + 1;
+                    }
+                }
+
+                bool Contested(ToggleTree t) => t.Floats.Concat(t.Objects).Any(b =>
+                    usage.TryGetValue(b, out int users) && users > 1);
+                bool TouchesOutside(ToggleTree t) => t.Floats.Concat(t.Objects).Any(outside.Contains);
+
+                foreach (var state in directStates)
+                {
+                    var direct = (BlendTree)state.motion;
+                    var children = direct.children;
+                    var keep = new List<ChildMotion>();
+                    bool changed = false;
+
+                    foreach (var child in children)
+                    {
+                        var subtree = child.motion as BlendTree;
+                        var match = subtree != null
+                            ? candidates.FirstOrDefault(c => c.Tree == subtree) : default;
+                        bool restsAtFullWeight =
+                            master.parameters.Any(p => p.name == child.directBlendParameter
+                                                       && p.defaultFloat >= 1f);
+                        if (match.Tree == null || !restsAtFullWeight
+                            || !Contested(match) || TouchesOutside(match))
+                        {
+                            keep.Add(child);
+                            continue;
+                        }
+
+                        string label = ToggleTreeLabel(match.Tree, layer.name);
+                        master.AddLayer(SanitizeFileName($"{layer.name} {label}"));
+                        var all = master.layers.ToList();
+                        var lifted = all[all.Count - 1];
+                        // Right above the source: on top it would outrank unrelated layers sharing a binding.
+                        all.RemoveAt(all.Count - 1);
+                        all.Insert(li + 1 + liftedHere++, lifted);
+                        lifted.defaultWeight = 1f;
+                        lifted.blendingMode = AnimatorLayerBlendingMode.Override;
+                        lifted.avatarMask = layer.avatarMask;
+                        var home = lifted.stateMachine.AddState(SanitizeFileName(label));
+                        home.motion = match.Tree;
+                        home.writeDefaultValues = true;
+                        lifted.stateMachine.defaultState = home;
+                        master.layers = all.ToArray();
+
+                        hoisted.Add(label);
+                        changed = true;
+                    }
+                    if (changed)
+                    {
+                        direct.children = keep.ToArray();
+                        EditorUtility.SetDirty(direct);
+                    }
+                }
+            }
+
+            if (hoisted.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(hoisted.Count, "toggle that shares parts moved into its own layer", "toggles that share parts moved into their own layers")}",
+                    $"{string.Join(", ", hoisted.Take(8))}{(hoisted.Count > 8 ? ", …" : "")}: " +
+                    "in one tree they fought and stuck. With two on, the higher one decides the shared part.");
+            }
+        }
+
+        static readonly Dictionary<string, string> restoreVerdicts = new Dictionary<string, string>();
+
+        static void FillEmptyStatesWithRestoreClips(AnimatorController master, BridgeContext ctx,
+            HashSet<string> writtenPaths)
+        {
+            string dir = $"{ctx.OutputDir}/RehomedAssets";
+            restoreVerdicts.Clear();
+            int filled = 0, layersTouched = 0, reused = 0, sharedSkipped = 0, candidates = 0, routers = 0;
+            // Bindings that named something this avatar no longer has.
+            // Counted so the failure branch can say which skip fired.
+            int unresolved = 0;
+            var unresolvedPaths = new SortedSet<string>(StableSampleOrder.Instance);
+            var names = new List<string>();
+            // Layers whose empty states are structural rather than a toggle.s off half.
+            var notToggles = new SortedSet<string>(StableSampleOrder.Instance);
+
+            // master.layers returns fresh wrappers per access; snapshot once, key on unique names.
+            var layers = master.layers;
+            var indexByName = new Dictionary<string, int>();
+            for (int i = 0; i < layers.Length; i++)
+            {
+                if (!indexByName.ContainsKey(layers[i].name))
+                {
+                    indexByName[layers[i].name] = i;
+                }
+            }
+            BuildRestoreOwnership(layers, out var owner, out var allClips, out var treeDriven, out _);
+            var bindingCounts = new Dictionary<AnimationClip, (int floats, int objects)>();
+            var pending = new List<(AnimationClip clip, string path)>();
+
+            // The finished controller: ToggleNativizer renames toggle layers.
+            foreach (var layer in layers)
+            {
+                if (IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                // What this layer animates, and which of its states have nothing at all.
+                var bindings = new HashSet<EditorCurveBinding>();
+                var objectBindings = new HashSet<EditorCurveBinding>();
+                var empties = new List<AnimatorState>();
+                int stateCount = 0;
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        stateCount++;
+                        var state = child.state;
+                        if (state == null)
+                        {
+                            continue;
+                        }
+                        // A curve-less clip is an empty state. VRCFury
+                        // parks a shared empty clip rather than null.
+                        if (state.motion == null || IsCurveless(state.motion, null))
+                        {
+                            // An empty state is only an "off" state if the layer can REST in it.
+                            // A router can't be rested in and must not be given values to assert.
+                            if (!IsPassThroughState(state))
+                            {
+                                empties.Add(state);
+                            }
+                            else
+                            {
+                                routers++;
+                            }
+                            continue;
+                        }
+                        CollectBindings(state.motion, bindings, objectBindings);
+                    }
+                });
+                if (empties.Count == 0 || (bindings.Count == 0 && objectBindings.Count == 0))
+                {
+                    restoreVerdicts[layer.name] = empties.Count == 0
+                        ? "no empty state to fill (every state already holds a motion, or is a router)"
+                        : "empty state found, but the layer animates nothing to restore";
+                    continue;
+                }
+                // Two-state toggles only; in larger machines empty states are structural.
+                if (stateCount != 2)
+                {
+                    restoreVerdicts[layer.name] = $"not a two-state toggle ({stateCount} states)";
+                    notToggles.Add($"{layer.name} ({stateCount} states)");
+                    continue;
+                }
+                candidates += empties.Count;
+
+                var clip = new AnimationClip { name = SanitizeFileName($"{layer.name} restore") };
+                int curves = 0, shared = 0;
+
+                // Only the lowest of several layers restores: then every combination comes out right.
+                int here = indexByName.TryGetValue(layer.name, out int found) ? found : -1;
+                bool Owns(EditorCurveBinding binding)
+                {
+                    // Driven by another layer's tree (a sibling tree here is not running at rest).
+                    if (TreeDrivenElsewhere(treeDriven, binding, here))
+                    {
+                        return false;
+                    }
+                    // Unknown binding: nobody else claims it, so this layer may restore it.
+                    return !owner.TryGetValue(binding, out int lowest) || lowest == here;
+                }
+
+                foreach (var binding in bindings)
+                {
+                    // Humanoid muscles are masked off these layers anyway, and baking a muscle
+                    // default would fight locomotion for the whole session.
+                    if (binding.type == typeof(Animator))
+                    {
+                        continue;
+                    }
+                    if (!Owns(binding))
+                    {
+                        shared++;
+                        continue;
+                    }
+                    if (!AnimationUtility.GetFloatValue(ctx.Target, binding, out float value))
+                    {
+                        // The clip names something this avatar no longer
+                        // has. No current value, nothing to restore.
+                        unresolved++;
+                        unresolvedPaths.Add($"{binding.path}:{binding.propertyName}");
+                        continue;
+                    }
+                    AnimationUtility.SetEditorCurve(clip, binding, AnimationCurve.Constant(0f, 0f, value));
+                    curves++;
+                }
+                foreach (var binding in objectBindings)
+                {
+                    if (!Owns(binding))
+                    {
+                        shared++;
+                        continue;
+                    }
+                    if (!AnimationUtility.GetObjectReferenceValue(ctx.Target, binding, out var value))
+                    {
+                        unresolved++;
+                        unresolvedPaths.Add($"{binding.path}:{binding.propertyName}");
+                        continue;
+                    }
+                    AnimationUtility.SetObjectReferenceCurve(clip, binding,
+                        new[] { new ObjectReferenceKeyframe { time = 0f, value = value } });
+                    curves++;
+                }
+                sharedSkipped += shared;
+                if (curves == 0)
+                {
+                    restoreVerdicts[layer.name] =
+                        $"candidate refused in full: {BridgeElements.Count(shared, "property", "properties")} owned elsewhere or " +
+                        "tree-driven, the rest unresolved or parameter-typed";
+                    UnityEngine.Object.DestroyImmediate(clip);
+                    continue;
+                }
+                restoreVerdicts[layer.name] = $"filled ({BridgeElements.Count(curves, "curve", "curves")})"
+                    + (shared > 0 ? $", {shared} refused as owned elsewhere or tree-driven" : "");
+
+                // Authored clips first: they carry curves and timing a snapshot cannot know.
+                var existing = FindEquivalentClip(clip, allClips, bindingCounts);
+                if (existing != null)
+                {
+                    UnityEngine.Object.DestroyImmediate(clip);
+                    foreach (var state in empties)
+                    {
+                        state.motion = existing;
+                        filled++;
+                    }
+                    layersTouched++;
+                    restoreVerdicts[layer.name] = $"filled by reusing the avatar's own \"{existing.name}\"";
+                    names.Add($"{layer.name} (reused \"{existing.name}\")");
+                    reused++;
+                    continue;
+                }
+
+                WriteRestoreClip(clip, dir, writtenPaths, pending);
+                foreach (var state in empties)
+                {
+                    state.motion = clip;
+                    filled++;
+                }
+                layersTouched++;
+                names.Add(layer.name);
+            }
+            CreateRestoreClips(dir, pending);
+
+            if (filled == 0)
+            {
+                // Candidates but no fills is a bug here (a toggle stuck on): report it.
+                if (candidates > 0)
+                {
+                    // Say why, with the numbers that answer the question.
+                    string because =
+                        unresolved > 0 && sharedSkipped > 0
+                            ? $" {BridgeElements.Count(unresolved, "property", "properties")} named something this avatar no longer has, and " +
+                              $"{sharedSkipped} belong to a lower layer, so nothing was left to restore."
+                        : unresolved > 0
+                            ? $" Every property they animate, {unresolved} of them, names something this " +
+                              "avatar no longer has, so there was no current value to snapshot. Removing a " +
+                              "VRChat-only system takes its objects with it, and a toggle that only ever " +
+                              "moved those has nothing left to restore: " +
+                              $"{string.Join(", ", unresolvedPaths.Take(4))}" +
+                              (unresolvedPaths.Count > 4 ? $", … ({unresolvedPaths.Count} paths)" : "") + "."
+                        : sharedSkipped > 0
+                            ? $" All {sharedSkipped} of the properties they animate are claimed by a lower " +
+                              "layer, which restores them instead; see the note about several layers " +
+                              "animating one thing. If these toggles do stick, that rule is picking the " +
+                              "wrong layer and the conversion is worth reporting."
+                            : " The pass found candidates and produced nothing, with no property either " +
+                              "unresolved or claimed elsewhere, which it should not do. Please report " +
+                              "this conversion.";
+
+                    ctx.Report.Warning(Category,
+                        $"{BridgeElements.Count(candidates, "empty \"off\" state was", "empty \"off\" states were")} left without a restore animation",
+                        "Each belongs to a toggle whose off direction now depends on Write Defaults " +
+                        "putting the property back. If any of these switch on and never off again, " +
+                        "that is why." + because);
+                }
+                return;
+            }
+            // Spare everything in the shared registry, including the partial-off topping's clips.
+            int stale = DeleteStaleRestoreClips(dir, writtenPaths);
+            AssetDatabase.SaveAssets();
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(filled, "empty \"off\" state", "empty \"off\" states")} across {BridgeElements.Count(layersTouched, "layer", "layers")} given a restore animation",
+                $"{string.Join(", ", names.Take(6))}{(names.Count > 6 ? ", …" : "")}" +
+                (reused > 0
+                    ? $": {reused} of them reuse an animation the avatar ALREADY had, which is " +
+                      "preferred wherever one matches; the rest were generated. "
+                    : ": ") +
+                "ChilloutVR does not restore defaults, so each off state now holds the value at conversion " +
+                "time. Set the avatar at rest before converting." +
+                (sharedSkipped > 0 ? $" {BridgeElements.Count(sharedSkipped, "property shared by several layers is", "properties shared by several layers are")} restored by the lowest only." : "") +
+                (routers > 0 ? $" {BridgeElements.Count(routers, "pass-through state", "pass-through states")}, such as a local/remote gate, {(routers == 1 ? "stays" : "stay")} empty." : "") +
+                (stale > 0 ? $" {BridgeElements.Count(stale, "restore clip", "restore clips")} from a previous conversion deleted." : "") +
+                (notToggles.Count > 0
+                    ? $"\n\nNot a two-state toggle, left alone ({notToggles.Count}): " +
+                      $"{string.Join(", ", notToggles.Take(6))}{(notToggles.Count > 6 ? ", …" : "")}."
+                    : ""));
+        }
+
+        static bool TreeDrivenElsewhere(Dictionary<EditorCurveBinding, HashSet<int>> treeDriven,
+            EditorCurveBinding binding, int askingLayer)
+        {
+            if (!treeDriven.TryGetValue(binding, out var owning))
+            {
+                return false;
+            }
+            foreach (int layer in owning)
+            {
+                if (layer != askingLayer)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static void BuildRestoreOwnership(AnimatorControllerLayer[] layers,
+            out Dictionary<EditorCurveBinding, int> owner, out HashSet<AnimationClip> allClips,
+            out Dictionary<EditorCurveBinding, HashSet<int>> treeDriven,
+            out Dictionary<EditorCurveBinding, int> anyOwner)
+        {
+            // Locals rather than the out params directly: a lambda may not touch an out parameter,
+            // and the walk below is a lambda.
+            var owners = new Dictionary<EditorCurveBinding, int>();
+            // Every clip the avatar already has, so an authored one can be preferred over a
+            // generated one.
+            var clips = new HashSet<AnimationClip>();
+            // Tree-driven bindings: exempt from restores, as a constant fights the live tree.
+            var trees = new Dictionary<EditorCurveBinding, HashSet<int>>();
+            // Trees included: the plain-state map reads "absent" as "nobody claims it".
+            var anyOwners = new Dictionary<EditorCurveBinding, int>();
+            int layerIndex = -1;
+            foreach (var candidate in layers)
+            {
+                layerIndex++;
+                var floatsHere = new HashSet<EditorCurveBinding>();
+                var objectsHere = new HashSet<EditorCurveBinding>();
+                var anythingHere = new HashSet<EditorCurveBinding>();
+                var treesHere = new HashSet<EditorCurveBinding>();
+                // Ownership needs a reachable state; clips are still collected from library layers.
+                var onlyPlayable = LibraryDefaultState(candidate);
+                WalkMachines(candidate.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        var motion = child.state != null ? child.state.motion : null;
+                        CollectClips(motion, clips);
+                        if (motion is BlendTree)
+                        {
+                            // Trees feed the exemption and any-ownership
+                            // maps, never plain-state ownership.
+                            CollectBindings(motion, treesHere, treesHere);
+                            if (onlyPlayable == null || child.state == onlyPlayable)
+                            {
+                                CollectBindings(motion, anythingHere, anythingHere);
+                            }
+                            continue;
+                        }
+                        if (onlyPlayable == null || child.state == onlyPlayable)
+                        {
+                            CollectBindings(motion, floatsHere, objectsHere);
+                            CollectBindings(motion, anythingHere, anythingHere);
+                        }
+                    }
+                });
+                // Which layer: a sibling tree in the same layer is not running while it rests.
+                foreach (var binding in treesHere)
+                {
+                    if (!trees.TryGetValue(binding, out var owning))
+                    {
+                        trees[binding] = owning = new HashSet<int>();
+                    }
+                    owning.Add(layerIndex);
+                }
+                foreach (var binding in floatsHere.Concat(objectsHere))
+                {
+                    if (!owners.ContainsKey(binding))
+                    {
+                        owners[binding] = layerIndex;
+                    }
+                }
+                foreach (var binding in anythingHere)
+                {
+                    if (!anyOwners.ContainsKey(binding))
+                    {
+                        anyOwners[binding] = layerIndex;
+                    }
+                }
+            }
+            owner = owners;
+            allClips = clips;
+            treeDriven = trees;
+            anyOwner = anyOwners;
+        }
+
+        static AnimatorState LibraryDefaultState(AnimatorControllerLayer layer)
+        {
+            var root = layer != null ? layer.stateMachine : null;
+            if (root == null)
+            {
+                return null;
+            }
+            int states = 0, transitions = 0;
+            WalkMachines(root, machine =>
+            {
+                states += machine.states.Length;
+                transitions += machine.anyStateTransitions.Length + machine.entryTransitions.Length;
+                foreach (var child in machine.states)
+                {
+                    if (child.state != null)
+                    {
+                        transitions += child.state.transitions.Length;
+                    }
+                }
+                foreach (var sub in machine.stateMachines)
+                {
+                    if (sub.stateMachine != null)
+                    {
+                        transitions += machine.GetStateMachineTransitions(sub.stateMachine).Length;
+                    }
+                }
+            });
+            return states > 1 && transitions == 0 ? root.defaultState : null;
+        }
+
+        // A 1D blend tree shaped like a toggle: one child animates, the other is empty. Or a
+        // Slider: no child empty, but each end animates something another end does not.
+        struct ToggleTree
+        {
+            public BlendTree Tree;
+            public int EmptyIndex;
+            public bool Slider;
+            public HashSet<EditorCurveBinding> Floats;
+            public HashSet<EditorCurveBinding> Objects;
+        }
+
+        static void FillEmptyTreeSlotsWithRestoreClips(AnimatorController master, BridgeContext ctx,
+            HashSet<string> writtenPaths)
+        {
+            string dir = $"{ctx.OutputDir}/RehomedAssets";
+            int filled = 0, reused = 0, candidateCount = 0, sliders = 0;
+            var names = new List<string>();
+            var sliderNames = new List<string>();
+            var contested = new SortedSet<string>(StableSampleOrder.Instance);
+
+            var layers = master.layers;
+            var indexByName = new Dictionary<string, int>();
+            for (int i = 0; i < layers.Length; i++)
+            {
+                if (!indexByName.ContainsKey(layers[i].name))
+                {
+                    indexByName[layers[i].name] = i;
+                }
+            }
+            BuildRestoreOwnership(layers, out var owner, out var allClips, out _, out var anyOwner);
+            var bindingCounts = new Dictionary<AnimationClip, (int floats, int objects)>();
+            var pending = new List<(AnimationClip clip, string path)>();
+
+            foreach (var layer in layers)
+            {
+                if (IsProtectedLayer(layer.name))
+                {
+                    continue;
+                }
+                int here = indexByName.TryGetValue(layer.name, out int found) ? found : -1;
+
+                var candidates = new List<ToggleTree>();
+                var seen = new HashSet<BlendTree>();
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            CollectToggleTrees(child.state.motion, seen, candidates, ctx);
+                        }
+                    }
+                });
+                if (candidates.Count == 0)
+                {
+                    continue;
+                }
+                candidateCount += candidates.Count(c => !c.Slider);
+
+                // How many toggles in this layer animate each property, and what the REST of the
+                // layer animates outside them. Both have to say "only me" before anything moves.
+                var usage = new Dictionary<EditorCurveBinding, int>();
+                foreach (var candidate in candidates)
+                {
+                    foreach (var binding in candidate.Floats.Concat(candidate.Objects))
+                    {
+                        usage.TryGetValue(binding, out int n);
+                        usage[binding] = n + 1;
+                    }
+                }
+                var outside = new HashSet<EditorCurveBinding>();
+                var toggleTrees = new HashSet<BlendTree>(candidates.Select(c => c.Tree));
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            CollectOutsideToggles(child.state.motion, toggleTrees, outside);
+                        }
+                    }
+                });
+
+                foreach (var candidate in candidates)
+                {
+                    string label = ToggleTreeLabel(candidate.Tree, layer.name);
+                    bool Owns(EditorCurveBinding binding)
+                    {
+                        if (usage.TryGetValue(binding, out int users) && users > 1)
+                        {
+                            return false;
+                        }
+                        if (outside.Contains(binding))
+                        {
+                            return false;
+                        }
+                        // The any-ownership map, trees included; an unknown binding is free to restore.
+                        return !anyOwner.TryGetValue(binding, out int lowest) || lowest == here;
+                    }
+
+                    if (candidate.Slider)
+                    {
+                        // Each end on a copy: the clip may play somewhere else too.
+                        var ends = candidate.Tree.children;
+                        int changed = 0, contestedHere = 0;
+                        for (int i = 0; i < ends.Length; i++)
+                        {
+                            var own = (AnimationClip)ends[i].motion;
+                            var have = new HashSet<EditorCurveBinding>(Bindings(own));
+                            AnimationClip copy = null;
+                            foreach (var binding in candidate.Floats.Concat(candidate.Objects))
+                            {
+                                if (have.Contains(binding) || !SliderRestores(binding))
+                                {
+                                    continue;
+                                }
+                                if (!Owns(binding))
+                                {
+                                    contestedHere++;
+                                    continue;
+                                }
+                                bool isObject = candidate.Objects.Contains(binding);
+                                float value = 0f;
+                                UnityEngine.Object reference = null;
+                                if (isObject ? !AnimationUtility.GetObjectReferenceValue(ctx.Target, binding, out reference)
+                                             : !AnimationUtility.GetFloatValue(ctx.Target, binding, out value))
+                                {
+                                    continue;
+                                }
+                                if (copy == null)
+                                {
+                                    copy = UnityEngine.Object.Instantiate(own);
+                                    copy.name = SanitizeFileName($"{label} {i} at rest");
+                                }
+                                if (isObject)
+                                {
+                                    AnimationUtility.SetObjectReferenceCurve(copy, binding,
+                                        new[] { new ObjectReferenceKeyframe { time = 0f, value = reference } });
+                                }
+                                else
+                                {
+                                    AnimationUtility.SetEditorCurve(copy, binding, AnimationCurve.Constant(0f, 0f, value));
+                                }
+                            }
+                            if (copy == null)
+                            {
+                                continue;
+                            }
+                            WriteRestoreClip(copy, dir, writtenPaths, pending);
+                            ends[i].motion = copy;
+                            changed++;
+                        }
+                        if (contestedHere > 0)
+                        {
+                            contested.Add(label);
+                        }
+                        if (changed > 0)
+                        {
+                            candidate.Tree.children = ends;
+                            sliders++;
+                            sliderNames.Add(label);
+                        }
+                        continue;
+                    }
+
+                    var clip = new AnimationClip { name = SanitizeFileName($"{label} restore") };
+                    int curves = 0, shared = 0;
+                    foreach (var binding in candidate.Floats)
+                    {
+                        // Fury's AAP trees animate parameters, not the
+                        // avatar, in this same two-child shape.
+                        // Snapshotting one would pin a computed value.
+                        if (binding.type == typeof(Animator))
+                        {
+                            continue;
+                        }
+                        if (!Owns(binding))
+                        {
+                            shared++;
+                            continue;
+                        }
+                        if (!AnimationUtility.GetFloatValue(ctx.Target, binding, out float value))
+                        {
+                            continue;
+                        }
+                        AnimationUtility.SetEditorCurve(clip, binding, AnimationCurve.Constant(0f, 0f, value));
+                        curves++;
+                    }
+                    foreach (var binding in candidate.Objects)
+                    {
+                        if (!Owns(binding))
+                        {
+                            shared++;
+                            continue;
+                        }
+                        if (!AnimationUtility.GetObjectReferenceValue(ctx.Target, binding, out var value))
+                        {
+                            continue;
+                        }
+                        AnimationUtility.SetObjectReferenceCurve(clip, binding,
+                            new[] { new ObjectReferenceKeyframe { time = 0f, value = value } });
+                        curves++;
+                    }
+                    if (shared > 0)
+                    {
+                        contested.Add(label);
+                    }
+                    if (curves == 0)
+                    {
+                        UnityEngine.Object.DestroyImmediate(clip);
+                        continue;
+                    }
+
+                    // Prefer the avatar's own animation, as the state pass does.
+                    Motion restore;
+                    var existing = FindEquivalentClip(clip, allClips, bindingCounts);
+                    if (existing != null)
+                    {
+                        UnityEngine.Object.DestroyImmediate(clip);
+                        restore = existing;
+                        reused++;
+                    }
+                    else
+                    {
+                        WriteRestoreClip(clip, dir, writtenPaths, pending);
+                        restore = clip;
+                    }
+
+                    // children is a copy; the setter is what writes it back.
+                    var kids = candidate.Tree.children;
+                    kids[candidate.EmptyIndex].motion = restore;
+                    candidate.Tree.children = kids;
+                    filled++;
+                    names.Add(label);
+                }
+            }
+            CreateRestoreClips(dir, pending);
+
+            if (sliders > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(sliders, "blend-tree slider", "blend-tree sliders")} whose ends animate different things given each other's values at rest",
+                    $"{string.Join(", ", sliderNames.Take(6))}{(sliderNames.Count > 6 ? ", …" : "")}: at one end the slider " +
+                    "said nothing about what the other end changes, and ChilloutVR, which does not restore defaults, " +
+                    "could leave it wherever it last was. Each end now also holds the others' at their value at " +
+                    "conversion time. Set the avatar at rest before converting.");
+            }
+            if (filled == 0)
+            {
+                if (candidateCount > 0)
+                {
+                    ctx.Report.Warning(Category,
+                        $"{BridgeElements.Count(candidateCount, "blend-tree toggle was", "blend-tree toggles were")} left without a restore animation",
+                        "Their \"off\" halves are empty and every property is claimed elsewhere. If one sticks on " +
+                        "in game, this is why.");
+                }
+                if (sliders > 0)
+                {
+                    EditorUtility.SetDirty(master);
+                    AssetDatabase.SaveAssets();
+                }
+                return;
+            }
+            EditorUtility.SetDirty(master);
+            AssetDatabase.SaveAssets();
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(filled, "blend-tree toggle", "blend-tree toggles")} given a restore animation for their \"off\" half",
+                $"{string.Join(", ", names.Take(6))}{(names.Count > 6 ? ", …" : "")}" +
+                (reused > 0
+                    ? $": {reused} of them reuse an animation the avatar ALREADY had; the rest were generated. "
+                    : ": ") +
+                "Each empty off half now holds the value at conversion time." +
+                (contested.Count > 0
+                    ? $"\n\nShared with another toggle in the tree, left as in VRChat ({contested.Count}): " +
+                      $"{string.Join(", ", contested.Take(6))}{(contested.Count > 6 ? ", …" : "")}."
+                    : ""));
+        }
+
+        internal static void FillEmptyTreeSlotsWithRestoreClipsForTest(AnimatorController master,
+            BridgeContext ctx) => FillEmptyTreeSlotsWithRestoreClips(master, ctx, new HashSet<string>());
+
+        // With ctx, an off half animating only dead paths counts as empty too, or the shape stays
+        // where the on half left it. By path: a live material property reads as missing.
+        static void CollectToggleTrees(Motion motion, HashSet<BlendTree> seen, List<ToggleTree> into,
+            BridgeContext ctx = null)
+        {
+            if (!(motion is BlendTree tree) || !seen.Add(tree))
+            {
+                return;
+            }
+            var children = tree.children;
+            // In a selector the empty child is "none", where CVR fills no silence: it gets its
+            // siblings' properties at rest.
+            if (tree.blendType == BlendTreeType.Simple1D && children.Length >= 2)
+            {
+                int empty = -1;
+                bool multipleEmpty = false;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    if (children[i].motion == null || IsCurveless(children[i].motion, null)
+                        || AnimatesOnlyDeadPaths(children[i].motion, ctx))
+                    {
+                        // More than one empty child: there is no single "off" to repair, and the
+                        // shape is structural rather than a toggle or selector.
+                        if (empty >= 0)
+                        {
+                            multipleEmpty = true;
+                            break;
+                        }
+                        empty = i;
+                    }
+                }
+                if (empty >= 0 && !multipleEmpty)
+                {
+                    var floats = new HashSet<EditorCurveBinding>();
+                    var objects = new HashSet<EditorCurveBinding>();
+                    for (int i = 0; i < children.Length; i++)
+                    {
+                        if (i != empty)
+                        {
+                            CollectBindings(children[i].motion, floats, objects);
+                        }
+                    }
+                    if (floats.Count > 0 || objects.Count > 0)
+                    {
+                        into.Add(new ToggleTree
+                        {
+                            Tree = tree,
+                            EmptyIndex = empty,
+                            Floats = floats,
+                            Objects = objects,
+                        });
+                        return;
+                    }
+                }
+                // Unasserted ends blend against the last rebind, in CVR wherever the avatar was.
+                // Object on/off is BalanceMenuTreeActives' job. Restore pass only (ctx).
+                if (empty < 0 && ctx != null && children.All(c => c.motion is AnimationClip clip && !clip.humanMotion))
+                {
+                    var floats = new HashSet<EditorCurveBinding>();
+                    var objects = new HashSet<EditorCurveBinding>();
+                    foreach (var c in children)
+                    {
+                        CollectBindings(c.motion, floats, objects);
+                    }
+                    int all = floats.Concat(objects).Count(SliderRestores);
+                    if (children.Any(c => Bindings((AnimationClip)c.motion).Count(SliderRestores) < all))
+                    {
+                        into.Add(new ToggleTree
+                        {
+                            Tree = tree,
+                            EmptyIndex = -1,
+                            Slider = true,
+                            Floats = floats,
+                            Objects = objects,
+                        });
+                        return;
+                    }
+                }
+            }
+            foreach (var child in children)
+            {
+                CollectToggleTrees(child.motion, seen, into, ctx);
+            }
+        }
+
+        static bool SliderRestores(EditorCurveBinding b) => b.type != typeof(Animator)
+            && !(b.type == typeof(GameObject) && b.propertyName == "m_IsActive");
+
+        static IEnumerable<EditorCurveBinding> Bindings(AnimationClip clip) =>
+            AnimationUtility.GetCurveBindings(clip).Concat(AnimationUtility.GetObjectReferenceCurveBindings(clip));
+
+        // Dead: missing in the source too, or stripped. Renamed paths (RepairClipPaths) and
+        // replaced components (RewirePhysicsToggles) do not count. Hashed paths cannot be looked up.
+        static bool AnimatesOnlyDeadPaths(Motion motion, BridgeContext ctx)
+        {
+            if (ctx == null || ctx.Target == null || !(motion is AnimationClip clip) || clip.humanMotion)
+            {
+                return false;
+            }
+            var bindings = AnimationUtility.GetCurveBindings(clip)
+                .Concat(AnimationUtility.GetObjectReferenceCurveBindings(clip)).ToList();
+            if (bindings.Count == 0)
+            {
+                return false;
+            }
+            foreach (var binding in bindings)
+            {
+                if (binding.type == typeof(Animator) || IsHashedPath(binding.path)
+                    || BridgeContext.FindByAnimationPath(ctx.Target.transform, binding.path) != null
+                    || (ctx.ResolvedInSource(binding.path) && !ctx.RemovedOnPurpose(binding.path)))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static void CollectOutsideToggles(Motion motion, HashSet<BlendTree> toggles,
+            HashSet<EditorCurveBinding> into)
+        {
+            if (motion is BlendTree tree)
+            {
+                if (toggles.Contains(tree))
+                {
+                    return;
+                }
+                foreach (var child in tree.children)
+                {
+                    CollectOutsideToggles(child.motion, toggles, into);
+                }
+                return;
+            }
+            var floats = new HashSet<EditorCurveBinding>();
+            var objects = new HashSet<EditorCurveBinding>();
+            CollectBindings(motion, floats, objects);
+            into.UnionWith(floats);
+            into.UnionWith(objects);
+        }
+
+        static string ToggleTreeLabel(BlendTree tree, string layerName)
+        {
+            string name = tree != null ? tree.name : null;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                name = layerName;
+            }
+            return name.Length > 60 ? name.Substring(0, 60).TrimEnd() : name;
+        }
+
+        // Unique only against this run's registry; folder-wide stacks copies on reconversion.
+        // Reserved where Claim looks too: "{layer} {state} restore" can spell a filler's
+        // "{layer} restore", and claiming it deleted the filler's file.
+        static void WriteRestoreClip(AnimationClip clip, string dir, HashSet<string> writtenPaths,
+            List<(AnimationClip clip, string path)> pending)
+        {
+            string path = $"{dir}/{clip.name}.anim";
+            for (int n = 2; !writtenPaths.Add(path) || !OutputAssetPaths.Reserve(path); n++)
+            {
+                path = $"{dir}/{clip.name} {n}.anim";
+            }
+            pending.Add((clip, path));
+        }
+
+        // Batched: one at a time cost two refreshes per clip. Deletes first, outside the batch:
+        // CreateAsset over an existing asset leaves other states with null motions. Before the
+        // filler returns, so the controller save embeds nothing.
+        static void CreateRestoreClips(string dir, List<(AnimationClip clip, string path)> pending)
+        {
+            if (pending.Count == 0)
+            {
+                return;
+            }
+            EnsureAssetFolder(dir);
+            // Every path here was claimed or reserved case-insensitively, so no two share a file.
+            var doomed = new List<string>();
+            foreach (var (_, path) in pending)
+            {
+                if (AssetDatabase.LoadAssetAtPath<AnimationClip>(path) != null)
+                {
+                    doomed.Add(path);
+                }
+            }
+            if (doomed.Count > 0)
+            {
+                AssetDatabase.DeleteAssets(doomed.ToArray(), new List<string>());
+            }
+            AssetDatabase.StartAssetEditing();
+            try
+            {
+                foreach (var (clip, path) in pending)
+                {
+                    AssetDatabase.CreateAsset(clip, path);
+                }
+            }
+            finally
+            {
+                AssetDatabase.StopAssetEditing();
+            }
+            foreach (var (clip, path) in pending)
+            {
+                if (!AssetDatabase.Contains(clip))
+                {
+                    Debug.Log($"[AvatarBridge] Restore clip {path} did not persist from its batch");
+                }
+            }
+            pending.Clear();
+        }
+
+        // CreateFolder over a full Refresh; Refresh only without a registered parent, or when an
+        // unimported folder on disk would make "RehomedAssets 1".
+        static void EnsureAssetFolder(string dir)
+        {
+            if (AssetDatabase.IsValidFolder(dir))
+            {
+                return;
+            }
+            string parent = System.IO.Path.GetDirectoryName(dir)?.Replace('\\', '/');
+            if (!string.IsNullOrEmpty(parent) && AssetDatabase.IsValidFolder(parent)
+                && !System.IO.Directory.Exists(dir))
+            {
+                AssetDatabase.CreateFolder(parent, System.IO.Path.GetFileName(dir));
+                return;
+            }
+            System.IO.Directory.CreateDirectory(dir);
+            AssetDatabase.Refresh();
+        }
+
+        static int DeleteStaleRestoreClips(string dir, HashSet<string> keep)
+        {
+            if (!AssetDatabase.IsValidFolder(dir))
+            {
+                return 0;
+            }
+            var stale = new List<string>();
+            foreach (var guid in AssetDatabase.FindAssets("t:AnimationClip", new[] { dir }))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(path) || keep.Contains(path))
+                {
+                    continue;
+                }
+                // " restore.anim" and " restore 4.anim" are the shapes this pass writes.
+                string file = System.IO.Path.GetFileNameWithoutExtension(path);
+                int cut = file.LastIndexOf(" restore", StringComparison.Ordinal);
+                if (cut < 0)
+                {
+                    continue;
+                }
+                string tail = file.Substring(cut + " restore".Length).Trim();
+                if (tail.Length > 0 && !int.TryParse(tail, out _))
+                {
+                    continue;
+                }
+                stale.Add(path);
+            }
+            if (stale.Count == 0)
+            {
+                return 0;
+            }
+            // One call: a DeleteAsset each was a refresh each.
+            var failed = new List<string>();
+            AssetDatabase.DeleteAssets(stale.ToArray(), failed);
+            return stale.Count - failed.Count;
+        }
+
+        static bool IsPassThroughState(AnimatorState state)
+        {
+            var transitions = state != null ? state.transitions : null;
+            if (transitions == null || transitions.Length == 0)
+            {
+                return false; // nowhere to go: this is where the layer lives
+            }
+            var openedAbove = new HashSet<string>();
+            var openedBelow = new HashSet<string>();
+            foreach (var transition in transitions)
+            {
+                if (transition == null)
+                {
+                    continue;
+                }
+                var conditions = transition.conditions;
+                if (conditions == null || conditions.Length == 0)
+                {
+                    return true; // unconditional exit
+                }
+                var above = new HashSet<string>();
+                var below = new HashSet<string>();
+                foreach (var condition in conditions)
+                {
+                    if (condition.mode == AnimatorConditionMode.Greater)
+                    {
+                        above.Add(condition.parameter);
+                    }
+                    else if (condition.mode == AnimatorConditionMode.Less)
+                    {
+                        below.Add(condition.parameter);
+                    }
+                }
+                // A band within one transition asks for a value; it doesn't cover the space.
+                var band = new HashSet<string>(above);
+                band.IntersectWith(below);
+                above.ExceptWith(band);
+                below.ExceptWith(band);
+                openedAbove.UnionWith(above);
+                openedBelow.UnionWith(below);
+            }
+            openedAbove.IntersectWith(openedBelow);
+            return openedAbove.Count > 0;
+        }
+
+        // bindingCounts lives for one filler pass, which never edits its candidates. Reading
+        // every clip's bindings again for every toggle made the pass toggles x clips.
+        static AnimationClip FindEquivalentClip(AnimationClip generated, HashSet<AnimationClip> candidates,
+            Dictionary<AnimationClip, (int floats, int objects)> bindingCounts)
+        {
+            var wantFloats = AnimationUtility.GetCurveBindings(generated);
+            var wantObjects = AnimationUtility.GetObjectReferenceCurveBindings(generated);
+
+            foreach (var candidate in candidates)
+            {
+                if (candidate == null)
+                {
+                    continue;
+                }
+                if (!bindingCounts.TryGetValue(candidate, out var have))
+                {
+                    have = (AnimationUtility.GetCurveBindings(candidate).Length,
+                        AnimationUtility.GetObjectReferenceCurveBindings(candidate).Length);
+                    bindingCounts[candidate] = have;
+                }
+                if (have.floats != wantFloats.Length || have.objects != wantObjects.Length)
+                {
+                    continue;
+                }
+
+                bool same = true;
+                foreach (var binding in wantFloats)
+                {
+                    var mine = AnimationUtility.GetEditorCurve(generated, binding);
+                    var theirs = AnimationUtility.GetEditorCurve(candidate, binding);
+                    // A restore clip holds one value; anything that moves over time is a
+                    // different animation, whatever it happens to start at.
+                    if (theirs == null || theirs.length == 0 || mine == null || mine.length == 0)
+                    {
+                        same = false;
+                        break;
+                    }
+                    // Every key: a loop returns to its start and would pass as a constant.
+                    foreach (var key in theirs.keys)
+                    {
+                        if (!Mathf.Approximately(key.value, mine.keys[0].value))
+                        {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (!same)
+                    {
+                        break;
+                    }
+                }
+                if (!same)
+                {
+                    continue;
+                }
+                foreach (var binding in wantObjects)
+                {
+                    var mine = AnimationUtility.GetObjectReferenceCurve(generated, binding);
+                    var theirs = AnimationUtility.GetObjectReferenceCurve(candidate, binding);
+                    // Every key, as with floats: a flipbook that starts on
+                    // the rest material is not a restore.
+                    if (theirs == null || theirs.Length == 0 || mine == null || mine.Length == 0
+                        || theirs.Any(k => k.value != mine[0].value))
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same)
+                {
+                    return candidate;
+                }
+            }
+            return null;
+        }
+
+        static void CollectBindings(Motion motion, HashSet<EditorCurveBinding> floats,
+            HashSet<EditorCurveBinding> objects)
+        {
+            if (motion is BlendTree tree)
+            {
+                foreach (var child in tree.children)
+                {
+                    CollectBindings(child.motion, floats, objects);
+                }
+                return;
+            }
+            if (!(motion is AnimationClip clip))
+            {
+                return;
+            }
+            foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+            {
+                floats.Add(binding);
+            }
+            foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+            {
+                objects.Add(binding);
+            }
+        }
+
+        static void WarnLocomotionOverrides(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            // The live layers: vrcLayers are detached copies, blind to the masks and names
+            // given since the merge.
+            var vrcMachines = new HashSet<AnimatorStateMachine>(vrcLayers.Select(l => l.stateMachine));
+            foreach (var layer in master.layers)
+            {
+                if (layer.stateMachine == null || !vrcMachines.Contains(layer.stateMachine))
+                {
+                    continue;
+                }
+                if (AvatarFeatureDetect.IsHandLayer(layer.name))
+                {
+                    continue; // hand pose layers are supposed to animate finger muscles
+                }
+                // A layer masked off the body cannot override anything, whatever its clips hold.
+                if (!MaskReachesBody(layer.avatarMask))
+                {
+                    continue;
+                }
+                InspectLayerCurves(layer, out bool animatesBody, out _);
+                if (animatesBody)
+                {
+                    // In keep-GoGo mode Base/Additive/Action are supposed
+                    // to drive the body; warning about them is noise.
+                    bool gogoReplacement = !ctx.Settings.stripGogoLoco && SystemStripper.AvatarUsesGogo(ctx)
+                        && (layer.name.StartsWith("[Base]") || layer.name.StartsWith("[Additive]")
+                            || layer.name.StartsWith("[Action]"));
+                    if (!gogoReplacement)
+                    {
+                        bool baseLayer = layer.name.StartsWith("[Base]", StringComparison.Ordinal);
+                        ctx.Report.Warning(Category, $"Layer \"{layer.name}\" animates body muscles or root motion",
+                            baseLayer
+                                ? "It replaces ChilloutVR's locomotion. If movement or stances stop working, turn off " +
+                                  "\"Base / locomotion\" and convert again."
+                                : "It can override CVR's locomotion/pose. Review it; lower its weight or delete " +
+                                  "it if movement breaks.");
+                    }
+                }
+            }
+        }
+
+        internal static bool IsDoomedGeneratedPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+            path = path.Replace('\\', '/');
+            // Only the temp roots. A broad "com.vrcfury" prefix also
+            // matches the installed package, whose GUIDs are stable.
+            // The wiped folders are exactly these two:
+            return path.StartsWith("Packages/com.vrcfury.temp", StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith("Packages/nadena.dev.ndmf/__Generated", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static void AuditSizeBlendshapes(AnimatorController master, BridgeContext ctx)
+        {
+            var chains = ctx.ConvertedPhysicsChains;
+            if (chains == null || chains.Count == 0)
+            {
+                return;
+            }
+            var root = ctx.Target.transform;
+
+            // chain name -> the shapes that resize it
+            var driven = new SortedDictionary<string, SortedSet<string>>(StringComparer.Ordinal);
+            var seen = new HashSet<AnimationClip>();
+
+            // Across the whole controller: a toggle is two constants, so per clip nothing moves.
+            var span = new Dictionary<EditorCurveBinding, Vector2>();
+
+            void Inspect(AnimationClip clip)
+            {
+                if (clip == null || !seen.Add(clip))
+                {
+                    return;
+                }
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type != typeof(SkinnedMeshRenderer)
+                        || !binding.propertyName.StartsWith("blendShape.", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                    if (curve == null || curve.keys.Length == 0)
+                    {
+                        continue;
+                    }
+                    float low = curve.keys[0].value, high = low;
+                    foreach (var key in curve.keys)
+                    {
+                        low = Mathf.Min(low, key.value);
+                        high = Mathf.Max(high, key.value);
+                    }
+                    if (span.TryGetValue(binding, out var reach))
+                    {
+                        low = Mathf.Min(low, reach.x);
+                        high = Mathf.Max(high, reach.y);
+                    }
+                    span[binding] = new Vector2(low, high);
+                }
+            }
+
+            void Walk(Motion motion)
+            {
+                if (motion is AnimationClip clip)
+                {
+                    Inspect(clip);
+                }
+                else if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        Walk(child.motion);
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        Walk(child.state.motion);
+                    }
+                });
+            }
+
+            // Bones a shape MOVES, from its deltas. The renderer's bone list is the whole armature,
+            // so a tongue shape "resized" arm ribbons: 18 chains against 40 shapes each.
+            var movedCache = new Dictionary<string, HashSet<Transform>>(StringComparer.Ordinal);
+            // Per renderer, not per shape: bones and boneWeights copy the whole array on every
+            // read, and one deltas buffer serves every shape since each read overwrites it all.
+            var skinCache = new Dictionary<SkinnedMeshRenderer, (Transform[] bones, BoneWeight[] weights, Vector3[] deltas)>();
+            HashSet<Transform> BonesMovedBy(SkinnedMeshRenderer renderer, string shapeName, string key)
+            {
+                if (movedCache.TryGetValue(key, out var known))
+                {
+                    return known;
+                }
+                var moved = new HashSet<Transform>();
+                movedCache[key] = moved;
+                var mesh = renderer.sharedMesh;
+                if (mesh == null)
+                {
+                    return moved;
+                }
+                int shape = mesh.GetBlendShapeIndex(shapeName);
+                int frames = shape >= 0 ? mesh.GetBlendShapeFrameCount(shape) : 0;
+                if (frames <= 0)
+                {
+                    return moved;
+                }
+                if (!skinCache.TryGetValue(renderer, out var skin))
+                {
+                    try
+                    {
+                        skin = (renderer.bones, mesh.boneWeights, new Vector3[mesh.vertexCount]);
+                    }
+                    catch
+                    {
+                        skin = default;
+                    }
+                    skinCache[renderer] = skin;
+                }
+                var (bones, weights, deltas) = skin;
+                if (bones == null || weights == null || deltas == null || weights.Length != deltas.Length)
+                {
+                    return moved;
+                }
+                try
+                {
+                    mesh.GetBlendShapeFrameVertices(shape, frames - 1, deltas, null, null);
+                }
+                catch
+                {
+                    return moved;
+                }
+                for (int i = 0; i < deltas.Length; i++)
+                {
+                    // A millimetre. Below that the shape is touching this vertex incidentally.
+                    if (deltas[i].sqrMagnitude < 1e-6f)
+                    {
+                        continue;
+                    }
+                    var w = weights[i];
+                    if (w.weight0 >= 0.2f && w.boneIndex0 < bones.Length && bones[w.boneIndex0] != null) moved.Add(bones[w.boneIndex0]);
+                    if (w.weight1 >= 0.2f && w.boneIndex1 < bones.Length && bones[w.boneIndex1] != null) moved.Add(bones[w.boneIndex1]);
+                    if (w.weight2 >= 0.2f && w.boneIndex2 < bones.Length && bones[w.boneIndex2] != null) moved.Add(bones[w.boneIndex2]);
+                    if (w.weight3 >= 0.2f && w.boneIndex3 < bones.Length && bones[w.boneIndex3] != null) moved.Add(bones[w.boneIndex3]);
+                }
+                return moved;
+            }
+
+            foreach (var pair in span)
+            {
+                // A shape every state pins to the same number resizes nothing.
+                if (pair.Value.y - pair.Value.x < 1f)
+                {
+                    continue;
+                }
+                var binding = pair.Key;
+                var target = BridgeContext.FindByAnimationPath(root, binding.path);
+                var renderer = target != null ? target.GetComponent<SkinnedMeshRenderer>() : null;
+                if (renderer == null)
+                {
+                    continue;
+                }
+                string shapeName = binding.propertyName.Substring("blendShape.".Length);
+                var moved = BonesMovedBy(renderer, shapeName, binding.path + "|" + shapeName);
+                if (moved.Count == 0)
+                {
+                    continue;
+                }
+                foreach (var chain in chains)
+                {
+                    var chainRoot = chain.Root != null ? chain.Root
+                        : chain.Source != null ? chain.Source.transform : null;
+                    if (chainRoot == null)
+                    {
+                        continue;
+                    }
+                    foreach (var bone in moved)
+                    {
+                        if (bone != chainRoot && !bone.IsChildOf(chainRoot))
+                        {
+                            continue;
+                        }
+                        if (!driven.TryGetValue(chainRoot.name, out var shapes))
+                        {
+                            driven[chainRoot.name] = shapes = new SortedSet<string>(StringComparer.Ordinal);
+                        }
+                        shapes.Add(shapeName);
+                        break;
+                    }
+                }
+            }
+
+            if (driven.Count == 0)
+            {
+                return;
+            }
+            // Four names is enough to recognise the slider; a chain deformed by twenty shapes
+            // does not become clearer by listing all twenty.
+            var lines = driven.Select(entry =>
+            {
+                var shown = entry.Value.Take(4).ToList();
+                string extra = entry.Value.Count > shown.Count
+                    ? $", +{entry.Value.Count - shown.Count} more" : "";
+                return $"\"{entry.Key}\" ({string.Join(", ", shown)}{extra})";
+            }).ToList();
+            // Approximated, not a Warning: nothing is broken, and it put 13 alarms on a good conversion.
+            ctx.Report.Approximated("PhysBones -> MagicaCloth2",
+                $"{BridgeElements.Count(driven.Count, "chain is resized by a blendshape, so its", "chains are resized by a blendshape, so their")} collision size " +
+                "cannot follow the slider",
+                string.Join("; ", lines) + ": sized at the saved slider position. Set the slider where it " +
+                "matters most before converting.");
+        }
+
+        // Merged layers some layer control raises to full weight.
+        static HashSet<AnimatorStateMachine> RaisedLayerMachines()
+        {
+            var raised = new HashSet<AnimatorStateMachine>();
+            foreach (var (key, goal) in CapturedLayerControls)
+            {
+                if (goal >= 0.5f && MergedLayerMachines.TryGetValue(key, out var gated) && gated != null)
+                {
+                    raised.Add(gated);
+                }
+            }
+            return raised;
+        }
+
+        // VRChat raises reaction layers by weight; ChilloutVR cannot change a
+        // layer's weight. The layer runs at 1 and its rest states assert the
+        // avatar's resting values for bindings no other layer moves.
+        static void ReviveWeightGatedLayers(AnimatorController master, BridgeContext ctx)
+        {
+            var raisedMachines = RaisedLayerMachines();
+            if (raisedMachines.Count == 0)
+            {
+                return;
+            }
+
+            var layers = master.layers;
+            var layerClips = new List<(List<AnimationClip> clips, List<AnimatorState> states)>();
+            foreach (var layer in layers)
+            {
+                var clips = new List<AnimationClip>();
+                var states = new List<AnimatorState>();
+                var seenTrees = new HashSet<BlendTree>();
+                void Collect(Motion motion)
+                {
+                    if (motion is AnimationClip clip)
+                    {
+                        clips.Add(clip);
+                    }
+                    else if (motion is BlendTree tree && seenTrees.Add(tree))
+                    {
+                        foreach (var child in tree.children)
+                        {
+                            Collect(child.motion);
+                        }
+                    }
+                }
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state == null)
+                        {
+                            continue;
+                        }
+                        states.Add(child.state);
+                        Collect(child.state.motion);
+                    }
+                });
+                layerClips.Add((clips, states));
+            }
+
+            bool MovesSomething(List<AnimationClip> clips)
+            {
+                foreach (var clip in clips)
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                        if (curve == null || curve.length == 0)
+                        {
+                            continue;
+                        }
+                        float first = curve.keys[0].value;
+                        if (curve.keys.Any(k => !Mathf.Approximately(k.value, first)))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                // Two constants for one binding in different clips still
+                // move it between states.
+                var seen = new Dictionary<EditorCurveBinding, float>();
+                foreach (var clip in clips)
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                        if (curve == null || curve.length == 0)
+                        {
+                            continue;
+                        }
+                        if (seen.TryGetValue(binding, out float other))
+                        {
+                            if (!Mathf.Approximately(other, curve.keys[0].value))
+                            {
+                                return true;
+                            }
+                        }
+                        else
+                        {
+                            seen[binding] = curve.keys[0].value;
+                        }
+                    }
+                }
+                // A material swap moves its slot as surely as a float
+                // moves a blendshape, and the rest clip asserts slots too.
+                var seenObjects = new Dictionary<EditorCurveBinding, UnityEngine.Object>();
+                foreach (var clip in clips)
+                {
+                    foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                    {
+                        var keys = AnimationUtility.GetObjectReferenceCurve(clip, binding);
+                        if (keys == null || keys.Length == 0)
+                        {
+                            continue;
+                        }
+                        if (keys.Any(k => k.value != keys[0].value)
+                            || (seenObjects.TryGetValue(binding, out var other) && other != keys[0].value))
+                        {
+                            return true;
+                        }
+                        seenObjects[binding] = keys[0].value;
+                    }
+                }
+                return false;
+            }
+
+            // Decided up front: bindings only revived layers share still need a rest assert.
+            var restStatesByLayer = new Dictionary<int, List<AnimatorState>>();
+            var unrevivable = new List<string>();
+            for (int i = 0; i < layers.Length; i++)
+            {
+                var layer = layers[i];
+                if (layer.stateMachine == null || !raisedMachines.Contains(layer.stateMachine)
+                    || layer.defaultWeight > 0.5f)
+                {
+                    continue;
+                }
+                var defaultState = layer.stateMachine != null ? layer.stateMachine.defaultState : null;
+                var restStates = new List<AnimatorState>();
+                bool defaultRaises = false;
+                foreach (var state in layerClips[i].states)
+                {
+                    bool raises = LayerControlGoals.TryGetValue(state, out float goal) && goal >= 0.5f;
+                    if (state == defaultState && raises)
+                    {
+                        defaultRaises = true;
+                    }
+                    if (!raises && (state == defaultState
+                        || (LayerControlGoals.TryGetValue(state, out float lowered) && lowered < 0.5f)))
+                    {
+                        restStates.Add(state);
+                    }
+                }
+                if (restStates.Count == 0 || defaultRaises)
+                {
+                    // The layer rests inside its reaction; at full weight
+                    // it would show constantly. Weight 0 stays honest.
+                    unrevivable.Add($"\"{layer.name}\"");
+                    continue;
+                }
+                restStatesByLayer[i] = restStates;
+            }
+
+            // Asserting rest here would override a moving layer. Revived movers do not count
+            // against each other: each asserts the same sampled value.
+            var movedElsewhere = new Dictionary<EditorCurveBinding, int>();
+            for (int i = 0; i < layers.Length; i++)
+            {
+                if (restStatesByLayer.ContainsKey(i) || !MovesSomething(layerClips[i].clips))
+                {
+                    continue;   // revived, or assert-only: owns nothing at rest
+                }
+                foreach (var clip in layerClips[i].clips.Distinct())
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip)
+                        .Concat(AnimationUtility.GetObjectReferenceCurveBindings(clip)))
+                    {
+                        movedElsewhere[binding] = movedElsewhere.TryGetValue(binding, out int owner) && owner != i
+                            ? -1 : i;   // -1 marks two moving layers
+                    }
+                }
+            }
+
+            var revived = new List<string>();
+            int curvesAdded = 0;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                if (!restStatesByLayer.TryGetValue(i, out var restStates))
+                {
+                    continue;
+                }
+                var layer = layers[i];
+
+                var mine = new List<EditorCurveBinding>();
+                var mineObjects = new List<EditorCurveBinding>();
+                foreach (var clip in layerClips[i].clips.Distinct())
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        if (binding.type == typeof(Animator) || mine.Contains(binding))
+                        {
+                            continue;   // parameters, not properties
+                        }
+                        if (!movedElsewhere.ContainsKey(binding))
+                        {
+                            mine.Add(binding);
+                        }
+                    }
+                    // The rest clip replaces the state's motion, so a slot
+                    // left out here keeps the reaction's material for good:
+                    // CVR never restores Write Defaults.
+                    foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                    {
+                        if (!mineObjects.Contains(binding) && !movedElsewhere.ContainsKey(binding))
+                        {
+                            mineObjects.Add(binding);
+                        }
+                    }
+                }
+
+                // Left loose: the controller save embeds orphaned motions.
+                var rest = new AnimationClip { name = SanitizeFileName($"{layer.name} rest") };
+                int added = 0;
+                foreach (var binding in mine)
+                {
+                    if (AnimationUtility.GetFloatValue(ctx.Target, binding, out float value))
+                    {
+                        AnimationUtility.SetEditorCurve(rest, binding,
+                            AnimationCurve.Constant(0f, 1f / 60f, value));
+                        added++;
+                    }
+                }
+                foreach (var binding in mineObjects)
+                {
+                    if (AnimationUtility.GetObjectReferenceValue(ctx.Target, binding, out var value))
+                    {
+                        AnimationUtility.SetObjectReferenceCurve(rest, binding,
+                            new[] { new ObjectReferenceKeyframe { time = 0f, value = value } });
+                        added++;
+                    }
+                }
+                foreach (var state in restStates)
+                {
+                    state.motion = rest;
+                }
+
+                layer.defaultWeight = 1f;
+                revived.Add($"\"{layer.name}\"");
+                curvesAdded += added;
+            }
+
+            // The other half of a contested binding: the normal layer that
+            // shares it must state the rest value from its own resting state.
+            var revivedBindings = new HashSet<EditorCurveBinding>();
+            foreach (int i in restStatesByLayer.Keys)
+            {
+                foreach (var clip in layerClips[i].clips.Distinct())
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        if (binding.type != typeof(Animator))
+                        {
+                            revivedBindings.Add(binding);
+                        }
+                    }
+                }
+            }
+            int handedBack = 0;
+            for (int j = 0; j < layers.Length; j++)
+            {
+                if (restStatesByLayer.ContainsKey(j)
+                    || layers[j].blendingMode == AnimatorLayerBlendingMode.Additive
+                    || layers[j].defaultWeight < 0.5f)
+                {
+                    continue;
+                }
+                var defaultState = layers[j].stateMachine != null
+                    ? layers[j].stateMachine.defaultState : null;
+                // A tree already answers with a value at every input; a
+                // constant beside it would fight the blend.
+                if (defaultState == null || defaultState.motion is BlendTree)
+                {
+                    continue;
+                }
+
+                var needs = new List<EditorCurveBinding>();
+                foreach (var clip in layerClips[j].clips.Distinct())
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        if (binding.type == typeof(Animator) || needs.Contains(binding)
+                            || !revivedBindings.Contains(binding))
+                        {
+                            continue;
+                        }
+                        // Sole normal mover only; two normal layers keep
+                        // their existing arbitration.
+                        if (movedElsewhere.TryGetValue(binding, out int owns) && owns == j)
+                        {
+                            needs.Add(binding);
+                        }
+                    }
+                }
+                if (needs.Count == 0)
+                {
+                    continue;
+                }
+
+                var existing = defaultState.motion as AnimationClip;
+                var drives = existing != null
+                    ? new HashSet<EditorCurveBinding>(AnimationUtility.GetCurveBindings(existing))
+                    : new HashSet<EditorCurveBinding>();
+                AnimationClip target = null;
+                foreach (var binding in needs)
+                {
+                    if (drives.Contains(binding)
+                        || !AnimationUtility.GetFloatValue(ctx.Target, binding, out float value))
+                    {
+                        continue;
+                    }
+                    if (target == null)
+                    {
+                        if (existing == null)
+                        {
+                            target = new AnimationClip { name = SanitizeFileName($"{layers[j].name} rest") };
+                        }
+                        else
+                        {
+                            // Cloned, never shared: the clip may sit in
+                            // other layers that must not gain asserts.
+                            target = UnityEngine.Object.Instantiate(existing);
+                            target.name = existing.name;
+                            target.hideFlags = HideFlags.None;
+                        }
+                    }
+                    AnimationUtility.SetEditorCurve(target, binding,
+                        AnimationCurve.Constant(0f, 1f / 60f, value));
+                    handedBack++;
+                }
+                if (target != null)
+                {
+                    defaultState.motion = target;
+                }
+            }
+            master.layers = layers;
+
+            if (revived.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(revived.Count, "weight-gated reaction layer", "weight-gated reaction layers")} rebuilt without the weight",
+                    string.Join(", ", revived) + $": {BridgeElements.Count(curvesAdded, "rest value", "rest values")}. ChilloutVR cannot raise a " +
+                    "layer's weight, so they run at full weight and rest at the avatar's values. Fade-ins are " +
+                    "instant." +
+                    (handedBack > 0 ? $" {BridgeElements.Count(handedBack, "shared property is", "shared properties are")} handed back after a reaction." : ""));
+            }
+            if (unrevivable.Count > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(unrevivable.Count, "weight-gated reaction layer", "weight-gated reaction layers")} will not show in game",
+                    string.Join(", ", unrevivable) + ": each rests inside its reaction, so at full weight it " +
+                    "would play constantly. ChilloutVR cannot raise a layer's weight, so these stay at weight 0.");
+            }
+        }
+
+        // A discrete active curve in a blend tree latches. Every branch of a
+        // menu-gated tree carries the binding, missing sides at rest.
+        static void BalanceMenuTreeActives(AnimatorController master, BridgeContext ctx)
+        {
+            var menuParameters = new HashSet<string>();
+            if (ctx.CvrAvatar?.avatarSettings?.settings != null)
+            {
+                foreach (var entry in ctx.CvrAvatar.avatarSettings.settings)
+                {
+                    if (entry != null && !string.IsNullOrEmpty(entry.machineName))
+                    {
+                        menuParameters.Add(entry.machineName);
+                    }
+                }
+            }
+            if (menuParameters.Count == 0)
+            {
+                return;
+            }
+
+            int added = 0;
+            var balanced = new SortedSet<string>(StableSampleOrder.Instance);
+            var seen = new HashSet<BlendTree>();
+
+            void CollectActives(Motion motion, HashSet<EditorCurveBinding> into)
+            {
+                if (motion is AnimationClip clip)
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        if (binding.type == typeof(GameObject) && binding.propertyName == "m_IsActive")
+                        {
+                            into.Add(binding);
+                        }
+                    }
+                }
+                else if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        CollectActives(child.motion, into);
+                    }
+                }
+            }
+
+            void Fill(BlendTree tree, int index, List<(EditorCurveBinding binding, float rest)> missing)
+            {
+                var children = tree.children;
+                if (children[index].motion is AnimationClip clip)
+                {
+                    var drives = new HashSet<EditorCurveBinding>(AnimationUtility.GetCurveBindings(clip));
+                    AnimationClip owned = null;
+                    foreach (var (binding, rest) in missing)
+                    {
+                        if (drives.Contains(binding))
+                        {
+                            continue;
+                        }
+                        if (owned == null)
+                        {
+                            // Cloned, never shared; the same sampled clip
+                            // can sit in unrelated trees.
+                            owned = UnityEngine.Object.Instantiate(clip);
+                            owned.name = clip.name;
+                            owned.hideFlags = HideFlags.None;
+                        }
+                        AnimationUtility.SetEditorCurve(owned, binding,
+                            AnimationCurve.Constant(0f, 1f / 60f, rest));
+                        added++;
+                    }
+                    if (owned != null)
+                    {
+                        bool auto = tree.useAutomaticThresholds;
+                        tree.useAutomaticThresholds = false;
+                        children[index].motion = owned;
+                        tree.children = children;
+                        tree.useAutomaticThresholds = auto;
+                    }
+                }
+                else if (children[index].motion is BlendTree sub)
+                {
+                    for (int i = 0; i < sub.children.Length; i++)
+                    {
+                        Fill(sub, i, missing);
+                    }
+                }
+            }
+
+            void Walk(Motion motion, string layerName)
+            {
+                if (!(motion is BlendTree tree) || !seen.Add(tree))
+                {
+                    return;
+                }
+                foreach (var child in tree.children)
+                {
+                    Walk(child.motion, layerName);
+                }
+                if (tree.blendType != BlendTreeType.Simple1D
+                    || !menuParameters.Contains(tree.blendParameter))
+                {
+                    return;
+                }
+
+                var union = new HashSet<EditorCurveBinding>();
+                CollectActives(tree, union);
+                if (union.Count == 0)
+                {
+                    return;
+                }
+                var children = tree.children;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    if (children[i].motion == null)
+                    {
+                        continue;   // the empty-slot filler owns those
+                    }
+                    var has = new HashSet<EditorCurveBinding>();
+                    CollectActives(children[i].motion, has);
+                    var missing = new List<(EditorCurveBinding, float)>();
+                    foreach (var binding in union)
+                    {
+                        if (has.Contains(binding))
+                        {
+                            continue;
+                        }
+                        var at = BridgeContext.FindByAnimationPath(ctx.Target.transform, binding.path);
+                        if (at != null)
+                        {
+                            missing.Add((binding, at.gameObject.activeSelf ? 1f : 0f));
+                        }
+                    }
+                    if (missing.Count > 0)
+                    {
+                        Fill(tree, i, missing);
+                        balanced.Add($"\"{tree.blendParameter}\" ({layerName})");
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            Walk(child.state.motion, layer.name);
+                        }
+                    }
+                });
+            }
+
+            if (added > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{BridgeElements.Count(added, "object switch", "object switches")} balanced across {BridgeElements.Count(balanced.Count, "menu tree", "menu trees")}",
+                    string.Join(", ", balanced) + ": the object latched after first use. Every side now writes it.");
+            }
+        }
+
+
+        static bool IsHashedPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+            foreach (var segment in path.Split('/'))
+            {
+                if (segment.Length == 0)
+                {
+                    return false;
+                }
+                foreach (var c in segment)
+                {
+                    if (c < '0' || c > '9')
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        static void RepairClipPaths(AnimatorController master, BridgeContext ctx)
+        {
+            var root = ctx.Target.transform;
+
+            var byDepth = new Dictionary<int, List<string[]>>();
+            foreach (var t in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (t == root)
+                {
+                    continue;
+                }
+                var segs = AnimationUtility.CalculateTransformPath(t, root).Split('/');
+                if (!byDepth.TryGetValue(segs.Length, out var list))
+                {
+                    byDepth[segs.Length] = list = new List<string[]>();
+                }
+                list.Add(segs);
+            }
+
+            var pathFix = new Dictionary<string, string>();
+            string Repair(string path)
+            {
+                if (pathFix.TryGetValue(path, out var known))
+                {
+                    return known;
+                }
+                string result = null;
+                var segs = path.Split('/');
+                if (byDepth.TryGetValue(segs.Length, out var candidates))
+                {
+                    bool ambiguous = false;
+                    foreach (var cs in candidates)
+                    {
+                        int mismatch = 0;
+                        for (int i = 0; i < segs.Length && mismatch <= 1; i++)
+                        {
+                            if (!string.Equals(segs[i], cs[i], StringComparison.Ordinal))
+                            {
+                                mismatch++;
+                            }
+                        }
+                        if (mismatch <= 1)
+                        {
+                            if (result != null)
+                            {
+                                ambiguous = true;
+                                break;
+                            }
+                            result = string.Join("/", cs);
+                        }
+                    }
+                    if (ambiguous)
+                    {
+                        result = null;
+                    }
+                }
+                pathFix[path] = result;
+                return result;
+            }
+
+            var repaired = new Dictionary<AnimationClip, AnimationClip>();
+            var rows = new List<string>();
+
+            AnimationClip Fix(AnimationClip clip)
+            {
+                if (clip == null)
+                {
+                    return null;
+                }
+                if (repaired.TryGetValue(clip, out var done))
+                {
+                    return done;
+                }
+                List<(EditorCurveBinding oldB, EditorCurveBinding newB, bool objRef)> moves = null;
+                string exampleOld = null, exampleNew = null;
+                var floatBindings = AnimationUtility.GetCurveBindings(clip);
+                var objectBindings = AnimationUtility.GetObjectReferenceCurveBindings(clip);
+                var clipPaths = new HashSet<string>(floatBindings.Concat(objectBindings).Select(b => b.path));
+                string Leaf(string p) => p.Substring(p.LastIndexOf('/') + 1);
+                void Consider(EditorCurveBinding binding, bool objRef)
+                {
+                    if (string.IsNullOrEmpty(binding.path) || IsHashedPath(binding.path))
+                    {
+                        return;
+                    }
+                    // Resolved the way the animator does, so a slash-named
+                    // object is not handed to the fuzzy repair below.
+                    if (BridgeContext.FindByAnimationPath(root, binding.path) != null)
+                    {
+                        return;
+                    }
+                    // Only paths this conversion broke; reviving a source-dead one hits the wrong object.
+                    if (!ctx.ResolvedInSource(binding.path) || ctx.RemovedOnPurpose(binding.path))
+                    {
+                        return;
+                    }
+                    var fixedPath = Repair(binding.path);
+                    if (fixedPath == null)
+                    {
+                        return;
+                    }
+                    // A lone differently named sibling is no proof ("Hat" would land on "Hair"):
+                    // accepted only when a child curve repairs into it too.
+                    if (Leaf(binding.path) != Leaf(fixedPath)
+                        && !clipPaths.Any(q => q.StartsWith(binding.path + "/", StringComparison.Ordinal)
+                            && BridgeContext.FindByAnimationPath(root, q) == null
+                            && (Repair(q) ?? "").StartsWith(fixedPath + "/", StringComparison.Ordinal)))
+                    {
+                        return;
+                    }
+                    // A curve moved onto an object without its component
+                    // is still dead, and the broken-paths warning goes quiet.
+                    var target = BridgeContext.FindByAnimationPath(root, fixedPath);
+                    if (target == null || (typeof(Component).IsAssignableFrom(binding.type)
+                        && target.GetComponent(binding.type) == null))
+                    {
+                        return;
+                    }
+                    var moved = binding;
+                    moved.path = fixedPath;
+                    if (moves == null)
+                    {
+                        moves = new List<(EditorCurveBinding, EditorCurveBinding, bool)>();
+                    }
+                    moves.Add((binding, moved, objRef));
+                    if (exampleOld == null)
+                    {
+                        exampleOld = binding.path;
+                        exampleNew = fixedPath;
+                    }
+                }
+                foreach (var binding in floatBindings)
+                {
+                    Consider(binding, false);
+                }
+                foreach (var binding in objectBindings)
+                {
+                    Consider(binding, true);
+                }
+                if (moves == null)
+                {
+                    repaired[clip] = clip;
+                    return clip;
+                }
+                var clone = UnityEngine.Object.Instantiate(clip);
+                clone.name = clip.name;
+                clone.hideFlags = HideFlags.None;
+                foreach (var (oldB, newB, objRef) in moves)
+                {
+                    if (objRef)
+                    {
+                        var keys = AnimationUtility.GetObjectReferenceCurve(clip, oldB);
+                        AnimationUtility.SetObjectReferenceCurve(clone, oldB, null);
+                        AnimationUtility.SetObjectReferenceCurve(clone, newB, keys);
+                    }
+                    else
+                    {
+                        var curve = AnimationUtility.GetEditorCurve(clip, oldB);
+                        AnimationUtility.SetEditorCurve(clone, oldB, null);
+                        AnimationUtility.SetEditorCurve(clone, newB, curve);
+                    }
+                }
+                repaired[clip] = clone;
+                rows.Add($"\"{clip.name}\" ({BridgeElements.Count(moves.Count, "curve", "curves")}, e.g. \"{exampleOld}\" -> \"{exampleNew}\")");
+                return clone;
+            }
+
+            Motion FixMotion(Motion motion)
+            {
+                if (motion is AnimationClip clip)
+                {
+                    return Fix(clip);
+                }
+                if (motion is BlendTree tree)
+                {
+                    var children = tree.children;
+                    bool changed = false;
+                    for (int i = 0; i < children.Length; i++)
+                    {
+                        var replacedChild = FixMotion(children[i].motion);
+                        if (!ReferenceEquals(replacedChild, children[i].motion))
+                        {
+                            children[i].motion = replacedChild;
+                            changed = true;
+                        }
+                    }
+                    if (changed)
+                    {
+                        bool auto = tree.useAutomaticThresholds;
+                        tree.useAutomaticThresholds = false;
+                        tree.children = children;
+                        tree.useAutomaticThresholds = auto;
+                    }
+                }
+                return motion;
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        child.state.motion = FixMotion(child.state.motion);
+                    }
+                });
+            }
+
+            if (rows.Count > 0)
+            {
+                ctx.Report.Approximated(Category,
+                    $"{BridgeElements.Count(rows.Count, "clip", "clips")} had broken curve paths repaired",
+                    string.Join("; ", rows.Take(8)) + (rows.Count > 8 ? "; …" : "") + ". Each matched exactly " +
+                    "one object; ambiguous ones are in the broken-paths warning.");
+            }
+        }
+
+        static void AuditCurveControlledGameParameters(AnimatorController master, BridgeContext ctx)
+        {
+            var gameFed = new HashSet<string>(CvrCoreParameters);
+            gameFed.UnionWith(StreamFedParameters);
+            gameFed.UnionWith(GestureMap.GestureWeightParameters);
+            gameFed.Add("VisemeLoudness");
+            gameFed.Add("Upright");
+
+            var offenders = new Dictionary<string, List<string>>();
+            var seen = new HashSet<AnimationClip>();
+
+            void Audit(Motion motion)
+            {
+                if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        Audit(child.motion);
+                    }
+                    return;
+                }
+                if (!(motion is AnimationClip clip) || !seen.Add(clip))
+                {
+                    return;
+                }
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (binding.type != typeof(Animator) || !string.IsNullOrEmpty(binding.path))
+                    {
+                        continue;
+                    }
+                    string bare = binding.propertyName.TrimStart('#');
+                    if (!gameFed.Contains(bare))
+                    {
+                        continue;
+                    }
+                    if (!offenders.TryGetValue(binding.propertyName, out var clips))
+                    {
+                        offenders[binding.propertyName] = clips = new List<string>();
+                    }
+                    if (!clips.Contains(clip.name))
+                    {
+                        clips.Add(clip.name);
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        Audit(child.state.motion);
+                    }
+                });
+            }
+
+            foreach (var offender in offenders)
+            {
+                ctx.Report.Warning(Category,
+                    $"Game-fed parameter \"{offender.Key}\" is animated by a clip: the game will NEVER write it",
+                    $"{(offender.Value.Count == 1 ? "Clip" : "Clips")}: {string.Join(", ", offender.Value.Take(5))}" +
+                    (offender.Value.Count > 5 ? ", …" : "") + ". It will sit frozen in game. Remove the curve, " +
+                    "or rename the animated parameter.");
+            }
+        }
+
+        static void AuditClipBindings(AnimatorController master, BridgeContext ctx)
+        {
+            var root = ctx.Target.transform;
+
+            var resolveCache = new Dictionary<string, bool>();
+            bool Resolves(string path)
+            {
+                if (string.IsNullOrEmpty(path))
+                {
+                    return true;
+                }
+                if (!resolveCache.TryGetValue(path, out var ok))
+                {
+                    // The animator's resolution, not Find's.
+                    resolveCache[path] = ok = BridgeContext.FindByAnimationPath(root, path) != null;
+                }
+                return ok;
+            }
+
+            var seen = new HashSet<AnimationClip>();
+            var broken = new List<(string clip, int dead, int total, string example)>();
+            // Clips whose dead paths resolved before conversion.
+            // Those breaks belong to this tool.
+            var lostClips = new List<(string clip, int dead, int total, string example)>();
+
+            void Audit(Motion motion)
+            {
+                if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        Audit(child.motion);
+                    }
+                    return;
+                }
+                if (!(motion is AnimationClip clip) || !seen.Add(clip))
+                {
+                    return;
+                }
+                int dead = 0, total = 0, lost = 0;
+                string example = null;
+                string lostExample = null;
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip)
+                             .Concat(AnimationUtility.GetObjectReferenceCurveBindings(clip)))
+                {
+                    // Empty-path Animator bindings are parameters. Hashed numeric paths (the CCK's
+                    // locomotion clips) bind at runtime and cannot be looked up.
+                    if (binding.type == typeof(Animator) && string.IsNullOrEmpty(binding.path))
+                    {
+                        continue;
+                    }
+                    if (IsHashedPath(binding.path))
+                    {
+                        continue;
+                    }
+                    total++;
+                    // Deleted with a stripped system: dead by design, and
+                    // already reported where the system was removed.
+                    if (!Resolves(binding.path) && !ctx.RemovedOnPurpose(binding.path))
+                    {
+                        dead++;
+                        example = example ?? binding.path;
+                        // Missing in the source too: silent in VRChat already. Only here: a real defect.
+                        if (ctx.ResolvedInSource(binding.path))
+                        {
+                            lost++;
+                            lostExample = lostExample ?? binding.path;
+                        }
+                    }
+                }
+                if (lost > 0)
+                {
+                    lostClips.Add((clip.name, lost, total, lostExample));
+                }
+                else if (dead > 0)
+                {
+                    broken.Add((clip.name, dead, total, example));
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        Audit(child.state.motion);
+                    }
+                });
+            }
+
+            // Paths this conversion lost. Rare, and always worth acting on.
+            if (lostClips.Count > 0)
+            {
+                lostClips.Sort((a, b) => b.dead.CompareTo(a.dead));
+                var lostLines = lostClips.Take(8)
+                    .Select(b => $"\"{b.clip}\" ({b.dead} of {b.total}, e.g. \"{b.example}\")");
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(lostClips.Count, "clip", "clips")} LOST paths that existed before conversion",
+                    string.Join("; ", lostLines) + (lostClips.Count > 8 ? "; …" : "") + ". Objects removed with a " +
+                    "stripped system are not counted here, so this is unexpected: please report it.");
+            }
+
+            if (broken.Count == 0)
+            {
+                return;
+            }
+            broken.Sort((a, b) => b.dead.CompareTo(a.dead));
+            var lines = broken.Take(8)
+                .Select(b => $"\"{b.clip}\" ({b.dead} of {b.total}, e.g. \"{b.example}\")");
+            // Not a warning. These paths were already missing on the
+            // source avatar, so the curves were silent in VRChat too.
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(broken.Count, "clip animates", "clips animate")} paths that were ALREADY missing in VRChat",
+                string.Join("; ", lines) + (broken.Count > 8 ? "; …" : "") + ". Nothing lost in conversion. " +
+                "If a build tool fixed these at upload, install it here and convert again.");
+        }
+
+        static void AuditMaterialProperties(AnimatorController master, BridgeContext ctx)
+        {
+            var root = ctx.Target.transform;
+            var seen = new HashSet<AnimationClip>();
+            // property -> (how many bindings, an example path, the shader to blame)
+            var dead = new Dictionary<string, (int count, string path, string shader)>();
+            var locked = new HashSet<string>();
+            // Flagged animated in Poiyomi and STILL missing from the shader: re-flagging will not help.
+            var flaggedAndStillMissing = new HashSet<string>();
+            // One verdict per renderer and property: every colour channel and every clip of a toggle
+            // asked the renderer and its materials again, seconds a conversion. Null: nothing to count.
+            var verdicts = new Dictionary<(string, string), (string shader, bool locked, bool flagged)?>();
+
+            void Audit(Motion motion)
+            {
+                if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        Audit(child.motion);
+                    }
+                    return;
+                }
+                if (!(motion is AnimationClip clip) || !seen.Add(clip))
+                {
+                    return;
+                }
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (!binding.propertyName.StartsWith("material."))
+                    {
+                        continue;
+                    }
+                    string property = binding.propertyName.Substring("material.".Length);
+                    // Colour and vector channels arrive one component at a time
+                    // ("material._Color.r"); the property is everything before the channel.
+                    int dot = property.LastIndexOf('.');
+                    if (dot > 0 && property.Length - dot == 2)
+                    {
+                        property = property.Substring(0, dot);
+                    }
+                    if (!verdicts.TryGetValue((binding.path, property), out var verdict))
+                        verdicts[(binding.path, property)] = verdict = Verdict(binding.path, property);
+                    if (verdict == null)
+                    {
+                        continue;
+                    }
+                    if (verdict.Value.locked) locked.Add(property);
+                    if (verdict.Value.flagged) flaggedAndStillMissing.Add(property);
+                    dead.TryGetValue(property, out var entry);
+                    dead[property] = (entry.count + 1, entry.path ?? binding.path, entry.shader ?? verdict.Value.shader);
+                }
+            }
+
+            // Null when the property is alive on the renderer, or the path has none.
+            (string shader, bool locked, bool flagged)? Verdict(string path, string property)
+            {
+                var target = BridgeContext.FindByAnimationPath(root, path);
+                var renderer = target != null ? target.GetComponent<Renderer>() : null;
+                if (renderer == null)
+                {
+                    return null; // a dead path, AuditClipBindings owns that report
+                }
+                Material carrier = null;
+                foreach (var material in renderer.sharedMaterials)
+                {
+                    if (material != null && material.HasProperty(property))
+                    {
+                        carrier = material;
+                        break;
+                    }
+                }
+                if (carrier != null)
+                {
+                    return null;
+                }
+                string shaderName = null;
+                bool isLocked = false, flagged = false;
+                foreach (var material in renderer.sharedMaterials)
+                {
+                    if (material != null && material.shader != null)
+                    {
+                        shaderName = material.shader.name;
+                        // Thry's optimiser writes its output under these names; a locked
+                        // shader is the difference between "author forgot" and "author
+                        // flagged it but never re-locked".
+                        if (shaderName.StartsWith("Hidden/Locked/")
+                            || material.shader.name.Contains("/OptimizedShaders/"))
+                        {
+                            isLocked = true;
+                        }
+                        // Poiyomi's "animate this" override tag: already flagged, so do not repeat the advice.
+                        if (!string.IsNullOrEmpty(material.GetTag(property + "Animated", false, "")))
+                        {
+                            flagged = true;
+                        }
+                        break;
+                    }
+                }
+                return (shaderName, isLocked, flagged);
+            }
+
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        Audit(child.state != null ? child.state.motion : null);
+                    }
+                });
+            }
+
+            if (dead.Count == 0)
+            {
+                return;
+            }
+            var fixable = dead.Keys.Where(p => !flaggedAndStillMissing.Contains(p)).ToList();
+            var stubborn = dead.Keys.Where(flaggedAndStillMissing.Contains).ToList();
+            string List(IEnumerable<string> names) =>
+                string.Join(", ", names.Take(6)) + (names.Count() > 6 ? ", …" : "");
+
+            var worst = dead.OrderByDescending(p => p.Value.count).ThenBy(p => p.Key, StringComparer.Ordinal).Take(6)
+                .Select(p => $"{p.Key} ({BridgeElements.Count(p.Value.count, "renderer", "renderers")}, e.g. \"{p.Value.path}\")");
+            bool anyLocked = locked.Count > 0;
+            ctx.Report.Warning(Category,
+                $"{BridgeElements.Count(dead.Count, "animated material property doesn't", "animated material properties don't")} exist on the shader they target",
+                string.Join("; ", worst) + (dead.Count > 6 ? "; …" : "") + ". " +
+                (anyLocked
+                    ? "A locked Poiyomi shader baked them away.\n\n" +
+                      (fixable.Count > 0
+                          ? $"FIXABLE ({fixable.Count}): {List(fixable)}. In Poiyomi's inspector: unlock, mark " +
+                            "animated, lock again.\n\n"
+                          : "") +
+                      (stubborn.Count > 0
+                          ? $"PROBABLY NOT ({stubborn.Count}): {List(stubborn)}. Already marked animated: their " +
+                            "shader section is off, or the Poiyomi version differs.\n\n"
+                          : "")
+                    : "They change nothing on screen. Check the names against the shader. ") +
+                "Equally dead in VRChat; conversion did not cause it.");
+        }
+
+        static void ReportKeptFaceTracking(AnimatorController master, BridgeContext ctx)
+        {
+            if (ctx.Settings.faceTrackingMode != FaceTrackingMode.None)
+            {
+                return;
+            }
+            var kept = master.parameters
+                .Select(p => p.name)
+                .Where(AvatarFeatureDetect.IsFaceTrackingParameter)
+                .ToList();
+            if (kept.Count == 0)
+            {
+                return;
+            }
+            var shown = kept.Take(6).Select(AvatarFeatureDetect.FaceTrackingShortName);
+            ctx.Report.Converted(Category,
+                $"Kept the avatar's own face tracking rig: {BridgeElements.Count(kept.Count, "parameter", "parameters")} came through",
+                $"{string.Join(", ", shown)}{(kept.Count > 6 ? ", …" : "")}. Merged unchanged; try them in the " +
+                "Avatar Tester.");
+        }
+
+        // Serialized guid sets of the source controllers, captured before any merging.
+        static readonly HashSet<string> _sourceControllerGuids = new HashSet<string>();
+
+        static void CollectSerializedGuids(string assetPath, HashSet<string> into)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(assetPath))
+                {
+                    return;
+                }
+                string full = System.IO.Path.GetFullPath(assetPath);
+                if (!System.IO.File.Exists(full))
+                {
+                    return;
+                }
+                // Full PPtr syntax only: {fileID: N, guid: X, type: N}.
+                // A bare "guid:" grep matches guid-looking text inside
+                // string fields, like missing-prefab object names.
+                foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex
+                    .Matches(System.IO.File.ReadAllText(full),
+                        @"\{fileID: -?\d+, guid: ([0-9a-f]{32}), type: \d+\}"))
+                {
+                    into.Add(match.Groups[1].Value);
+                }
+            }
+            catch
+            {
+                // Unreadable source: the audit just loses inherited/introduced attribution.
+            }
+        }
+
+        internal static void NameGraftedEmoteClips(BridgeContext ctx)
+        {
+            var master = ctx.MergedController;
+            if (master == null)
+            {
+                return;
+            }
+            var layer = master.layers.FirstOrDefault(l => l != null && l.name == "Locomotion/Emotes");
+            if (layer?.stateMachine == null)
+            {
+                return;
+            }
+            // Copied, never renamed: one clip can sit in a grafted state and a puppet tree.
+            // One copy per source clip.
+            var copies = new Dictionary<AnimationClip, AnimationClip>();
+            var renamed = new SortedSet<string>(StringComparer.Ordinal);
+            var pending = new List<(AnimationClip copy, string target)>();
+            var stale = new List<string>();
+            foreach (var child in layer.stateMachine.states)
+            {
+                var state = child.state;
+                if (state == null || state.name == null
+                    || !state.name.StartsWith("[AB] ", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                if (!(state.motion is AnimationClip clip) || clip == null
+                    || clip.name.Contains("Emote"))
+                {
+                    continue;
+                }
+                if (!copies.TryGetValue(clip, out var copy))
+                {
+                    copy = UnityEngine.Object.Instantiate(clip);
+                    copy.name = clip.name + " Emote";
+                    pending.Add((copy, OutputAssetPaths.Claim(
+                        $"{ctx.OutputDir}/RehomedAssets/{SanitizeFileName(copy.name)}.anim", stale)));
+                    copies[clip] = copy;
+                }
+                state.motion = copy;
+                EditorUtility.SetDirty(state);
+                renamed.Add($"\"{state.name.Substring(5)}\"");
+            }
+            // Written in one batch: a delete and a create each refreshed the database, per emote.
+            if (pending.Count > 0)
+            {
+                EnsureAssetFolder($"{ctx.OutputDir}/RehomedAssets");
+                if (stale.Count > 0) AssetDatabase.DeleteAssets(stale.ToArray(), new List<string>());
+                AssetDatabase.StartAssetEditing();
+                try
+                {
+                    foreach (var (copy, target) in pending) AssetDatabase.CreateAsset(copy, target);
+                }
+                finally
+                {
+                    AssetDatabase.StopAssetEditing();
+                }
+            }
+            if (renamed.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Converted(Category,
+                $"{BridgeElements.Count(renamed.Count, "emote will free your hands while it plays", "emotes will free your hands while they play")}",
+                string.Join(", ", renamed) + ": ChilloutVR knows an emote by its clip name, so these are " +
+                "renamed. It still cannot pose single fingers.");
+        }
+
+        internal static void StripDeadMaterialCurves(BridgeContext ctx)
+        {
+            var master = ctx.MergedController;
+            if (master == null || !ctx.Settings.stripDeadMaterialAnimation)
+            {
+                return;
+            }
+            var root = ctx.Target.transform;
+
+            // Renderers with animated material slots are off limits.
+            // "No such property" is only true of this instant; the
+            // swapped-in material may well have it.
+            var swapped = new HashSet<Renderer>();
+            var clips = new HashSet<AnimationClip>();
+            foreach (var layer in master.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        CollectClips(child.state != null ? child.state.motion : null, clips);
+                    }
+                });
+            }
+            foreach (var clip in clips)
+            {
+                foreach (var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+                {
+                    if (!binding.propertyName.StartsWith("m_Materials."))
+                    {
+                        continue;
+                    }
+                    var target = BridgeContext.FindByAnimationPath(root, binding.path);
+                    var renderer = target != null ? target.GetComponent<Renderer>() : null;
+                    if (renderer != null)
+                    {
+                        swapped.Add(renderer);
+                    }
+                }
+            }
+
+            var byProperty = new Dictionary<string, int>();
+            int curvesRemoved = 0, clipsTouched = 0, clipsEmptied = 0;
+
+            foreach (var clip in clips)
+            {
+                var doomed = new List<EditorCurveBinding>();
+                foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                {
+                    if (!binding.propertyName.StartsWith("material."))
+                    {
+                        continue;
+                    }
+                    string property = binding.propertyName.Substring("material.".Length);
+                    int dot = property.LastIndexOf('.');
+                    if (dot > 0 && property.Length - dot == 2)
+                    {
+                        property = property.Substring(0, dot);
+                    }
+                    var target = BridgeContext.FindByAnimationPath(root, binding.path);
+                    var renderer = target != null ? target.GetComponent<Renderer>() : null;
+                    // Unresolvable path: AuditClipBindings owns that, and guessing here could
+                    // delete animation for an object a later step restores.
+                    if (renderer == null || swapped.Contains(renderer))
+                    {
+                        continue;
+                    }
+                    if (renderer.sharedMaterials.Any(m => m != null && m.HasProperty(property)))
+                    {
+                        continue;
+                    }
+                    doomed.Add(binding);
+                    byProperty.TryGetValue(property, out int seen);
+                    byProperty[property] = seen + 1;
+                }
+                if (doomed.Count == 0)
+                {
+                    continue;
+                }
+                foreach (var binding in doomed)
+                {
+                    AnimationUtility.SetEditorCurve(clip, binding, null);
+                }
+                curvesRemoved += doomed.Count;
+                clipsTouched++;
+                if (AnimationUtility.GetCurveBindings(clip).Length == 0
+                    && AnimationUtility.GetObjectReferenceCurveBindings(clip).Length == 0)
+                {
+                    clipsEmptied++;
+                }
+                EditorUtility.SetDirty(clip);
+            }
+
+            if (curvesRemoved == 0)
+            {
+                return;
+            }
+
+            int layersRemoved = RemoveEmptyToggleLayers(master, ctx);
+            // The parameter and menu pruning that already exists does the rest of the cascade,
+            // now that nothing reads those parameters.
+            PruneOrphanedParameters(master, ctx);
+            PruneDeadMenuEntries(master, ctx);
+            EditorUtility.SetDirty(master);
+            AssetDatabase.SaveAssets();
+
+            var worst = byProperty.OrderByDescending(p => p.Value).ThenBy(p => p.Key, StringComparer.Ordinal).Take(6)
+                .Select(p => $"{p.Key} ({p.Value})");
+            ctx.Report.Converted(Category,
+                $"Removed {BridgeElements.Count(curvesRemoved, "animation curve", "animation curves")} that could never have done anything",
+                $"{string.Join(", ", worst)}{(byProperty.Count > 6 ? ", …" : "")}: across " +
+                $"{BridgeElements.Count(clipsTouched, "clip", "clips")}, of which {clipsEmptied} were left animating nothing" +
+                (layersRemoved > 0 ? $", and {BridgeElements.Count(layersRemoved, "layer", "layers")} left animating nothing removed" : "") +
+                ". Their shader lacks those properties, so they did nothing in VRChat either. The warning " +
+                "above says which can come back. Turn off \"Remove animation that can't do anything\" to keep " +
+                "them. Only the conversion's copies were edited.");
+        }
+
+        static int RemoveEmptyToggleLayers(AnimatorController master, BridgeContext ctx)
+        {
+            var layers = master.layers;
+            var dropped = new List<string>();
+            // Highest first, keeping lower indices valid. RemoveLayer, as after the save a dropped
+            // list entry leaves its machine in the file. Motions detached first: clips are shared.
+            for (int i = layers.Length - 1; i >= 0; i--)
+            {
+                var layer = layers[i];
+                if (IsProtectedLayer(layer.name) || !LayerAnimatesNothing(layer))
+                {
+                    continue;
+                }
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        if (child.state != null)
+                        {
+                            child.state.motion = null;
+                        }
+                    }
+                });
+                master.RemoveLayer(i);
+                dropped.Insert(0, layer.name);
+            }
+            if (dropped.Count == 0)
+            {
+                return 0;
+            }
+            // Not only the layers this strip emptied: one that animated nothing to begin
+            // with goes too.
+            ctx.Report.Converted(Category,
+                $"Removed {BridgeElements.Count(dropped.Count, "layer", "layers")} left animating nothing",
+                string.Join(", ", dropped.Take(8)) + (dropped.Count > 8 ? ", …" : "") +
+                ": no state in them animates anything or runs a behaviour.");
+            return dropped.Count;
+        }
+
+        // Exact names, not IsHandLayer: a numbered duplicate still needs the toggle passes,
+        // above all AnyState self-restart suppression.
+        static bool IsProtectedLayer(string name)
+        {
+            return name == "Locomotion/Emotes" || name == "LeftHand" || name == "RightHand"
+                   || name == "Size" || name == "Linear Smoothing Layer"
+                   || name.StartsWith("[FT] ");
+        }
+
+        static bool LayerAnimatesNothing(AnimatorControllerLayer layer)
+        {
+            bool empty = true;
+            WalkMachines(layer.stateMachine, machine =>
+            {
+                if (machine.behaviours != null && machine.behaviours.Length > 0)
+                {
+                    empty = false;
+                }
+                foreach (var child in machine.states)
+                {
+                    if (child.state == null)
+                    {
+                        continue;
+                    }
+                    if (child.state.behaviours != null && child.state.behaviours.Length > 0)
+                    {
+                        empty = false;
+                        return;
+                    }
+                    if (MotionAnimatesSomething(child.state.motion))
+                    {
+                        empty = false;
+                        return;
+                    }
+                }
+            });
+            return empty;
+        }
+
+        static bool MotionAnimatesSomething(Motion motion)
+        {
+            if (motion is BlendTree tree)
+            {
+                return tree.children.Any(c => MotionAnimatesSomething(c.motion));
+            }
+            if (!(motion is AnimationClip clip))
+            {
+                return false;
+            }
+            return AnimationUtility.GetCurveBindings(clip).Length > 0
+                   || AnimationUtility.GetObjectReferenceCurveBindings(clip).Length > 0;
+        }
+
+        internal static void CollectClips(Motion motion, HashSet<AnimationClip> into)
+        {
+            if (motion is BlendTree tree)
+            {
+                foreach (var child in tree.children)
+                {
+                    CollectClips(child.motion, into);
+                }
+            }
+            else if (motion is AnimationClip clip)
+            {
+                into.Add(clip);
+            }
+        }
+
+        internal static void AuditSerializedReferences(BridgeContext ctx)
+        {
+            string controllerPath = ctx.MergedController != null
+                ? AssetDatabase.GetAssetPath(ctx.MergedController)
+                : null;
+            var guids = new HashSet<string>();
+            CollectSerializedGuids(controllerPath, guids);
+            if (guids.Count == 0)
+            {
+                return;
+            }
+
+            int intoTemp = 0, introduced = 0, inherited = 0;
+            string badSample = null, inheritedSample = null;
+            foreach (var guid in guids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(path))
+                {
+                    if (_sourceControllerGuids.Contains(guid))
+                    {
+                        inherited++;
+                        inheritedSample = inheritedSample ?? guid;
+                    }
+                    else
+                    {
+                        introduced++;
+                        badSample = badSample ?? guid;
+                    }
+                }
+                else if (IsDoomedGeneratedPath(path))
+                {
+                    intoTemp++;
+                    badSample = badSample ?? path;
+                }
+            }
+
+            if (intoTemp > 0 || introduced > 0)
+            {
+                ctx.Report.Error(Category,
+                    $"The saved controller references {intoTemp} bake-temp (VRCFury/NDMF) and {BridgeElements.Count(introduced, "unresolvable asset", "unresolvable assets")}",
+                    $"e.g. {badSample}. They stop working after the next play or VRCFury build. Do not upload " +
+                    "this conversion." +
+                    (introduced > 0
+                        // Usually a VRCFury bake that failed partway (hundreds of Fury exceptions in
+                        // the log), which nothing here can repair, so the message says check that first.
+                        ? " Check the bake first: build a test copy of the SOURCE avatar (Tools > VRCFury > " +
+                          "Build a Test Copy). A version mismatch is the usual cause. If that is clean, please " +
+                          "report it with this file."
+                        : ""));
+            }
+            if (inherited > 0)
+            {
+                ctx.Report.Warning(Category,
+                    $"{BridgeElements.Count(inherited, "dead asset reference", "dead asset references")} inherited from the source avatar",
+                    $"e.g. {inheritedSample}. Missing from this project, so dead in VRChat too. Safe to upload; " +
+                    "import the missing package to revive them.");
+            }
+        }
+
+        static int CountMotionReferences(AnimatorController controller)
+        {
+            int count = 0;
+            void CountMotion(Motion motion)
+            {
+                if (motion == null)
+                {
+                    return;
+                }
+                count++;
+                if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        CountMotion(child.motion);
+                    }
+                }
+            }
+            foreach (var layer in controller.layers)
+            {
+                WalkMachines(layer.stateMachine, machine =>
+                {
+                    foreach (var child in machine.states)
+                    {
+                        CountMotion(child.state.motion);
+                    }
+                });
+            }
+            return count;
+        }
+
+
+        static IEnumerable<AnimationClip> CollectClips(Motion motion)
+        {
+            if (motion is AnimationClip clip)
+            {
+                yield return clip;
+            }
+            else if (motion is BlendTree tree)
+            {
+                foreach (var child in tree.children)
+                {
+                    foreach (var nested in CollectClips(child.motion))
+                    {
+                        yield return nested;
+                    }
+                }
+            }
+        }
+
+        static void DeduplicateLayers(AnimatorController master, BridgeContext ctx)
+        {
+            var seenMachines = new HashSet<AnimatorStateMachine>();
+            var kept = new List<AnimatorControllerLayer>();
+            var dropped = new List<string>();
+            foreach (var layer in master.layers)
+            {
+                if (layer.stateMachine != null && !seenMachines.Add(layer.stateMachine))
+                {
+                    dropped.Add(layer.name);
+                    continue;
+                }
+                kept.Add(layer);
+            }
+            if (dropped.Count > 0)
+            {
+                master.layers = kept.ToArray();
+                ctx.Report.Warning(Category, $"Removed {BridgeElements.Count(dropped.Count, "duplicate layer", "duplicate layers")}",
+                    string.Join(", ", dropped.Distinct()) + ": duplicates would have overwritten the working layer.");
+            }
+        }
+
+        static int _gestureConditionsRedirected;
+
+        static void StripExistingFaceTracking(AnimatorController master, List<AnimatorControllerLayer> vrcLayers, BridgeContext ctx)
+        {
+            if (ctx.Settings.faceTrackingMode == FaceTrackingMode.None)
+            {
+                return;
+            }
+            bool IsFt(string name) => FaceTrackingParameters.IsFaceTracking(name) || FaceTrackingParameters.IsRigSwitch(name);
+
+            var removedMachines = new HashSet<AnimatorStateMachine>();
+            foreach (var layer in vrcLayers.ToList())
+            {
+                // Without IsLocal, TrackingType and the like: a viseme layer reading VisemesEnable and
+                // TrackingType came out half the rig's and stayed, holding the tracked mouth at 0.
+                var refs = SystemStripper.CollectParameterRefs(layer.stateMachine).Where(r => !FaceTrackingParameters.IsNeutral(r)).ToList();
+                if (refs.Count == 0)
+                {
+                    continue;
+                }
+                int ftRefs = refs.Count(IsFt);
+                if (ftRefs > 0 && ftRefs >= refs.Count * 0.6f)
+                {
+                    removedMachines.Add(layer.stateMachine);
+                    vrcLayers.Remove(layer);
+                }
+            }
+            if (removedMachines.Count > 0)
+            {
+                master.layers = master.layers
+                    .Where(l => l.stateMachine == null || !removedMachines.Contains(l.stateMachine))
+                    .ToArray();
+            }
+
+            // VRCFury's Defaults Direct tree keeps FT parameters "referenced", so prune them there too.
+            SystemStripper.PruneDirectBlendTrees(ctx, master, vrcLayers, IsFt);
+
+            var stillReferenced = new HashSet<string>();
+            foreach (var layer in master.layers)
+            {
+                stillReferenced.UnionWith(SystemStripper.CollectParameterRefs(layer.stateMachine));
+            }
+            var parameters = master.parameters;
+            int before = parameters.Length;
+            master.parameters = parameters.Where(p => !IsFt(p.name) || stillReferenced.Contains(p.name)).ToArray();
+            int removedParams = before - master.parameters.Length;
+
+            if (removedMachines.Count > 0 || removedParams > 0)
+            {
+                ctx.Report.Converted("Face tracking",
+                    $"Removed the avatar's existing FT rig: {BridgeElements.Count(removedMachines.Count, "layer", "layers")}, {BridgeElements.Count(removedParams, "parameter", "parameters")}",
+                    "This mode provides its own face tracking, so the baked-in FT animator was removed " +
+                    "to avoid fighting it for the same blendshapes.");
+            }
+        }
+
+        static AvatarMask _handLeftMask, _handRightMask, _handsOnlyMask, _musclesOnlyMask, _noMuscleMask, _noFingersMask;
+
+        static AvatarMask GetHandsOnlyMask() =>
+            _handsOnlyMask = _handsOnlyMask != null ? _handsOnlyMask
+                : BuildMask("AvatarBridge_HandsOnly", AvatarMaskBodyPart.LeftFingers, AvatarMaskBodyPart.RightFingers);
+
+        // Every humanoid part off, the transform list as authored. Saved with the controller.
+        static AvatarMask WithoutMuscles(AvatarMask mask)
+        {
+            var copy = new AvatarMask { name = mask.name + "_NoMuscles" };
+            for (int part = 0; part < (int)AvatarMaskBodyPart.LastBodyPart; part++)
+            {
+                copy.SetHumanoidBodyPartActive((AvatarMaskBodyPart)part, false);
+            }
+            copy.transformCount = mask.transformCount;
+            for (int t = 0; t < mask.transformCount; t++)
+            {
+                copy.SetTransformPath(t, mask.GetTransformPath(t));
+                copy.SetTransformActive(t, mask.GetTransformActive(t));
+            }
+            return copy;
+        }
+
+        // No mask, or one that lets any part but the fingers through.
+        static bool MaskReachesBody(AvatarMask mask)
+        {
+            if (mask == null)
+            {
+                return true;
+            }
+            for (int i = 0; i < (int)AvatarMaskBodyPart.LastBodyPart; i++)
+            {
+                var part = (AvatarMaskBodyPart)i;
+                if (part != AvatarMaskBodyPart.LeftFingers && part != AvatarMaskBodyPart.RightFingers
+                    && mask.GetHumanoidBodyPartActive(part))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static AvatarMask GetNoMuscleMask(BridgeContext ctx)
+        {
+            return _noMuscleMask != null ? _noMuscleMask
+                : _noMuscleMask = BuildRigMask("AvatarBridge_NoMuscles", ctx);
+        }
+
+        static AvatarMask GetNoFingersMask(BridgeContext ctx)
+        {
+            if (_noFingersMask != null)
+            {
+                return _noFingersMask;
+            }
+            var parts = new List<AvatarMaskBodyPart>();
+            for (int i = 0; i < (int)AvatarMaskBodyPart.LastBodyPart; i++)
+            {
+                var part = (AvatarMaskBodyPart)i;
+                if (part != AvatarMaskBodyPart.LeftFingers && part != AvatarMaskBodyPart.RightFingers)
+                {
+                    parts.Add(part);
+                }
+            }
+            return _noFingersMask = BuildRigMask("AvatarBridge_NoFingers", ctx, parts.ToArray());
+        }
+
+        static AvatarMask BuildRigMask(string name, BridgeContext ctx, params AvatarMaskBodyPart[] activeParts)
+        {
+            var mask = BuildMask(name, activeParts);
+            ListEveryTransform(mask, ctx);
+            return mask;
+        }
+
+        // A mask lists transforms by PATH and animates only those, so objects renamed or made
+        // after the merge silently lose their curves (socket senders stopped scaling). Rebuilt at the end.
+        public static void RefreshRigMasks(BridgeContext ctx)
+        {
+            var master = ctx.MergedController;
+            if (master == null || ctx.Target == null)
+            {
+                return;
+            }
+            var seen = new HashSet<AvatarMask>();
+            int refreshed = 0;
+            foreach (var layer in master.layers)
+            {
+                var mask = layer?.avatarMask;
+                if (mask == null || !seen.Add(mask) || mask.transformCount == 0
+                    || !mask.name.StartsWith("AvatarBridge_", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                var before = new HashSet<string>();
+                for (int i = 0; i < mask.transformCount; i++)
+                {
+                    before.Add(mask.GetTransformPath(i));
+                }
+                ListEveryTransform(mask, ctx);
+                bool changed = before.Count != mask.transformCount;
+                for (int i = 0; !changed && i < mask.transformCount; i++)
+                {
+                    changed = !before.Contains(mask.GetTransformPath(i));
+                }
+                if (!changed)
+                {
+                    continue;
+                }
+                EditorUtility.SetDirty(mask);
+                refreshed++;
+            }
+            if (refreshed > 0)
+            {
+                ctx.Report.Converted("Animator", $"Refreshed {BridgeElements.Count(refreshed, "layer mask", "layer masks")}",
+                    "The masks that let a layer move any object list every object by name, and " +
+                    "objects were renamed after those lists were written. Rewritten from the final " +
+                    "hierarchy, so a position or scale toggle on a renamed object still lands.");
+            }
+        }
+
+        static void ListEveryTransform(AvatarMask mask, BridgeContext ctx)
+        {
+            var root = ctx.Target != null ? ctx.Target.transform : null;
+            if (root == null)
+            {
+                return;
+            }
+            mask.transformCount = 0;
+            mask.AddTransformPath(root, true);
+            for (int i = 0; i < mask.transformCount; i++)
+            {
+                mask.SetTransformActive(i, true);
+            }
+        }
+
+        static AvatarMask ReplaceVrcMask(AvatarMask mask, BridgeContext ctx)
+        {
+            if (mask == null)
+            {
+                return null;
+            }
+            switch (mask.name)
+            {
+                case "vrc_Hand Left":
+                    return _handLeftMask = _handLeftMask != null ? _handLeftMask
+                        : BuildMask("AvatarBridge_HandLeft", AvatarMaskBodyPart.LeftFingers);
+                case "vrc_Hand Right":
+                    return _handRightMask = _handRightMask != null ? _handRightMask
+                        : BuildMask("AvatarBridge_HandRight", AvatarMaskBodyPart.RightFingers);
+                case "vrc_HandsOnly":
+                    return GetHandsOnlyMask();
+                case "vrc_MusclesOnly":
+                    if (_musclesOnlyMask == null)
+                    {
+                        _musclesOnlyMask = BuildMask("AvatarBridge_MusclesOnly",
+                            AvatarMaskBodyPart.Root, AvatarMaskBodyPart.Body, AvatarMaskBodyPart.Head,
+                            AvatarMaskBodyPart.LeftLeg, AvatarMaskBodyPart.RightLeg,
+                            AvatarMaskBodyPart.LeftArm, AvatarMaskBodyPart.RightArm,
+                            AvatarMaskBodyPart.LeftFingers, AvatarMaskBodyPart.RightFingers);
+                    }
+                    return _musclesOnlyMask;
+                default:
+                    return mask;
+            }
+        }
+
+        static AvatarMask BuildMask(string name, params AvatarMaskBodyPart[] activeParts)
+        {
+            var mask = new AvatarMask { name = name };
+            for (int i = 0; i < (int)AvatarMaskBodyPart.LastBodyPart; i++)
+            {
+                mask.SetHumanoidBodyPartActive((AvatarMaskBodyPart)i, activeParts.Contains((AvatarMaskBodyPart)i));
+            }
+            return mask;
+        }
+
+        // ------------------------------------------------------------------ utils ----
+
+        public static void ResetMaskCache()
+        {
+            _handLeftMask = _handRightMask = _handsOnlyMask = _musclesOnlyMask = null;
+            _noMuscleMask = _noFingersMask = null;
+            // Renderers are new each run, so this would otherwise hold every converted avatar's.
+            WeightedBonesCache.Clear();
+        }
+
+        // Transitions leaving a child machine live on its parent, so a walk
+        // over states, AnyState and Entry never meets their conditions.
+        static AnimatorTransition[] SubMachineTransitions(AnimatorStateMachine machine) =>
+            machine.stateMachines
+                .Where(child => child.stateMachine != null)
+                .SelectMany(child => machine.GetStateMachineTransitions(child.stateMachine)
+                    ?? new AnimatorTransition[0])
+                .ToArray();
+
+        static void WalkMachines(AnimatorStateMachine machine, Action<AnimatorStateMachine> visit)
+            => WalkMachines(machine, visit, new HashSet<AnimatorStateMachine>());
+
+        // Cycle guard as in LocomotionGrafter.AllStates: script-made or corrupt controllers can loop.
+        static void WalkMachines(AnimatorStateMachine machine, Action<AnimatorStateMachine> visit,
+            HashSet<AnimatorStateMachine> seen)
+        {
+            if (machine == null || !seen.Add(machine))
+            {
+                return;
+            }
+            visit(machine);
+            foreach (var child in machine.stateMachines)
+            {
+                WalkMachines(child.stateMachine, visit, seen);
+            }
+        }
+
+        static string GetCvrHandLayerName(VRCAvatarDescriptor.AnimLayerType id, AnimatorControllerLayer srcLayer)
+        {
+            if (id != VRCAvatarDescriptor.AnimLayerType.Gesture || IsProxyOnlyLayer(srcLayer))
+            {
+                return null;
+            }
+            string maskName = srcLayer.avatarMask != null ? srcLayer.avatarMask.name : "";
+            if (maskName == "vrc_Hand Left") return "LeftHand";
+            if (maskName == "vrc_Hand Right") return "RightHand";
+
+            // What the layer READS (GestureLeft/Right) beats its name.
+            string drives = GestureSideOf(srcLayer);
+            if (drives != null) return drives;
+
+            // The name last, never by substring: "Copyright pose" became a right-hand layer.
+            // A word boundary alone misses "GestureRight", so: after a non-letter, or a mid-name capital.
+            if (Side(srcLayer.name, "left")) return "LeftHand";
+            if (Side(srcLayer.name, "right")) return "RightHand";
+            return null;
+        }
+
+        static bool Side(string layerName, string word)
+        {
+            if (string.IsNullOrEmpty(layerName)) return false;
+            string capital = char.ToUpperInvariant(word[0]) + word.Substring(1);
+            return Regex.IsMatch(layerName, "(^|[^A-Za-z])" + word, RegexOptions.IgnoreCase)
+                   || Regex.IsMatch(layerName, "[a-z]" + capital);
+        }
+
+        // The one gesture parameter this layer's trees or conditions read, else null.
+        static string GestureSideOf(AnimatorControllerLayer srcLayer)
+        {
+            if (srcLayer?.stateMachine == null) return null;
+            bool left = false, right = false;
+            var seen = new HashSet<Motion>();
+
+            void Read(string parameter)
+            {
+                if (string.IsNullOrEmpty(parameter)) return;
+                if (parameter.IndexOf("GestureLeft", StringComparison.OrdinalIgnoreCase) >= 0) left = true;
+                if (parameter.IndexOf("GestureRight", StringComparison.OrdinalIgnoreCase) >= 0) right = true;
+            }
+
+            void Look(Motion motion)
+            {
+                if (!(motion is BlendTree tree) || !seen.Add(tree)) return;
+                Read(tree.blendParameter);
+                Read(tree.blendParameterY);
+                foreach (var child in tree.children) Look(child.motion);
+            }
+
+            void Conditions(AnimatorStateTransition[] transitions)
+            {
+                foreach (var t in transitions)
+                {
+                    if (t == null) continue;
+                    foreach (var c in t.conditions) Read(c.parameter);
+                }
+            }
+
+            WalkMachines(srcLayer.stateMachine, machine =>
+            {
+                Conditions(machine.anyStateTransitions);
+                foreach (var child in machine.states)
+                {
+                    Look(child.state.motion);
+                    Conditions(child.state.transitions);
+                    if (child.state.timeParameterActive) Read(child.state.timeParameter);
+                    if (child.state.speedParameterActive) Read(child.state.speedParameter);
+                }
+            });
+
+            // Both is no answer: a layer reading each hand belongs to
+            // neither of CVR's two, and guessing one halves it.
+            if (left == right) return null;
+            return left ? "LeftHand" : "RightHand";
+        }
+
+        // proxy_* clips are VRChat runtime placeholders; played literally, fingers snap.
+        internal static bool IsProxyOnlyLayer(AnimatorControllerLayer srcLayer)
+        {
+            if (srcLayer?.stateMachine == null)
+            {
+                return false;
+            }
+            int clips = 0;
+            bool authored = false;
+            void Look(Motion motion)
+            {
+                if (motion is AnimationClip clip)
+                {
+                    clips++;
+                    if (!IsVrchatProxyClip(clip))
+                    {
+                        authored = true;
+                    }
+                }
+                else if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children)
+                    {
+                        Look(child.motion);
+                    }
+                }
+            }
+            WalkMachines(srcLayer.stateMachine, machine =>
+            {
+                foreach (var child in machine.states)
+                {
+                    if (child.state != null)
+                    {
+                        Look(child.state.motion);
+                    }
+                }
+            });
+            return clips > 0 && !authored;
+        }
+
+        static int CountParameterDrivers(AnimatorControllerLayer layer)
+        {
+            int drivers = 0;
+            WalkMachines(layer.stateMachine, machine =>
+            {
+                foreach (var child in machine.states)
+                {
+                    foreach (var behaviour in child.state.behaviours)
+                    {
+                        if (behaviour is VRCAvatarParameterDriver)
+                        {
+                            drivers++;
+                        }
+                    }
+                }
+            });
+            return drivers;
+        }
+
+        internal static bool IsVrchatProxyClip(AnimationClip clip)
+        {
+            if (clip == null)
+            {
+                return false;
+            }
+            if (clip.name.StartsWith("proxy_", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            // Rehomed copies keep the name; a package path only proves
+            // where the original sat, so the name is checked first.
+            string path = AssetDatabase.GetAssetPath(clip) ?? "";
+            return path.IndexOf("com.vrchat.", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static string MakeUniqueLayerName(List<AnimatorControllerLayer> layers, string name)
+        {
+            string candidate = name;
+            int suffix = 2;
+            while (layers.Any(l => l.name == candidate))
+            {
+                candidate = $"{name} {suffix++}";
+            }
+            return candidate;
+        }
+
+        static string SanitizeFileName(string name)
+        {
+            // An asset's name is free text and can be empty; a file name can be neither.
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return "Asset";
+            }
+            foreach (char c in System.IO.Path.GetInvalidFileNameChars())
+            {
+                name = name.Replace(c, '_');
+            }
+            return name.Trim();
+        }
+    }
+}
+#endif

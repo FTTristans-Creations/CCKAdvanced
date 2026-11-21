@@ -1,0 +1,59 @@
+name: Release package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version from tag
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '$GITHUB_REF_NAME' is not a plain semver (expected vX.Y.Z)."
+            exit 1
+          fi
+
+          # package.json: set the version the VCC publisher reads.
+          python3 - "$VERSION" <<'PY'
+          import json, sys
+          version = sys.argv[1]
+          with open('package.json') as f:
+              data = json.load(f)
+          data['version'] = version
+          with open('package.json', 'w') as f:
+              json.dump(data, f, indent=2)
+              f.write('\n')
+          PY
+
+          # The updater's own version constant, patched inside the shipped sources.
+          sed -i "s/public const string Version = \"[^\"]*\";/public const string Version = \"$VERSION\";/" \
+            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+          grep -q "Version = \"$VERSION\"" \
+            "Assets/CVR.CCK/Advanced/Scripts/Common/CCKAdvancedInfo.cs"
+
+          echo "Stamped version $VERSION"
+
+      - name: Build VPM package zip
+        run: |
+          set -euo pipefail
+          ZIP_NAME="com.fttristan.cck-advanced.zip"
+          rm -f "$ZIP_NAME"
+          zip -r "$ZIP_NAME" package.json "Assets/CVR.CCK" \
+            -x "*.DS_Store" "*/.DS_Store" "*.tmp"
+          echo "Built $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: com.fttristan.cck-advanced.zip
+          generate_release_notes: true

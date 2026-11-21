@@ -1,0 +1,21 @@
+.cck-tab-selected {
+    background-color: rgba(0, 0, 0, 0.4);
+}
+
+.back-icon {
+    background-image: resource("d_back@2x");
+}
+
+.forward-icon {
+    background-image: resource("d_forward@2x");
+}
+
+/* light mode version
+.back-icon {
+    background-image: resource("back@2x");
+}
+
+.forward-icon {
+    background-image: resource("forward@2x");
+}
+*/

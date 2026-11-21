@@ -1,0 +1,1042 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using VRC.SDK3.Avatars.Components;
+
+namespace AvatarBridge
+{
+    // Grafts the avatar's locomotion clips into CVR's Locomotion/Emotes layer, the one layer that
+    // can both assert and yield a body pose. proxy_* clips are skipped (the CCK's equal them).
+    // Matched by tree position: VRChat trees in m/s, CVR in normalized input. Sources never modified.
+    internal static class LocomotionGrafter
+    {
+        const string Category = "Animator";
+
+        static readonly Dictionary<(AnimationClip clip, bool loop), AnimationClip> LoopClones
+            = new Dictionary<(AnimationClip, bool), AnimationClip>();
+
+        static readonly Dictionary<(AnimationClip clip, bool onlyIfTravels, bool keepPose), AnimationClip> MotionStripped
+            = new Dictionary<(AnimationClip, bool, bool), AnimationClip>();
+
+        static readonly List<string> StrippedNames = new List<string>();
+
+        internal static void ResetClones()
+        {
+            LoopClones.Clear();
+            MotionStripped.Clear();
+            StrippedNames.Clear();
+            GogoEmotes.Clear();
+        }
+
+        internal static AnimationClip WithoutRootMotion(AnimationClip clip, bool onlyIfTravels = false,
+            bool keepPose = false)
+        {
+            if (clip == null)
+            {
+                return null;
+            }
+            if (MotionStripped.TryGetValue((clip, onlyIfTravels, keepPose), out var done))
+            {
+                return done;
+            }
+            var doomed = new List<EditorCurveBinding>();
+            foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+            {
+                if (!IsRootMovement(binding))
+                {
+                    continue;
+                }
+                // A full-body pose owns its height and orientation; only floor travel is the game's.
+                // Baked into the bones: CVR discards root motion, so a root curve does nothing worn.
+                // Only Action-transplanted poses ask for this.
+                if (keepPose && (IsVertical(binding) || IsRotation(binding)))
+                {
+                    continue;
+                }
+                doomed.Add(binding);
+            }
+            if (doomed.Count == 0 || (onlyIfTravels && !Travels(clip, doomed)))
+            {
+                // Nothing to strip, but a kept pose may still need its
+                // curves baked, and that needs a clone.
+                if (keepPose && NeedsBake(clip))
+                {
+                    var poseOnly = UnityEngine.Object.Instantiate(clip);
+                    poseOnly.name = clip.name;
+                    BakeIntoPose(poseOnly);
+                    MotionStripped[(clip, onlyIfTravels, keepPose)] = poseOnly;
+                    return poseOnly;
+                }
+                MotionStripped[(clip, onlyIfTravels, keepPose)] = clip;
+                return clip;
+            }
+            var clone = UnityEngine.Object.Instantiate(clip);
+            clone.name = clip.name;
+            if (keepPose)
+            {
+                BakeIntoPose(clone);
+            }
+            foreach (var binding in doomed)
+            {
+                // Flattened, never deleted: the root curve also carries the baseline height.
+                var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                float first = curve != null && curve.keys.Length > 0 ? curve.keys[0].value : 0f;
+                AnimationUtility.SetEditorCurve(clone, binding,
+                    AnimationCurve.Constant(0f, Mathf.Max(clip.length, 1f / 60f), first));
+            }
+            MotionStripped[(clip, onlyIfTravels, keepPose)] = clone;
+            StrippedNames.Add(clip.name);
+            return clone;
+        }
+
+        static bool Travels(AnimationClip clip, List<EditorCurveBinding> rootBindings)
+        {
+            float positionDelta = 0f, rotationDelta = 0f;
+            foreach (var binding in rootBindings)
+            {
+                var curve = AnimationUtility.GetEditorCurve(clip, binding);
+                if (curve == null || curve.keys.Length == 0)
+                {
+                    continue;
+                }
+                float delta = Mathf.Abs(curve.keys[curve.keys.Length - 1].value - curve.keys[0].value);
+                string p = binding.propertyName;
+                bool position = p.StartsWith("RootT.", StringComparison.Ordinal)
+                    || p.StartsWith("MotionT.", StringComparison.Ordinal)
+                    || p.StartsWith("m_LocalPosition", StringComparison.Ordinal);
+                if (position)
+                {
+                    positionDelta = Mathf.Max(positionDelta, delta);
+                }
+                else
+                {
+                    rotationDelta = Mathf.Max(rotationDelta, delta);
+                }
+            }
+            // Rotation curves are quaternion components (0..1 scale); 0.1 is roughly 12 degrees.
+            return positionDelta > 0.05f || rotationDelta > 0.1f;
+        }
+
+        static bool IsRootMovement(EditorCurveBinding binding)
+        {
+            if (!string.IsNullOrEmpty(binding.path))
+            {
+                return false; // a child bone's own animation is pose, not player movement
+            }
+            if (binding.type == typeof(Transform))
+            {
+                return true;
+            }
+            if (binding.type == typeof(Animator))
+            {
+                string p = binding.propertyName;
+                return p.StartsWith("RootT.", StringComparison.Ordinal)
+                    || p.StartsWith("RootQ.", StringComparison.Ordinal)
+                    || p.StartsWith("MotionT.", StringComparison.Ordinal)
+                    || p.StartsWith("MotionQ.", StringComparison.Ordinal);
+            }
+            return false;
+        }
+
+        static bool NeedsBake(AnimationClip clip)
+        {
+            var s = AnimationUtility.GetAnimationClipSettings(clip);
+            return !s.loopBlendOrientation || !s.loopBlendPositionY;
+        }
+
+        static void BakeIntoPose(AnimationClip clip)
+        {
+            var s = AnimationUtility.GetAnimationClipSettings(clip);
+            s.loopBlendOrientation = true;
+            s.keepOriginalOrientation = true;
+            s.loopBlendPositionY = true;
+            s.keepOriginalPositionY = true;
+            AnimationUtility.SetAnimationClipSettings(clip, s);
+        }
+
+        static bool IsRotation(EditorCurveBinding binding)
+        {
+            string p = binding.propertyName;
+            return p.StartsWith("RootQ.", StringComparison.Ordinal)
+                   || p.StartsWith("MotionQ.", StringComparison.Ordinal)
+                   || p.StartsWith("m_LocalRotation.", StringComparison.Ordinal);
+        }
+
+        static bool IsVertical(EditorCurveBinding binding)
+        {
+            string p = binding.propertyName;
+            return p.EndsWith(".y", StringComparison.Ordinal)
+                   && (p.StartsWith("RootT.", StringComparison.Ordinal)
+                       || p.StartsWith("MotionT.", StringComparison.Ordinal)
+                       || p.StartsWith("m_LocalPosition.", StringComparison.Ordinal));
+        }
+
+        static AnimationClip Prepare(AnimationClip graft, Motion slotOriginal)
+        {
+            return LoopMatched(WithoutRootMotion(graft), slotOriginal);
+        }
+
+        static AnimationClip LoopMatched(AnimationClip graft, Motion slotOriginal)
+        {
+            if (!(slotOriginal is AnimationClip original) || graft == null)
+            {
+                return graft;
+            }
+            bool wantLoop = AnimationUtility.GetAnimationClipSettings(original).loopTime;
+            if (AnimationUtility.GetAnimationClipSettings(graft).loopTime == wantLoop)
+            {
+                return graft;
+            }
+            if (LoopClones.TryGetValue((graft, wantLoop), out var cached))
+            {
+                return cached;
+            }
+            var clone = UnityEngine.Object.Instantiate(graft);
+            clone.name = graft.name;
+            var settings = AnimationUtility.GetAnimationClipSettings(clone);
+            settings.loopTime = wantLoop;
+            AnimationUtility.SetAnimationClipSettings(clone, settings);
+            LoopClones[(graft, wantLoop)] = clone;
+            return clone;
+        }
+
+        // Direction-and-speed identity of a locomotion blend-tree child.
+        enum Slot
+        {
+            Idle,
+            WalkForward, RunForward,
+            WalkBack, RunBack,
+            WalkStrafe, RunStrafe,
+            WalkForwardDiagonal, RunForwardDiagonal,
+            WalkBackDiagonal, RunBackDiagonal
+        }
+
+        public static void Run(BridgeContext ctx, AnimatorController master)
+        {
+            // Clone caches are cleared by AnimatorMerger.Run before the
+            // Action transplant. Clearing here would break the dedupe.
+            var cvrLayer = master.layers.FirstOrDefault(l => l != null && l.name == "Locomotion/Emotes");
+            if (cvrLayer == null || cvrLayer.stateMachine == null)
+            {
+                return; // keep-GoGo mode removes the layer; nothing to graft into
+            }
+            var targets = CollectStates(cvrLayer.stateMachine);
+
+            var grafts = new List<string>();
+            int proxiesSkipped = 0;
+
+            var baseController = ctx.Settings.convertBaseLayer
+                ? SourceController(ctx, VRCAvatarDescriptor.AnimLayerType.Base)
+                : null;
+            if (baseController != null)
+            {
+                GraftStanceTrees(baseController, targets, grafts, ref proxiesSkipped);
+                GraftJumpAndFall(baseController, targets, grafts, ref proxiesSkipped);
+            }
+
+            // The client raises Flying itself, so only the pose is converted, not speed logic.
+            var poseSources = new List<AnimatorController>();
+            if (baseController != null)
+            {
+                poseSources.Add(baseController);
+            }
+            if (ctx.Settings.convertActionLayer)
+            {
+                var action = SourceController(ctx, VRCAvatarDescriptor.AnimLayerType.Action);
+                if (action != null)
+                {
+                    poseSources.Add(action);
+                }
+            }
+            GraftMovementModePoses(poseSources, targets, grafts, ref proxiesSkipped);
+
+            // The Sitting special layer is descriptor-level content.
+            // Its one useful product here is the sit pose itself.
+            GraftSitting(ctx, targets, grafts, ref proxiesSkipped);
+
+            if (grafts.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"{grafts.Count} of the avatar's own locomotion animations grafted into ChilloutVR's locomotion",
+                    $"{string.Join("; ", grafts)}. Matched to ChilloutVR's locomotion by velocity, loops matched " +
+                    "to their slot. A flight pose plays in ChilloutVR's own flight mode.");
+            }
+            else if (proxiesSkipped > 0 && ctx.Settings.convertBaseLayer)
+            {
+                ctx.Report.Skipped(Category,
+                    "Base locomotion is VRChat's built-in placeholder animations, nothing to carry over",
+                    $"All {proxiesSkipped} are VRChat proxy clips. ChilloutVR's own set is used.");
+            }
+
+            if (StrippedNames.Count > 0)
+            {
+                ctx.Report.Converted(Category,
+                    $"Movement baked into {BridgeElements.Count(StrippedNames.Count, "animation", "animations")} flattened, ChilloutVR moves you itself",
+                    $"{string.Join(", ", StrippedNames.Distinct())}. Root movement is held at its starting value, " +
+                    "so the game moves you. Motion that returns home is untouched.");
+            }
+        }
+
+        // ------------------------------------------------------------------ sources ----
+
+        static AnimatorController SourceController(BridgeContext ctx, VRCAvatarDescriptor.AnimLayerType type)
+        {
+            foreach (var layer in ctx.SourceDescriptor.baseAnimationLayers)
+            {
+                if (layer.type == type && !layer.isDefault)
+                {
+                    return layer.animatorController as AnimatorController;
+                }
+            }
+            return null;
+        }
+
+        static bool IsVrchatStock(AnimationClip clip)
+        {
+            if (clip == null)
+            {
+                return true;
+            }
+            if (clip.name.StartsWith("proxy_", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            string path = AssetDatabase.GetAssetPath(clip) ?? "";
+            return path.IndexOf("com.vrchat.", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // ------------------------------------------------------------ stance trees ----
+
+        static void GraftStanceTrees(AnimatorController source,
+            Dictionary<string, AnimatorState> targets, List<string> grafts, ref int proxiesSkipped)
+        {
+            // CCK state name -> which source states qualify as that stance. "Lying" is what
+            // pose-style controllers call prone.
+            var stances = new (string cvrState, string[] nameTokens)[]
+            {
+                ("Standard Locomotion", new[] { "stand" }),
+                ("Crouching Locomotion", new[] { "crouch" }),
+                ("Prone Locomotion", new[] { "prone", "lying", "lie" }),
+            };
+
+            foreach (var (cvrStateName, tokens) in stances)
+            {
+                if (!targets.TryGetValue(cvrStateName, out var cvrState) || !(cvrState.motion is BlendTree cvrTree))
+                {
+                    continue; // a future CCK reshaped its layer, degrade to no graft, not to a wrong one
+                }
+                foreach (var state in AllStates(source))
+                {
+                    string name = state.name.ToLowerInvariant();
+                    if (!tokens.Any(t => name.Contains(t)))
+                    {
+                        continue;
+                    }
+                    if (state.motion is BlendTree sourceTree && IsVelocityTree(sourceTree))
+                    {
+                        GraftTree(sourceTree, cvrTree, cvrStateName, grafts, ref proxiesSkipped);
+                        break; // first velocity tree per stance wins; duplicates are copies of it
+                    }
+                    // Stance poses are VR-tracked (the headset lowers the player); only velocity trees are grafted.
+                    if (state.motion is AnimationClip stock && IsVrchatStock(stock))
+                    {
+                        proxiesSkipped++;
+                    }
+                }
+            }
+        }
+
+        static bool IsVelocityTree(BlendTree tree)
+        {
+            return (tree.blendType == BlendTreeType.FreeformDirectional2D
+                    || tree.blendType == BlendTreeType.SimpleDirectional2D
+                    || tree.blendType == BlendTreeType.FreeformCartesian2D)
+                && tree.blendParameter == "VelocityX"
+                && tree.blendParameterY == "VelocityZ";
+        }
+
+        static void GraftTree(BlendTree sourceTree, BlendTree cvrTree, string label,
+            List<string> grafts, ref int proxiesSkipped)
+        {
+            // Both trees run through the same classifier: direction from the child's angle,
+            // speed ring from its magnitude relative to the others in its direction. The units
+            // differ (m/s vs normalized input) but the GEOMETRY is the same language.
+            var sourcePicks = new Dictionary<(Slot, Side), AnimationClip>();
+            foreach (var (slot, side, clip) in ClassifyClips(sourceTree))
+            {
+                if (IsVrchatStock(clip))
+                {
+                    proxiesSkipped++;
+                    continue;
+                }
+                // Per slot and side, or left and right strafe collide and one is lost.
+                if (!sourcePicks.ContainsKey((slot, side)))
+                {
+                    sourcePicks[(slot, side)] = clip;
+                }
+            }
+            ReplaceAll(cvrTree, sourcePicks, label, grafts);
+        }
+
+        static IEnumerable<(Slot slot, Side side, AnimationClip clip)> ClassifyClips(BlendTree tree)
+        {
+            var children = tree.children;
+            float maxMag = 0f;
+            foreach (var child in children)
+            {
+                maxMag = Mathf.Max(maxMag, child.position.magnitude);
+            }
+            if (maxMag <= 0f)
+            {
+                yield break;
+            }
+
+            // Walk/run is decided per DIRECTION: VRChat's back-run (2.1 m/s) is slower than its
+            // forward-walk-adjacent jog (3.4), so a global speed split misfiles it.
+            var byDirection = new Dictionary<int, List<float>>();
+            foreach (var child in children)
+            {
+                int direction = DirectionOf(child.position, maxMag);
+                if (!byDirection.TryGetValue(direction, out var mags))
+                {
+                    byDirection[direction] = mags = new List<float>();
+                }
+                mags.Add(child.position.magnitude);
+            }
+
+            foreach (var child in children)
+            {
+                if (!(child.motion is AnimationClip clip))
+                {
+                    continue; // nested trees have their own parameter space; positions don't carry
+                }
+                var slot = SlotOf(child.position, maxMag, byDirection);
+                if (slot.HasValue)
+                {
+                    yield return (slot.Value, SideOf(child.position), clip);
+                }
+            }
+        }
+
+        // DirectionOf folds east into west (CVR slots are pairs); this keeps the sign, or a real
+        // left and right clip become one written to both sides.
+        enum Side { Centre, Left, Right }
+
+        static Side SideOf(Vector2 position)
+        {
+            if (position.x < -0.001f) return Side.Left;
+            if (position.x > 0.001f) return Side.Right;
+            return Side.Centre;
+        }
+
+        static Side Opposite(Side side)
+        {
+            return side == Side.Left ? Side.Right : side == Side.Right ? Side.Left : Side.Centre;
+        }
+
+        static int DirectionOf(Vector2 position, float maxMag)
+        {
+            if (position.magnitude < 0.15f * maxMag)
+            {
+                return 0;
+            }
+            float angle = Vector2.Angle(Vector2.up, new Vector2(Mathf.Abs(position.x), position.y));
+            if (angle < 22.5f) return 1;
+            if (angle < 67.5f) return 2;
+            if (angle < 112.5f) return 3;
+            if (angle < 157.5f) return 4;
+            return 5;
+        }
+
+        static Slot? SlotOf(Vector2 position, float maxMag, Dictionary<int, List<float>> byDirection)
+        {
+            int direction = DirectionOf(position, maxMag);
+            if (direction == 0)
+            {
+                return Slot.Idle;
+            }
+            var mags = byDirection[direction];
+            float slowest = mags.Min(), fastest = mags.Max();
+            float mag = position.magnitude;
+            bool run;
+            if (Mathf.Approximately(slowest, fastest))
+            {
+                // A single speed in this direction (crouch/prone trees): whether it is the walk
+                // or the run is judged against the tree's overall top speed.
+                run = mag >= 0.55f * maxMag;
+            }
+            else if (Mathf.Approximately(mag, slowest))
+            {
+                run = false;
+            }
+            else if (Mathf.Approximately(mag, fastest))
+            {
+                run = true;
+            }
+            else
+            {
+                return null; // a middle speed (VRChat's jog), CVR has no ring for it
+            }
+            switch (direction)
+            {
+                case 1: return run ? Slot.RunForward : Slot.WalkForward;
+                case 2: return run ? Slot.RunForwardDiagonal : Slot.WalkForwardDiagonal;
+                case 3: return run ? Slot.RunStrafe : Slot.WalkStrafe;
+                case 4: return run ? Slot.RunBackDiagonal : Slot.WalkBackDiagonal;
+                default: return run ? Slot.RunBack : Slot.WalkBack;
+            }
+        }
+
+        // Each CCK position asks for its own side; a side with no pick falls back to the other,
+        // which symmetric avatars rely on.
+        static void ReplaceAll(BlendTree cvrTree, Dictionary<(Slot, Side), AnimationClip> picks,
+            string label, List<string> grafts)
+        {
+            if (picks.Count == 0)
+            {
+                return;
+            }
+            var children = cvrTree.children;
+            float maxMag = 0f;
+            foreach (var child in children)
+            {
+                maxMag = Mathf.Max(maxMag, child.position.magnitude);
+            }
+            var byDirection = new Dictionary<int, List<float>>();
+            foreach (var child in children)
+            {
+                int direction = DirectionOf(child.position, maxMag);
+                if (!byDirection.TryGetValue(direction, out var mags))
+                {
+                    byDirection[direction] = mags = new List<float>();
+                }
+                mags.Add(child.position.magnitude);
+            }
+
+            bool replaced = false;
+            var reported = new HashSet<(Slot, Side)>();
+            for (int i = 0; i < children.Length; i++)
+            {
+                var slot = SlotOf(children[i].position, maxMag, byDirection);
+                if (!slot.HasValue)
+                {
+                    continue;
+                }
+                var side = SideOf(children[i].position);
+                if (!picks.TryGetValue((slot.Value, side), out var clip)
+                    && !picks.TryGetValue((slot.Value, Side.Centre), out clip)
+                    && !picks.TryGetValue((slot.Value, Opposite(side)), out clip))
+                {
+                    continue;
+                }
+                var use = Prepare(clip, children[i].motion);
+                if (children[i].motion == use)
+                {
+                    continue;
+                }
+                children[i].motion = use;
+                replaced = true;
+                if (reported.Add((slot.Value, side)))
+                {
+                    grafts.Add($"{label} {Describe(slot.Value)}{SideLabel(side)} ← \"{clip.name}\"");
+                }
+            }
+            if (replaced)
+            {
+                cvrTree.children = children;
+                EditorUtility.SetDirty(cvrTree);
+            }
+        }
+
+        static string SideLabel(Side side)
+        {
+            return side == Side.Left ? " (left)" : side == Side.Right ? " (right)" : "";
+        }
+
+        static string Describe(Slot slot)
+        {
+            switch (slot)
+            {
+                case Slot.Idle: return "idle";
+                case Slot.WalkForward: return "walk";
+                case Slot.RunForward: return "run";
+                case Slot.WalkBack: return "walk back";
+                case Slot.RunBack: return "run back";
+                case Slot.WalkStrafe: return "strafe";
+                case Slot.RunStrafe: return "strafe run";
+                case Slot.WalkForwardDiagonal: return "diagonal walk";
+                case Slot.RunForwardDiagonal: return "diagonal run";
+                case Slot.WalkBackDiagonal: return "back-diagonal walk";
+                default: return "back-diagonal run";
+            }
+        }
+
+        // ------------------------------------------------------------- jump & fall ----
+
+        static void GraftJumpAndFall(AnimatorController source,
+            Dictionary<string, AnimatorState> targets, List<string> grafts, ref int proxiesSkipped)
+        {
+            // VRChat state name (first match wins) -> the CCK state that plays the same moment.
+            var moments = new (string cvrState, string[] sourceNames)[]
+            {
+                ("JumpStart", new[] { "smallhop", "small hop" }),
+                ("JumpAir", new[] { "short fall", "shortfall", "long fall", "longfall" }),
+                ("JumpLand", new[] { "quickland", "quick land", "hardland", "hard land", "land" }),
+            };
+            foreach (var (cvrStateName, sourceNames) in moments)
+            {
+                if (!targets.TryGetValue(cvrStateName, out var cvrState))
+                {
+                    continue;
+                }
+                foreach (string wanted in sourceNames)
+                {
+                    var state = AllStates(source).FirstOrDefault(s =>
+                        s.name.Replace("_", " ").ToLowerInvariant() == wanted
+                        && s.motion is AnimationClip);
+                    if (state == null)
+                    {
+                        continue;
+                    }
+                    var clip = (AnimationClip)state.motion;
+                    if (IsVrchatStock(clip))
+                    {
+                        proxiesSkipped++;
+                        break; // the stock clip in the expected slot; later names are fallbacks
+                    }
+                    // Not loop-matched: one-shot moments, played once in
+                    // the source. Played once, the clip holds its last
+                    // frame through a long fall as the source did.
+                    var use = WithoutRootMotion(clip);
+                    if (cvrState.motion != use)
+                    {
+                        cvrState.motion = use;
+                        EditorUtility.SetDirty(cvrState);
+                        grafts.Add($"{cvrStateName} ← \"{clip.name}\"");
+                    }
+                    break;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------- sitting ----
+
+        static void GraftSitting(BridgeContext ctx,
+            Dictionary<string, AnimatorState> targets, List<string> grafts, ref int proxiesSkipped)
+        {
+            if (!targets.TryGetValue("Sitting", out var cvrSitting))
+            {
+                return;
+            }
+            AnimatorController sitting = null;
+            foreach (var layer in ctx.SourceDescriptor.specialAnimationLayers)
+            {
+                if (layer.type == VRCAvatarDescriptor.AnimLayerType.Sitting && !layer.isDefault)
+                {
+                    sitting = layer.animatorController as AnimatorController;
+                }
+            }
+            if (sitting == null)
+            {
+                return;
+            }
+            // The pose used by the most states is the sit. A tie means
+            // two different authored sits; leave the CCK's.
+            var votes = new Dictionary<AnimationClip, int>();
+            foreach (var state in AllStates(sitting))
+            {
+                if (state.motion is AnimationClip clip)
+                {
+                    if (IsVrchatStock(clip))
+                    {
+                        proxiesSkipped++;
+                        continue;
+                    }
+                    votes[clip] = votes.TryGetValue(clip, out int n) ? n + 1 : 1;
+                }
+            }
+            if (votes.Count == 0)
+            {
+                return;
+            }
+            int best = votes.Values.Max();
+            var winners = votes.Where(v => v.Value == best).Select(v => v.Key).ToList();
+            if (winners.Count != 1)
+            {
+                return;
+            }
+            var use = Prepare(winners[0], cvrSitting.motion);
+            if (cvrSitting.motion != use)
+            {
+                cvrSitting.motion = use;
+                EditorUtility.SetDirty(cvrSitting);
+                grafts.Add($"Sitting ← \"{winners[0].name}\"");
+            }
+        }
+
+        // -------------------------------------------------- flight & swim poses ----
+
+        static void GraftMovementModePoses(List<AnimatorController> sources,
+            Dictionary<string, AnimatorState> targets, List<string> grafts, ref int proxiesSkipped)
+        {
+            var modes = new (string cvrState, string[] tokens)[]
+            {
+                ("LocFlying", new[] { "fly", "flight", "flying", "hover", "glide", "copter" }),
+                ("Swimming", new[] { "swim" }),
+            };
+            foreach (var (cvrStateName, tokens) in modes)
+            {
+                if (!targets.TryGetValue(cvrStateName, out var cvrState))
+                {
+                    continue;
+                }
+                // Scored: a pose loops or is named idle/hover; transition names count against. No score: CCK pose stays.
+                AnimatorState best = null;
+                int bestScore = 1; // require positive evidence, not just a token match
+                foreach (var source in sources)
+                {
+                    foreach (var state in AllStates(source))
+                    {
+                        if (!(state.motion is AnimationClip candidate))
+                        {
+                            continue;
+                        }
+                        string name = (state.name + " " + candidate.name).ToLowerInvariant();
+                        if (!tokens.Any(t => name.Contains(t)))
+                        {
+                            continue;
+                        }
+                        if (IsVrchatStock(candidate))
+                        {
+                            proxiesSkipped++;
+                            continue;
+                        }
+                        int score = 0;
+                        if (AnimationUtility.GetAnimationClipSettings(candidate).loopTime)
+                        {
+                            score += 2;
+                        }
+                        if (new[] { "idle", "hover", "loop", "hold", "still" }.Any(t => name.Contains(t)))
+                        {
+                            score += 2;
+                        }
+                        if (new[] { " to ", ".to.", "transition", "changing", "enter", "exit",
+                                    " in ", " out ", "start", "end" }.Any(t => name.Contains(t)))
+                        {
+                            score -= 3;
+                        }
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            best = state;
+                        }
+                    }
+                }
+                if (best != null)
+                {
+                    var clip = (AnimationClip)best.motion;
+                    var use = Prepare(clip, cvrState.motion);
+                    if (cvrState.motion != use)
+                    {
+                        cvrState.motion = use;
+                        EditorUtility.SetDirty(cvrState);
+                        grafts.Add($"{cvrStateName} ← \"{clip.name}\" (from \"{best.name}\")");
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------- GoGo emotes ----
+
+        // GoGo's emotes, then its sit and lie poses, into CVR's eight slots. Override controller, not
+        // master: the client names wheel entries after the clip overriding Emote1 to Emote8.
+        static readonly List<KeyValuePair<AnimationClip, AnimationClip>> GogoEmotes
+            = new List<KeyValuePair<AnimationClip, AnimationClip>>();
+
+        static readonly (string clip, string label)[] GogoLibrary =
+        {
+            ("go_sit_crossed_leg", "Sit Cross-Legged"), ("go_seiza", "Seiza"), ("go_side_sit", "Side Sit"),
+            ("go_long_sitting", "Sit Legs Out"), ("go_kneeling", "Kneel"), ("go_squat", "Squat"),
+            ("go_laydown_side", "Lie On Side"), ("go_laydown_chill_idle_long", "Lie Back"),
+        };
+
+        internal static void PlaceGogoEmotes(BridgeContext ctx, AnimatorController master)
+        {
+            GogoEmotes.Clear();
+            if (!ctx.Settings.stripGogoLoco || !ctx.Settings.gogoEmotes || !SystemStripper.AvatarUsesGogo(ctx))
+            {
+                return;
+            }
+            var layer = master.layers.FirstOrDefault(l => l.name == "Locomotion/Emotes");
+            var states = layer != null ? CollectStates(layer.stateMachine) : null;
+            if (states == null || !states.ContainsKey("Emote1"))
+            {
+                ctx.Report.Skipped(Category, "GoGo poses not placed", "ChilloutVR's emote states are missing from its locomotion layer.");
+                return;
+            }
+
+            var action = SourceController(ctx, VRCAvatarDescriptor.AnimLayerType.Action);
+            var byValue = new List<(int value, Motion motion)>();
+            if (action != null)
+            {
+                // GoGo's layers only: another dance system on Action is moved by the transplant.
+                foreach (var source in action.layers.Where(SystemStripper.IsGogoLayer))
+                {
+                    foreach (var t in Transitions(source.stateMachine))
+                    {
+                        if (t.destinationState == null || t.destinationState.motion == null)
+                        {
+                            continue;
+                        }
+                        foreach (var c in t.conditions)
+                        {
+                            if (c.mode == AnimatorConditionMode.Equals && c.threshold >= 1f && c.threshold <= 254f
+                                && (c.parameter == "VRCEmote" || c.parameter.EndsWith("/VRCEmote", StringComparison.Ordinal)))
+                            {
+                                byValue.Add(((int)c.threshold, t.destinationState.motion));
+                            }
+                        }
+                    }
+                }
+            }
+            int trees = byValue.Where(x => x.motion is BlendTree).Select(x => x.motion).Distinct().Count();
+            // GoGo's own placeholders fill a run of values with one clip; a creator's emote has one.
+            var picks = byValue.Where(x => x.motion is AnimationClip).GroupBy(x => (AnimationClip)x.motion)
+                .Where(g => !IsVrchatStock(g.Key) && !g.Key.name.StartsWith("go_", StringComparison.OrdinalIgnoreCase)
+                    && g.Key.humanMotion && g.Select(x => x.value).Distinct().Count() <= 2)
+                .OrderBy(g => g.Min(x => x.value)).Select(g => (clip: g.Key, label: g.Key.name)).ToList();
+            var library = GogoLibraryClips(ctx);
+            if (picks.Count + library.Count == 0)
+            {
+                ctx.Report.Skipped(Category, "GoGo poses not placed", "GoGo was found, but none of its poses are in this project.");
+                return;
+            }
+            picks.AddRange(library);
+            var left = picks.Skip(8).Select(p => p.label).ToList();
+            picks = picks.Take(8).ToList();
+
+            // A label shared with a locomotion clip would make the client take that clip for an emote.
+            var taken = new HashSet<string>(Motions(layer.stateMachine).Select(m => m.name), StringComparer.Ordinal);
+            string dir = ctx.OutputDir + "/RehomedAssets";
+            if (!AssetDatabase.IsValidFolder(dir))
+            {
+                OutputAssetPaths.EnsureFolder(dir);
+            }
+            var placed = new List<string>();
+            var stale = new List<string>();
+            var pending = new List<(AnimationClip copy, string path)>();
+            for (int i = 0; i < picks.Count; i++)
+            {
+                var (src, label) = picks[i];
+                if (!states.TryGetValue("Emote" + (i + 1), out var state) || !(state.motion is AnimationClip slot))
+                {
+                    continue;
+                }
+                var copy = UnityEngine.Object.Instantiate(WithoutRootMotion(src, onlyIfTravels: true, keepPose: true));
+                // Body only: ChilloutVR never restores Write Defaults, so a toggle or material
+                // curve in a pose would stick after the pose ended.
+                foreach (var b in AnimationUtility.GetCurveBindings(copy).Where(b => b.type != typeof(Animator)))
+                {
+                    AnimationUtility.SetEditorCurve(copy, b, null);
+                }
+                foreach (var b in AnimationUtility.GetObjectReferenceCurveBindings(copy))
+                {
+                    AnimationUtility.SetObjectReferenceCurve(copy, b, null);
+                }
+                while (!taken.Add(label))
+                {
+                    label += " Pose";
+                }
+                copy.name = label;
+                pending.Add((copy, OutputAssetPaths.Claim($"{dir}/{OutputAssetPaths.SafeFileName(label)}.anim", stale)));
+                // The emote states leave after one play. A pose or a loop is held until the
+                // player moves, which ends any emote.
+                bool hold = src.isLooping || src.length <= 0.1f;
+                if (hold)
+                {
+                    foreach (var t in state.transitions.Where(t => t.hasExitTime && t.conditions.Length == 0).ToList())
+                    {
+                        state.RemoveTransition(t);
+                    }
+                }
+                GogoEmotes.Add(new KeyValuePair<AnimationClip, AnimationClip>(slot, copy));
+                placed.Add($"Emote{i + 1} \"{label}\"" + (hold ? " (held until you move)" : ""));
+            }
+            // Written in one batch: a delete and a create each refreshed the database, per pose.
+            if (stale.Count > 0) AssetDatabase.DeleteAssets(stale.ToArray(), new List<string>());
+            AssetDatabase.StartAssetEditing();
+            try
+            {
+                foreach (var (copy, path) in pending) AssetDatabase.CreateAsset(copy, path);
+            }
+            finally
+            {
+                AssetDatabase.StopAssetEditing();
+            }
+            if (placed.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Converted(Category, $"{BridgeElements.Count(placed.Count, "GoGo pose", "GoGo poses")} in ChilloutVR's emote wheel",
+                string.Join(", ", placed) + ". They replace ChilloutVR's stock emotes on this avatar, and they cost no synced " +
+                "parameters. GoGo's height, puppet and pose controls have no equivalent here.");
+            if (left.Count > 0)
+            {
+                ctx.Report.Skipped(Category, $"{BridgeElements.Count(left.Count, "GoGo pose", "GoGo poses")} did not fit",
+                    "The emote wheel holds eight: " + string.Join(", ", left) + ".");
+            }
+            if (trees > 0)
+            {
+                ctx.Report.Skipped(Category, $"{BridgeElements.Count(trees, "GoGo emote", "GoGo emotes")} left out",
+                    "A blend tree, which an emote slot cannot hold.");
+            }
+        }
+
+        internal static void FillGogoEmotes(AnimatorOverrideController overrides)
+        {
+            if (GogoEmotes.Count > 0)
+            {
+                overrides.ApplyOverrides(GogoEmotes);
+            }
+        }
+
+        // From the GoGo copy the avatar plays, found by its go_stand, so a project holding
+        // several GoGo installs takes the right one.
+        static List<(AnimationClip clip, string label)> GogoLibraryClips(BridgeContext ctx)
+        {
+            var stand = new[] { VRCAvatarDescriptor.AnimLayerType.Base, VRCAvatarDescriptor.AnimLayerType.Action }
+                .Select(t => SourceController(ctx, t)).Where(c => c != null)
+                .SelectMany(c => c.animationClips).FirstOrDefault(c => c != null && c.name == "go_stand");
+            string home = stand != null ? System.IO.Path.GetDirectoryName(AssetDatabase.GetAssetPath(stand)).Replace('\\', '/') : null;
+            var found = new List<(AnimationClip, string)>();
+            // One project-wide search for every name, made only if home lacks one: a search each
+            // cost about a second in a large project.
+            ILookup<string, string> elsewhere = null;
+            foreach (var (name, label) in GogoLibrary)
+            {
+                var clip = home != null ? AssetDatabase.LoadAssetAtPath<AnimationClip>($"{home}/{name}.anim") : null;
+                if (clip == null)
+                {
+                    if (elsewhere == null)
+                        elsewhere = AssetDatabase.FindAssets("go_ t:AnimationClip").Select(AssetDatabase.GUIDToAssetPath)
+                            .ToLookup(p => System.IO.Path.GetFileNameWithoutExtension(p));
+                    clip = elsewhere[name].OrderBy(p => p, StringComparer.Ordinal)
+                        .Select(AssetDatabase.LoadAssetAtPath<AnimationClip>).FirstOrDefault(c => c != null);
+                }
+                if (clip != null)
+                {
+                    found.Add((clip, label));
+                }
+            }
+            return found;
+        }
+
+        static IEnumerable<AnimatorStateTransition> Transitions(AnimatorStateMachine root)
+        {
+            var stack = new Stack<AnimatorStateMachine>();
+            var seen = new HashSet<AnimatorStateMachine>();
+            stack.Push(root);
+            while (stack.Count > 0)
+            {
+                var machine = stack.Pop();
+                if (machine == null || !seen.Add(machine))
+                {
+                    continue;
+                }
+                foreach (var t in machine.anyStateTransitions)
+                {
+                    yield return t;
+                }
+                foreach (var child in machine.states.Where(c => c.state != null))
+                {
+                    foreach (var t in child.state.transitions)
+                    {
+                        yield return t;
+                    }
+                }
+                foreach (var sub in machine.stateMachines)
+                {
+                    stack.Push(sub.stateMachine);
+                }
+            }
+        }
+
+        static IEnumerable<Motion> Motions(AnimatorStateMachine root)
+        {
+            var stack = new Stack<Motion>(AllStates(root).Select(s => s.motion).Where(m => m != null));
+            while (stack.Count > 0)
+            {
+                var motion = stack.Pop();
+                yield return motion;
+                if (motion is BlendTree tree)
+                {
+                    foreach (var child in tree.children.Where(c => c.motion != null))
+                    {
+                        stack.Push(child.motion);
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------- walkers ----
+
+        static Dictionary<string, AnimatorState> CollectStates(AnimatorStateMachine root)
+        {
+            var result = new Dictionary<string, AnimatorState>(StringComparer.Ordinal);
+            foreach (var state in AllStates(root))
+            {
+                if (!result.ContainsKey(state.name))
+                {
+                    result[state.name] = state;
+                }
+            }
+            return result;
+        }
+
+        static IEnumerable<AnimatorState> AllStates(AnimatorController controller)
+        {
+            foreach (var layer in controller.layers)
+            {
+                foreach (var state in AllStates(layer.stateMachine))
+                {
+                    yield return state;
+                }
+            }
+        }
+
+        static IEnumerable<AnimatorState> AllStates(AnimatorStateMachine machine)
+        {
+            if (machine == null)
+            {
+                yield break;
+            }
+            var stack = new Stack<AnimatorStateMachine>();
+            var seen = new HashSet<AnimatorStateMachine>();
+            stack.Push(machine);
+            while (stack.Count > 0)
+            {
+                var current = stack.Pop();
+                if (current == null || !seen.Add(current))
+                {
+                    continue;
+                }
+                foreach (var child in current.states)
+                {
+                    if (child.state != null)
+                    {
+                        yield return child.state;
+                    }
+                }
+                foreach (var sub in current.stateMachines)
+                {
+                    stack.Push(sub.stateMachine);
+                }
+            }
+        }
+    }
+}
+#endif

@@ -1,0 +1,231 @@
+// A YAPS plug: authoring data for the mesh that bends.
+// The toolkit bakes from it and writes the knobs to the material.
+// ChilloutVR strips it at upload. No SDK dependency.
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace AvatarBridge.Yaps
+{
+    [AddComponentMenu("YAPS/YAPS Plug")]
+    [DisallowMultipleComponent]
+    public class YapsPlug : MonoBehaviour
+    {
+        [Tooltip("The mesh that bends. Leave empty to use the renderer on this object.")]
+        // new: hides the obsolete Component.renderer. Renaming would drop serialized data.
+        public new Renderer renderer;
+
+        [Tooltip("-1 bakes every material the bone chain reaches, or on a converted plug every one the " +
+                 "conversion baked. A number bakes that slot alone, and a plug spanning several tears at the seam.")]
+        public int materialSlot = -1;
+
+        // Made by the converter. Its object is a marker under a bone, so a chain read
+        // from it finds the wrong slots; a re-bake uses bakedSlots instead.
+        [HideInInspector]
+        public bool converted;
+
+        [Header("Skinned mesh")]
+        [Tooltip("The bone the shaft grows from; only vertices weighted to it and its children " +
+                 "bend. Empty for a mesh that is only the plug.")]
+        public Transform rootBone;
+
+        [Tooltip("A second copy of the plug, drawn only while it has somewhere to go: the first copy goes " +
+                 "into one socket, and the second into the next or out of a portal's exit. Screen atlas only. " +
+                 "Doubles the plug's vertices and about doubles its deform cost, even while the copy is hidden. Only when no " +
+                 "other plug shares the mesh and the plug sits on one material. Bake again after changing it.")]
+        public bool twoAtOnce;
+
+        [Header("Measurement")]
+        [Tooltip("Tick if the measured base is at the wrong end. Skinned meshes only; a plain mesh " +
+                 "bends from its origin along +Z.")]
+        public bool flipAxis;
+
+        [Tooltip("Length in metres, when the measurement is wrong. 0 uses the measurement.")]
+        public float lengthOverride;
+
+        [Header("Shape at rest")]
+        [Range(-1.5f, 1.5f), Tooltip("A resting bend along the whole shaft. Positive bends down, toward the avatar's down, as DPS does.")]
+        [YapsFrom("DPS")]
+        public float curvature;
+        [Range(-1.5f, 1.5f), Tooltip("A second bend near the tip, opposite in sign, so the shaft can sweep and then hook.")]
+        [YapsFrom("DPS")]
+        public float recurvature;
+        [Range(0f, 1f), Tooltip("How much the base resists bending toward a socket. 0 bends evenly from the root.")]
+        [YapsFrom("DPS")]
+        public float entranceStiffness;
+
+        [Header("Inside a socket")]
+        [Range(0f, 1f), Tooltip("How much the socket narrows the shaft where it grips.")]
+        [YapsFrom("DPS · TPS")]
+        public float squeeze;
+        [Range(0.01f, 1f), Tooltip("How far either side of the opening the grip reaches, as a fraction of length.")]
+        [YapsFrom("DPS · TPS")]
+        public float squeezeReach = 0.15f;
+        [Range(0f, 1f), Tooltip("The swell just short of the opening, as a fraction of radius.")]
+        [YapsFrom("DPS · TPS")]
+        public float bulge;
+        [Range(0.01f, 1f), Tooltip("How far before the opening the swell begins.")]
+        [YapsFrom("DPS · TPS")]
+        public float bulgeReach = 0.2f;
+        [Range(0f, 0.5f), Tooltip("How far short of the opening the swell peaks, rising over its reach behind. 0 peaks halfway along the reach.")]
+        [YapsFrom("TPS")]
+        public float bulgeFalloff;
+
+        [Header("Out of a socket")]
+        [Range(0.1f, 1f), Tooltip("How much of its length it keeps when no socket is using it. 1 is no change.")]
+        [YapsFrom("TPS")]
+        public float idleLength = 1f;
+        [Range(0.1f, 1f), Tooltip("How much of its width it keeps when no socket is using it.")]
+        [YapsFrom("TPS")]
+        public float idleWidth = 1f;
+        [Range(0f, 0.5f), Tooltip("Idle motion, tip-heavy, out of a socket only. Plays in the scene view while selected.")]
+        [YapsFrom("DPS")]
+        public float wriggle;
+        [Range(0f, 20f), Tooltip("How fast it wriggles.")]
+        [YapsFrom("DPS")]
+        public float wriggleSpeed = 2f;
+
+        [Header("Motion inside a socket")]
+        [Range(0f, 0.5f), Tooltip("A stroke along the shaft, only while a socket has it.")]
+        [YapsFrom("TPS")]
+        public float pumping;
+        [Range(0f, 20f), Tooltip("How fast it pumps.")]
+        [YapsFrom("TPS")]
+        public float pumpingSpeed = 6f;
+        [Range(0.05f, 1f), Tooltip("How much of the shaft pumps. 1 is the whole length; small values move only the tip.")]
+        [YapsFrom("TPS")]
+        public float pumpingWidth = 1f;
+
+        [Header("The bend toward a socket")]
+        [Range(0.2f, 3f), Tooltip("Below 1 arrives more directly, above 1 sweeps a wider arc.")]
+        [YapsFrom("TPS")]
+        public float bezierSmoothness = 1f;
+        [Range(0f, 0.8f), Tooltip("A fraction of the shaft held straight before any bend.")]
+        [YapsFrom("TPS")]
+        public float straightBeforeBend;
+        [Range(0f, 0.5f), Tooltip("Ease the join between the straight part and the curve.")]
+        [YapsFrom("TPS")]
+        public float easeIntoBend;
+        [Range(0f, 1f), Tooltip("A socket nearer than this (fraction of length) is held off, so a plug pushed hard against one does not fold.")]
+        [YapsFrom("TPS")]
+        public float minimumSocketDistance;
+
+        [Header("Past the opening")]
+        [Range(0f, 1f), Tooltip("How far past a hole before the shaft narrows, as a fraction of length.")]
+        [YapsFrom("YAPS")]
+        public float taperStart = 0.10f;
+        [Range(0f, 1f), Tooltip("...and how far past it before the shaft has closed to a point.")]
+        [YapsFrom("YAPS")]
+        public float taperEnd = 0.30f;
+        [Tooltip("Let the tip carry on past a ring. Off, the shaft stops at every socket.")]
+        [YapsFrom("SPS")]
+        public bool overrun = true;
+
+        [Header("How sockets find it")]
+        [Tooltip("The tip light DPS sockets read.")]
+        [YapsFrom("DPS")]
+        public bool emitTipLight = true;
+
+        [Tooltip("Toy mods measure a plug from the first mesh they find above its tip light, which on an " +
+                 "avatar is often another mesh entirely, so a toy can respond from the wrong place or the wrong " +
+                 "distance. On, the tip light carries a hidden mesh at the base, of the measured length, for them " +
+                 "to find. Needs the tip light; Bake again after changing it.")]
+        [YapsFrom("DPS")]
+        public bool toyModLength = true;
+
+        [Tooltip("The tip pointers TPS and SPS sockets read.")]
+        [YapsFrom("TPS · SPS")]
+        public bool emitPointers = true;
+
+        [Header("Which sockets it answers")]
+        [YapsFrom("SPS")]
+        [Tooltip("Answer only sockets with one of these tags; empty answers anything not refused. " +
+                 "Four at most, so a longer list belongs on the sockets. Screen atlas only: a " +
+                 "socket it cannot read is answered.")]
+        public List<string> answers = new List<string>();
+
+        [YapsFrom("SPS")]
+        [Tooltip("Never answer a socket with any of these tags; beats the list above. Four at most.")]
+        public List<string> refuses = new List<string>();
+
+        // Off unless asked for: the CCK counts its material slot on every built avatar.
+        [HideInInspector]
+        public bool readout;
+
+        // Where the readout sits and the mesh it replaced, for Remove; and its
+        // sources, so another plug baked into the same mesh can rebuild it.
+        [HideInInspector]
+        public Renderer readoutRenderer;
+        [HideInInspector]
+        public Mesh readoutReplaced;
+        [HideInInspector]
+        public Material readoutSource;
+        [HideInInspector]
+        public int readoutAnchor = -1;
+        [HideInInspector]
+        public int readoutTip = -1;
+
+        [HideInInspector]
+        public Material bakedFrom;
+
+        // One entry per slot the bake replaced: patching only one slot of a plug that
+        // spans several tears the mesh at the seam. bakedFrom stays for the primary
+        // slot so older bakes still restore.
+        [System.Serializable]
+        public class BakedSlot
+        {
+            public int slot;
+            public Material was;
+
+            // A plug can span meshes, so the slot number alone is ambiguous.
+            // Empty means the plug's own renderer (older records).
+            public Renderer renderer;
+        }
+
+        [HideInInspector]
+        public System.Collections.Generic.List<BakedSlot> bakedSlots =
+            new System.Collections.Generic.List<BakedSlot>();
+
+        // The shapes the last bake kept on its own mesh, in bake order. A second
+        // plug on that mesh reads them to tell its own old curves from this one's.
+        [HideInInspector]
+        public System.Collections.Generic.List<string> bakedShapes =
+            new System.Collections.Generic.List<string>();
+
+        // A material an animation swaps into a baked slot. It sits on no renderer
+        // until the toggle plays, so the knobs reach it only through this record.
+        [System.Serializable]
+        public class SlotVariant
+        {
+            public Renderer renderer;
+            public int slot;
+            public Material material;
+        }
+
+        [HideInInspector]
+        public List<SlotVariant> variants = new List<SlotVariant>();
+
+        // The mesh before this plug's triangles moved to a slot of their own,
+        // off a slot another plug's bake held, for Remove to put back.
+        [HideInInspector]
+        public Mesh splitFrom;
+
+        // The mesh the second copy was appended to, for a re-bake to build
+        // from and Remove to put back.
+        [HideInInspector]
+        public Mesh dupFrom;
+
+        // A plain mesh before the bake widened its bounds on a copy, for
+        // Remove to put back.
+        [HideInInspector]
+        public Mesh boundsFrom;
+
+        // The wearer's own sockets, as changes against the default (all but the hips).
+        // Changes, not a full list, so a socket added later starts at its default.
+        [HideInInspector]
+        public List<YapsSocket> selfEnter = new List<YapsSocket>();
+        [HideInInspector]
+        public List<YapsSocket> selfRefuse = new List<YapsSocket>();
+
+        public Renderer Target => renderer != null ? renderer : GetComponent<Renderer>();
+    }
+}

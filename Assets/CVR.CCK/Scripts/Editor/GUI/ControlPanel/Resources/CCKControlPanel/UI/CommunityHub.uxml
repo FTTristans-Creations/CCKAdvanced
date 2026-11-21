@@ -1,0 +1,104 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd" editor-extension-mode="True">
+    <ui:VisualElement name="cck-content" style="flex-grow: 1; flex-direction: column; flex-shrink: 0;">
+        <ui:ScrollView name="cck-scroll" horizontal-page-size="0" horizontal-scroller-visibility="Hidden" style="flex-grow: 1; flex-shrink: 0;">
+            <ui:VisualElement name="cck-container" style="flex-grow: 1; align-items: center; flex-shrink: 0;">
+                <ui:VisualElement name="cck-account-container" style="width: 80%; min-width: 320px; max-width: 400px; margin-top: 15px; align-items: center;">
+                    <ui:Box name="cck-login-box" style="width: 100%; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0);">
+                        <ui:VisualElement style="flex-direction: row; align-items: center; justify-content: space-between;">
+                            <ui:Label text="ACCOUNT_LOGIN" display-tooltip-when-elided="true" style="-unity-font-style: bold; flex-grow: 0;" />
+                            <ui:DropdownField index="0" name="ProfileSelector" choices="Profile 1, Profile 2, Profile 3, Profile 4, Profile 5, Profile 6, Profile 7, Profile 8" style="flex-grow: 0; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; flex-shrink: 1; width: 75px;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="cck-separator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:VisualElement name="cck-username-element">
+                            <ui:Label text="USERNAME" display-tooltip-when-elided="true" name="cck-username-label" style="padding-left: 5px;" />
+                            <ui:TextField picking-mode="Ignore" max-length="45" name="cck-username-input" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:VisualElement name="cck-access-key-element">
+                            <ui:Label text="ACCESS_KEY" display-tooltip-when-elided="true" name="cck-access-key-label" style="padding-left: 5px;" />
+                            <ui:TextField picking-mode="Ignore" name="cck-access-key-input" password="true" max-length="512" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:VisualElement name="cck-login-failed-element">
+                            <ui:Label text="LOGIN_FAILED" display-tooltip-when-elided="true" name="cck-login-failed-label" style="display: none; -unity-font-style: bold; padding-left: 5px;" />
+                        </ui:VisualElement>
+                        <ui:Button text="LOGIN" display-tooltip-when-elided="true" name="cck-login-button" style="height: 30px;" />
+                        <ui:Button text="CREATE_ACCOUNT" display-tooltip-when-elided="true" name="cck-create-account-button" style="height: 30px;" />
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:HelpBox name="cck-auth-info" text="AUTH_INFO_TEXT" />
+                    </ui:Box>
+                    <ui:Box name="cck-account-info-box" style="width: 100%; display: flex; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0);">
+                        <ui:VisualElement style="flex-direction: row; align-items: center; justify-content: space-between;">
+                            <ui:Label text="ACCOUNT_INFO" display-tooltip-when-elided="true" style="-unity-font-style: bold; width: 125px;" />
+                            <ui:DropdownField index="0" name="ProfileSelector" choices="Profile 1, Profile 2, Profile 3, Profile 4, Profile 5, Profile 6, Profile 7, Profile 8" style="flex-grow: 0; margin-left: 0; margin-right: 0; margin-top: 0; margin-bottom: 0; flex-shrink: 1; width: 75px;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="cck-separator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:VisualElement name="cck-auth-info-row" class="cck-info-row" style="flex-direction: row; margin: 2px;">
+                            <ui:Label text="AUTHENTICATED_AS" name="cck-auth-label" style="width: 50%; flex-shrink: 1;" />
+                            <ui:Label name="cck-auth-value" style="flex-grow: 1;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="cck-rank-info-row" class="cck-info-row" style="flex-direction: row; margin: 2px;">
+                            <ui:Label text="API_USER_RANK" name="cck-rank-label" style="width: 50%;" />
+                            <ui:Label name="cck-rank-value" style="flex-grow: 1;" />
+                        </ui:VisualElement>
+                        <ui:VisualElement name="cck-unlock-info-row" class="cck-info-row" style="flex-direction: row; margin: 2px;">
+                            <ui:Label text="ACCOUNT_UNLOCK" name="cck-unlock-label" style="width: 50%;" />
+                            <ui:Label name="cck-unlock-value" style="flex-grow: 1;" />
+                        </ui:VisualElement>
+                        <ui:Button text="LOGOUT" name="cck-logout-button" style="height: 30px;" />
+                    </ui:Box>
+                </ui:VisualElement>
+                <ui:Box name="cck-stats-box" style="width: 80%; max-width: 400px; min-width: 320px; display: flex; margin-top: 15px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0);">
+                    <ui:Label text="CONTENT_STATISTICS" display-tooltip-when-elided="true" style="-unity-font-style: bold;" />
+                    <ui:VisualElement name="cck-separator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+                    <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                    <ui:VisualElement name="cck-stats-header" style="flex-direction: row; justify-content: space-between;">
+                        <ui:Label style="width: 25%;" />
+                        <ui:Label text="AVATARS" style="width: 25%; -unity-text-align: middle-left; -unity-font-style: bold;" />
+                        <ui:Label text="WORLDS" style="width: 25%; -unity-text-align: middle-left; -unity-font-style: bold;" />
+                        <ui:Label text="PROPS" style="width: 25%; -unity-text-align: middle-left; -unity-font-style: bold;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="cck-stats-public" class="cck-stats-row" style="flex-direction: row; justify-content: space-between; margin-top: 5px;">
+                        <ui:Label text="PUBLIC" style="width: 25%; -unity-font-style: bold;" />
+                        <ui:Label name="cck-public-avatars-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                        <ui:Label name="cck-public-worlds-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                        <ui:Label name="cck-public-spawnables-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="cck-stats-private" class="cck-stats-row" style="flex-direction: row; justify-content: space-between; margin-top: 5px;">
+                        <ui:Label text="PRIVATE" style="width: 25%; -unity-font-style: bold;" />
+                        <ui:Label name="cck-private-avatars-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                        <ui:Label name="cck-private-worlds-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                        <ui:Label name="cck-private-spawnables-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="cck-stats-total" class="cck-stats-row" style="flex-direction: row; justify-content: space-between; margin-top: 5px;">
+                        <ui:Label text="TOTAL" style="width: 25%;" />
+                        <ui:Label name="cck-total-avatars-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                        <ui:Label name="cck-total-worlds-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                        <ui:Label name="cck-total-spawnables-value" text="0" style="width: 25%; -unity-text-align: middle-left;" />
+                    </ui:VisualElement>
+                    <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                    <ui:HelpBox name="cck-limit-avatars-worlds" text="LIMIT_WARNING_AVATARS_WORLDS" message-type="Warning" />
+                    <ui:HelpBox name="cck-limit-spawnables" text="LIMIT_WARNING_PROPS" message-type="Warning" />
+                    <ui:HelpBox name="cck-limit-info" text="LIMIT_INFO" message-type="Info" />
+                </ui:Box>
+                <ui:VisualElement name="cck-hub-container" style="width: 80%; min-width: 320px; max-width: 400px; margin-top: 15px;">
+                    <ui:Box name="cck-hub-box" style="padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0);">
+                        <ui:Label text="COMMUNITY_HUB" display-tooltip-when-elided="true" style="-unity-font-style: bold;" />
+                        <ui:VisualElement name="cck-separator" style="height: 1px; background-color: rgb(0, 0, 0); margin-right: 5px; margin-left: 5px; margin-top: 2px; margin-bottom: 2px;" />
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:HelpBox name="cck-hub-info" text="HUB_INFO" message-type="Info" />
+                        <ui:Button text="OPEN_HUB" name="cck-open-hub-button" style="height: 30px;" />
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:HelpBox name="cck-feedback-info" text="FEEDBACK_INFO" message-type="Info" />
+                        <ui:Button text="OPEN_FEEDBACK" name="cck-open-feedback-button" style="height: 30px;" />
+                        <ui:VisualElement name="cck-spacer" style="height: 10px;" />
+                        <ui:HelpBox name="cck-docs-info" text="DOCS_INFO" message-type="Info" />
+                        <ui:Button text="OPEN_DOCS" name="cck-open-docs-button" style="height: 30px;" />
+                    </ui:Box>
+                </ui:VisualElement>
+            </ui:VisualElement>
+        </ui:ScrollView>
+    </ui:VisualElement>
+</ui:UXML>

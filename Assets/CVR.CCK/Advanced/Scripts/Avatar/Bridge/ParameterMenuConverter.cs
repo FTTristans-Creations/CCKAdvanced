@@ -1,0 +1,762 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEditor.Animations;
+using UnityEngine;
+using VRC.SDK3.Avatars.Components;
+using VRC.SDK3.Avatars.ScriptableObjects;
+using ABI.CCK.Components;
+using ABI.CCK.Scripts;
+
+namespace AvatarBridge
+{
+    // Converts VRChat expression parameters + expression menus into ChilloutVR
+    // Advanced Avatar Settings entries:
+    //
+    //   Bool  + menu toggle/button  -> Toggle
+    //   Int   + menu toggles        -> Dropdown (one option per used value) or Toggle
+    //   Float + radial/puppet menu  -> Slider
+    //
+    // No GameObject targets: the FX layers already react; entries exist for the menu and
+    // profile saving. Sync comes from the animator's parameter list.
+    public static class ParameterMenuConverter
+    {
+        const string Category = "Parameters & menu";
+
+        static readonly (string Needle, string Parameter, string When)[] ClientDrivenEquivalents =
+        {
+            ("flight", "Flying", "you actually fly (or enter a zero-gravity world)"),
+            ("flying", "Flying", "you actually fly (or enter a zero-gravity world)"),
+            ("swimming", "Swimming", "you enter water"),
+            ("crouch", "Crouching", "you crouch"),
+            ("prone", "Prone", "you go prone"),
+        };
+
+        static void NoteClientDrivenEquivalent(BridgeContext ctx, string parameterName, string display)
+        {
+            string haystack = ((parameterName ?? "") + " " + (display ?? "")).ToLowerInvariant();
+            foreach (var candidate in ClientDrivenEquivalents)
+            {
+                if (haystack.IndexOf(candidate.Needle, StringComparison.Ordinal) < 0)
+                {
+                    continue;
+                }
+                ctx.Report.Converted(Category, $"\"{display}\": ChilloutVR drives \"{candidate.Parameter}\" itself",
+                    $"Kept as a menu toggle. ChilloutVR sets \"{candidate.Parameter}\" whenever {candidate.When}; " +
+                    "point the layer at it to follow automatically, where the world allows.");
+                return;
+            }
+        }
+
+        public const string UnusedOption = "(unused)";
+
+        // Joins submenu names into a menu path. Not '/': control names use it themselves
+        // ("Jacket On/Off"), and splitting on it kept only "Off".
+        const char MenuSeparator = '\u001F';
+
+        class MenuUse
+        {
+            public string DisplayName;
+            public float Value;
+            public VRCExpressionsMenu.Control.ControlType Type;
+        }
+
+        // A VRChat two-axis puppet: one control, two -1..1 parameters.
+        class PuppetPair
+        {
+            public string Display;
+            public string X;
+            public string Y;
+        }
+
+        public static void Run(BridgeContext ctx)
+        {
+            var vrc = ctx.SourceDescriptor;
+            var vrcParams = vrc.expressionParameters;
+
+            // Which parameter names must keep their exact (synced) name.
+            if (vrcParams != null && vrcParams.parameters != null)
+            {
+                foreach (var p in vrcParams.parameters)
+                {
+                    if (string.IsNullOrEmpty(p.name))
+                    {
+                        continue;
+                    }
+                    if (!ctx.Settings.preserveParameterSyncState || p.networkSynced)
+                    {
+                        ctx.PreserveParameters.Add(p.name);
+                    }
+                }
+            }
+
+            var uses = new Dictionary<string, List<MenuUse>>();
+            var visited = new HashSet<VRCExpressionsMenu>();
+            var puppets = new List<PuppetPair>();
+            WalkMenu(vrc.expressionsMenu, "", uses, visited, ctx, puppets);
+
+            // VRChat's 256-bit budget pushed menu parameters into side channels that do not survive
+            // conversion, so "not synced" is untrustworthy. CVR has 3200 bits: menu parameters sync.
+            if (ctx.Settings.preserveParameterSyncState
+                && vrcParams != null && vrcParams.parameters != null)
+            {
+                var resynced = new List<string>();
+                foreach (var p in vrcParams.parameters)
+                {
+                    if (!string.IsNullOrEmpty(p.name) && uses.ContainsKey(p.name)
+                        && !ctx.PreserveParameters.Contains(p.name))
+                    {
+                        ctx.PreserveParameters.Add(p.name);
+                        resynced.Add(p.name);
+                    }
+                }
+                if (resynced.Count > 0)
+                {
+                    ctx.Report.Converted(Category,
+                        $"{BridgeElements.Count(resynced.Count, "menu parameter", "menu parameters")} synced although VRChat marked them local",
+                        string.Join(", ", resynced.Take(12)) + (resynced.Count > 12 ? ", …" : "") +
+                        ": a menu drives each, so others should see what it does.");
+                }
+            }
+
+            var entries = new List<CVRAdvancedSettingsEntry>();
+            var usedNames = new HashSet<string>();
+
+            // Two-axis puppets become one ChilloutVR Joystick2D rather than two sliders, so the
+            // parameters they own must not also be built as sliders below.
+            var joystickParams = new HashSet<string>();
+            foreach (var entry in BuildJoysticks(ctx, puppets, usedNames, joystickParams))
+            {
+                entries.Add(entry);
+            }
+
+            // Menu entries show the leaf name ("Cloak"), qualified by their parent menu
+            // only when several controls share the same leaf ("Hoodie (Tops)").
+            var leafCounts = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in uses)
+            {
+                string leaf = ShortName(pair.Value[0].DisplayName);
+                leafCounts[leaf] = leafCounts.TryGetValue(leaf, out var n) ? n + 1 : 1;
+            }
+
+            int ftSkipped = 0;
+            if (vrcParams != null && vrcParams.parameters != null)
+            {
+                foreach (var p in vrcParams.parameters)
+                {
+                    if (string.IsNullOrEmpty(p.name))
+                    {
+                        continue;
+                    }
+                    // Face-tracking parameters are driven by the FT animator layers; never
+                    // expose them as menu toggles.
+                    if (FaceTrackingParameters.IsFaceTracking(p.name))
+                    {
+                        ftSkipped++;
+                        continue;
+                    }
+                    if (joystickParams.Contains(p.name))
+                    {
+                        continue; // already covered by its Joystick2D entry
+                    }
+                    // Never for a parameter the stripper takes, or the stripped system's menu dangles.
+                    if (SystemStripper.WillBeStripped(ctx, p.name))
+                    {
+                        ctx.Report.Skipped(Category, $"Menu control for \"{p.name}\" not created",
+                            "The parameter belongs to a system being stripped (GoGo Loco / SPS / " +
+                            "extra keywords), so a control for it would sit in the menu driving " +
+                            "removed layers.");
+                        continue;
+                    }
+                    var entry = BuildEntry(ctx, p, uses.TryGetValue(p.name, out var paramUses) ? paramUses : null, usedNames, leafCounts);
+                    if (entry != null)
+                    {
+                        entries.Add(entry);
+                    }
+                }
+            }
+            else
+            {
+                ctx.Report.Warning(Category, "Expression parameters", "Avatar has no expression parameters asset.");
+            }
+
+            // Keep the CVR menu in roughly the same order as the VRChat menu.
+            entries = entries.OrderBy(e =>
+            {
+                int index = ctx.ParameterOrder.IndexOf(e.machineName);
+                return index == -1 ? int.MaxValue : index;
+            }).ToList();
+
+            if (ftSkipped > 0)
+            {
+                ctx.Report.Converted(Category, $"{BridgeElements.Count(ftSkipped, "face-tracking parameter", "face-tracking parameters")} left as-is",
+                    "Not exposed as menu toggles: the FT animator layers drive them.");
+            }
+
+            ctx.CvrAvatar.avatarSettings.settings = entries;
+            UnityEditor.EditorUtility.SetDirty(ctx.CvrAvatar);
+            ctx.Report.Converted(Category, $"{entries.Count} Advanced Avatar Settings entries created");
+            NoteParameterPackers(ctx, entries);
+        }
+
+        static List<CVRAdvancedSettingsEntry> BuildJoysticks(BridgeContext ctx, List<PuppetPair> puppets,
+            HashSet<string> usedNames, HashSet<string> claimed)
+        {
+            var result = new List<CVRAdvancedSettingsEntry>();
+            foreach (var puppet in puppets)
+            {
+                // A parameter can only belong to one control; if two puppets share an axis the
+                // avatar is already ambiguous and the sliders are the safer reading.
+                if (claimed.Contains(puppet.X) || claimed.Contains(puppet.Y))
+                {
+                    continue;
+                }
+
+                // Stripper's first: renaming "Go/PuppetX" to "-x" hid it from the "Go/" match and it survived.
+                if (SystemStripper.WillBeStripped(ctx, puppet.X) ||
+                    SystemStripper.WillBeStripped(ctx, puppet.Y))
+                {
+                    continue;
+                }
+
+                string label = ShortName(puppet.Display);
+                string machine = AnimatorMerger.SanitizeParameterName(label);
+                // An unnamed control gives the sanitizer nothing to work with and it falls back to
+                // a generic name. A menu full of "Param" helps nobody; leave those as sliders.
+                if (string.IsNullOrWhiteSpace(label) || string.IsNullOrEmpty(machine) ||
+                    machine == "Param")
+                {
+                    continue;
+                }
+                string candidate = machine;
+                for (int n = 2; !usedNames.Add(candidate); n++)
+                {
+                    candidate = machine + n;
+                }
+
+                ctx.ForcedRenames[puppet.X] = candidate + "-x";
+                ctx.ForcedRenames[puppet.Y] = candidate + "-y";
+                claimed.Add(puppet.X);
+                claimed.Add(puppet.Y);
+
+                // Both axes keep syncing: the pair is one control to the wearer, and half a
+                // joystick arriving at other players is worse than none.
+                ctx.PreserveParameters.Add(candidate + "-x");
+                ctx.PreserveParameters.Add(candidate + "-y");
+                // The base name too: CVR derives the axes from it. Left out, it became "#Name", the
+                // axes "#Name-x" matched nothing, and the dead-entry sweep removed the control.
+                ctx.PreserveParameters.Add(candidate);
+
+                result.Add(new CVRAdvancedSettingsEntry
+                {
+                    name = label,
+                    machineName = candidate,
+                    unlinkNameFromMachineName = true,
+                    type = CVRAdvancedSettingsEntry.SettingsType.Joystick2D,
+                    setting = new CVRAdvancesAvatarSettingJoystick2D
+                    {
+                        // A VRChat puppet rests centred and reaches a full unit in each
+                        // direction; ChilloutVR's default 0..1 range would clip half of it away.
+                        defaultValue = Vector2.zero,
+                        rangeMin = new Vector2(-1f, -1f),
+                        rangeMax = new Vector2(1f, 1f),
+                        usedType = CVRAdvancesAvatarSettingBase.ParameterType.Float,
+                    }
+                });
+
+                ctx.Report.Converted(Category, label,
+                    $"Two-axis puppet -> Joystick2D \"{candidate}\", full -1..1 on both axes. " +
+                    $"\"{puppet.X}\" and \"{puppet.Y}\" are renamed to \"{candidate}-x\" and " +
+                    $"\"{candidate}-y\", which is how ChilloutVR addresses a joystick's axes.");
+            }
+            return result;
+        }
+
+        static readonly string[] PackerPrefixes = { "MemOpt", "VFUP_", "VRCFuryUnlimited" };
+
+        static void NoteParameterPackers(BridgeContext ctx, List<CVRAdvancedSettingsEntry> entries)
+        {
+            var packed = entries
+                .Where(e => PackerPrefixes.Any(p => (e.machineName ?? "").StartsWith(p)))
+                .Select(e => e.machineName)
+                .ToList();
+            if (packed.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Warning(Category, $"{BridgeElements.Count(packed.Count, "packed sync slot", "packed sync slots")} must stay in the menu",
+                $"{string.Join(", ", packed.Take(4))}{(packed.Count > 4 ? ", …" : "")}: they carry the real " +
+                "toggles to other players. Deleting them breaks that.");
+        }
+
+        static CVRAdvancedSettingsEntry BuildEntry(BridgeContext ctx, VRCExpressionParameters.Parameter p,
+            List<MenuUse> paramUses, HashSet<string> usedNames, Dictionary<string, int> leafCounts)
+        {
+            bool hasMenu = paramUses != null && paramUses.Count > 0;
+
+            // Game-driven values (gestures, locomotion, visemes, stream-fed): overwritten every
+            // frame, so a menu control does nothing but cost space and sync.
+            if (CvrParameterNames.IsGameDriven(p.name))
+            {
+                ctx.Report.Skipped(Category, p.name,
+                    "No menu control created: ChilloutVR drives this parameter itself, so the avatar's " +
+                    "animator still reads it, but a menu entry would only fight the game for the value.");
+                return null;
+            }
+
+            if (!hasMenu && !ctx.Settings.exposeMenulessSyncedParameters)
+            {
+                ctx.Report.Skipped(Category, p.name, "Not referenced by any menu control.");
+                return null;
+            }
+            if (!hasMenu && ctx.Settings.preserveParameterSyncState && !p.networkSynced)
+            {
+                // Local-only and menuless: nothing to expose, the animator keeps it internal.
+                return null;
+            }
+
+            if (!hasMenu)
+            {
+                // Remembered, not decided here: whether this one is worth keeping depends on what
+                // the merged animator turns out to do with the parameter, and the merge hasn't
+                // happened yet. See AnimatorMerger.WithdrawSelfDrivenExposures.
+                ctx.AutoExposedParameters.Add(p.name);
+            }
+
+            string display = hasMenu
+                ? (p.valueType == VRCExpressionParameters.ValueType.Int ? DropdownTitle(paramUses) : null)
+                    ?? FriendlyMenuName(paramUses[0].DisplayName, leafCounts)
+                : FriendlyParamName(p.name);
+            display = MakeUnique(display, usedNames);
+
+            // VRChat menu Buttons are momentary; held while pressed, then reset. ChilloutVR's
+            // menu has no equivalent control type (Toggle/Dropdown/Color/Slider/Input... only), so
+            // they convert as ordinary toggles: the value stays until switched off.
+            if (hasMenu && paramUses.All(u => u.Type == VRCExpressionsMenu.Control.ControlType.Button))
+            {
+                ctx.ImpulseParameters.Add(p.name);
+                ctx.Report.Approximated(Category, p.name,
+                    $"\"{display}\" was a momentary Button in VRChat; ChilloutVR has no button control, " +
+                    "so it becomes a toggle you switch off again. If it drives a one-shot effect, add a " +
+                    "state in the animator that drives the parameter back to 0.");
+            }
+
+            NoteClientDrivenEquivalent(ctx, p.name, display);
+
+            switch (p.valueType)
+            {
+                case VRCExpressionParameters.ValueType.Bool:
+                    ctx.Report.Converted(Category, p.name, $"Toggle \"{display}\"");
+                    return new CVRAdvancedSettingsEntry
+                    {
+                        name = display,
+                        machineName = p.name,
+                        unlinkNameFromMachineName = true,
+                        setting = new CVRAdvancesAvatarSettingGameObjectToggle
+                        {
+                            defaultValue = p.defaultValue != 0,
+                            usedType = CVRAdvancesAvatarSettingBase.ParameterType.Bool
+                        }
+                    };
+
+                case VRCExpressionParameters.ValueType.Float:
+                    // VRCFury bakes toggles as floats: a checkbox if every use writes 0 or 1. Presets
+                    // at 0.25/0.5/0.75 stay a slider, a checkbox would reach none of them.
+                    bool allToggles = hasMenu && paramUses.All(u =>
+                        u.Type == VRCExpressionsMenu.Control.ControlType.Toggle ||
+                        u.Type == VRCExpressionsMenu.Control.ControlType.Button);
+                    var presets = allToggles
+                        ? paramUses.Where(u => u.Type == VRCExpressionsMenu.Control.ControlType.Toggle &&
+                                               u.Value != 0f && !Mathf.Approximately(u.Value, 1f))
+                            .Select(u => u.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture))
+                            .Distinct().ToList()
+                        : null;
+                    if (allToggles && presets.Count == 0)
+                    {
+                        ctx.Report.Converted(Category, p.name, $"Toggle \"{display}\" (float parameter)");
+                        return new CVRAdvancedSettingsEntry
+                        {
+                            name = display,
+                            machineName = p.name,
+                            unlinkNameFromMachineName = true,
+                            setting = new CVRAdvancesAvatarSettingGameObjectToggle
+                            {
+                                defaultValue = p.defaultValue != 0,
+                                usedType = CVRAdvancesAvatarSettingBase.ParameterType.Float
+                            }
+                        };
+                    }
+                    if (hasMenu && paramUses.Any(u =>
+                        u.Type == VRCExpressionsMenu.Control.ControlType.TwoAxisPuppet))
+                    {
+                        ctx.Report.Approximated(Category, p.name,
+                            "Two-axis puppet axis converted to a 0..1 slider; the -1..0 half is unreachable from the CVR menu.");
+                    }
+                    else if (allToggles)
+                    {
+                        ctx.Report.Approximated(Category, p.name,
+                            $"Slider \"{display}\": its VRChat toggles set it to {string.Join(", ", presets)}, and a " +
+                            "ChilloutVR toggle can only write 0 or 1. Drag the slider to those values.");
+                    }
+                    else
+                    {
+                        ctx.Report.Converted(Category, p.name, $"Slider \"{display}\"");
+                    }
+                    return new CVRAdvancedSettingsEntry
+                    {
+                        name = display,
+                        machineName = p.name,
+                        unlinkNameFromMachineName = true,
+                        type = CVRAdvancedSettingsEntry.SettingsType.Slider,
+                        setting = new CVRAdvancesAvatarSettingSlider
+                        {
+                            defaultValue = p.defaultValue,
+                            usedType = CVRAdvancesAvatarSettingBase.ParameterType.Float
+                        }
+                    };
+
+                case VRCExpressionParameters.ValueType.Int:
+                    return BuildIntEntry(ctx, p, paramUses, display);
+
+                default:
+                    ctx.Report.Skipped(Category, p.name, $"Unknown parameter type {p.valueType}.");
+                    return null;
+            }
+        }
+
+        static CVRAdvancedSettingsEntry BuildIntEntry(BridgeContext ctx, VRCExpressionParameters.Parameter p,
+            List<MenuUse> paramUses, string display)
+        {
+            bool hasMenu = paramUses != null && paramUses.Count > 0;
+
+            // A single menu toggle that sets the int to 1 behaves like a bool.
+            if (hasMenu && paramUses.Count == 1 && Mathf.Approximately(paramUses[0].Value, 1f))
+            {
+                ctx.Report.Converted(Category, p.name, $"Toggle \"{display}\" (int used as bool)");
+                return new CVRAdvancedSettingsEntry
+                {
+                    name = display,
+                    machineName = p.name,
+                    unlinkNameFromMachineName = true,
+                    setting = new CVRAdvancesAvatarSettingGameObjectToggle
+                    {
+                        defaultValue = Mathf.Approximately(p.defaultValue, 1f),
+                        usedType = CVRAdvancesAvatarSettingBase.ParameterType.Bool
+                    }
+                };
+            }
+
+            // What the animator actually reacts to, and the state name behind each value.
+            var animatorValues = ScanIntUsage(ctx, p.name);
+
+            var valueNames = new Dictionary<int, string>();
+            if (hasMenu)
+            {
+                foreach (var use in paramUses)
+                {
+                    valueNames[(int)use.Value] = ShortName(use.DisplayName);
+                }
+            }
+            else
+            {
+                foreach (var kv in animatorValues)
+                {
+                    valueNames[kv.Key] = kv.Value ?? (p.name + " = " + kv.Key);
+                }
+            }
+            int maxValue = Mathf.Max(valueNames.Count > 0 ? valueNames.Keys.Max() : 0, (int)p.defaultValue);
+            maxValue = Mathf.Min(maxValue, 255);
+
+            // Dropdown index is the value, so N needs N+1 entries. Gaps CompactIntDropdowns cannot
+            // remove get the reacting state's name, or a label saying nothing reacts.
+            var options = new List<CVRAdvancedSettingsDropDownEntry>();
+            int live = 0, inert = 0;
+            for (int i = 0; i <= maxValue; i++)
+            {
+                string label;
+                if (valueNames.TryGetValue(i, out var menuLabel))
+                {
+                    label = menuLabel;
+                    live++;
+                }
+                else if (animatorValues.TryGetValue(i, out var stateName))
+                {
+                    // A VRChat menu has no button for 0: switching a toggle off returns the int there.
+                    label = stateName ?? (i == 0 && hasMenu ? "None" : $"Option {i}");
+                    live++;
+                }
+                else
+                {
+                    label = UnusedOption;
+                    inert++;
+                }
+                options.Add(new CVRAdvancedSettingsDropDownEntry { name = label });
+            }
+
+            // Gaps are reported later: the animator merge renumbers the parameter to remove
+            // them where it can, and only explains them when it can't (CompactIntDropdowns).
+            ctx.Report.Converted(Category, p.name,
+                inert > 0
+                    ? $"Dropdown \"{display}\" with {options.Count} options ({live} mapped to a value the avatar uses)"
+                    : $"Dropdown \"{display}\" with {options.Count} options");
+            return new CVRAdvancedSettingsEntry
+            {
+                name = display,
+                machineName = p.name,
+                unlinkNameFromMachineName = true,
+                type = CVRAdvancedSettingsEntry.SettingsType.Dropdown,
+                setting = new CVRAdvancesAvatarSettingGameObjectDropdown
+                {
+                    defaultValue = (int)p.defaultValue,
+                    options = options,
+                    usedType = CVRAdvancesAvatarSettingBase.ParameterType.Int
+                }
+            };
+        }
+
+        static void WalkMenu(VRCExpressionsMenu menu, string prefix,
+            Dictionary<string, List<MenuUse>> uses, HashSet<VRCExpressionsMenu> visited, BridgeContext ctx,
+            List<PuppetPair> puppets)
+        {
+            if (menu == null || visited.Contains(menu))
+            {
+                return;
+            }
+            visited.Add(menu);
+
+            foreach (var control in menu.controls)
+            {
+                string display = prefix + YapsLabel(ctx, CleanMenuName(control.name));
+                switch (control.type)
+                {
+                    case VRCExpressionsMenu.Control.ControlType.Toggle:
+                    case VRCExpressionsMenu.Control.ControlType.Button:
+                        RecordUse(uses, ctx, control.parameter?.name, display, control.value, control.type);
+                        break;
+
+                    case VRCExpressionsMenu.Control.ControlType.RadialPuppet:
+                        RecordSubParameter(uses, ctx, control, 0, display, control.type);
+                        break;
+
+                    case VRCExpressionsMenu.Control.ControlType.TwoAxisPuppet:
+                        RecordSubParameter(uses, ctx, control, 0, display + " (Horizontal)", control.type);
+                        RecordSubParameter(uses, ctx, control, 1, display + " (Vertical)", control.type);
+                        string px = SubParameterName(control, 0), py = SubParameterName(control, 1);
+                        if (!string.IsNullOrEmpty(px) && !string.IsNullOrEmpty(py) && px != py)
+                        {
+                            puppets.Add(new PuppetPair { Display = display, X = px, Y = py });
+                        }
+                        break;
+
+                    case VRCExpressionsMenu.Control.ControlType.FourAxisPuppet:
+                        RecordSubParameter(uses, ctx, control, 0, display + " (Up)", control.type);
+                        RecordSubParameter(uses, ctx, control, 1, display + " (Right)", control.type);
+                        RecordSubParameter(uses, ctx, control, 2, display + " (Down)", control.type);
+                        RecordSubParameter(uses, ctx, control, 3, display + " (Left)", control.type);
+                        break;
+
+                    case VRCExpressionsMenu.Control.ControlType.SubMenu:
+                        WalkMenu(control.subMenu, display + MenuSeparator, uses, visited, ctx, puppets);
+                        break;
+                }
+            }
+        }
+
+        static string SubParameterName(VRCExpressionsMenu.Control control, int index) =>
+            control.subParameters != null && control.subParameters.Length > index
+                ? control.subParameters[index]?.name
+                : null;
+
+        static void RecordSubParameter(Dictionary<string, List<MenuUse>> uses, BridgeContext ctx,
+            VRCExpressionsMenu.Control control, int index, string display,
+            VRCExpressionsMenu.Control.ControlType type)
+        {
+            if (control.subParameters != null && control.subParameters.Length > index)
+            {
+                RecordUse(uses, ctx, control.subParameters[index]?.name, display, 0f, type);
+            }
+        }
+
+        static void RecordUse(Dictionary<string, List<MenuUse>> uses, BridgeContext ctx,
+            string parameterName, string display, float value, VRCExpressionsMenu.Control.ControlType type)
+        {
+            if (string.IsNullOrEmpty(parameterName))
+            {
+                return;
+            }
+            if (!uses.TryGetValue(parameterName, out var list))
+            {
+                uses[parameterName] = list = new List<MenuUse>();
+            }
+            list.Add(new MenuUse { DisplayName = display, Value = value, Type = type });
+            if (!ctx.ParameterOrder.Contains(parameterName))
+            {
+                ctx.ParameterOrder.Add(parameterName);
+            }
+        }
+
+        // The layers the merge will convert, by its own rule: a skipped or default layer's
+        // values never reach the output.
+        static Dictionary<int, string> ScanIntUsage(BridgeContext ctx, string parameterName)
+        {
+            var values = new Dictionary<int, string> { { 0, null } };
+            foreach (var (_, controller) in AnimatorMerger.GetSelectedVrcControllers(ctx))
+            {
+                foreach (var animatorLayer in controller.layers)
+                {
+                    ScanMachine(animatorLayer.stateMachine, parameterName, values);
+                }
+            }
+            return values;
+        }
+
+        static void ScanMachine(AnimatorStateMachine machine, string parameterName, Dictionary<int, string> values)
+        {
+            if (machine == null)
+            {
+                return;
+            }
+            foreach (var child in machine.states)
+            {
+                foreach (var transition in child.state.transitions)
+                {
+                    ScanConditions(transition, parameterName, values);
+                }
+            }
+            foreach (var transition in machine.anyStateTransitions)
+            {
+                ScanConditions(transition, parameterName, values);
+            }
+            foreach (var transition in machine.entryTransitions)
+            {
+                ScanConditions(transition, parameterName, values);
+            }
+            foreach (var child in machine.stateMachines)
+            {
+                ScanMachine(child.stateMachine, parameterName, values);
+            }
+        }
+
+        static void ScanConditions(AnimatorTransitionBase transition, string parameterName, Dictionary<int, string> values)
+        {
+            foreach (var condition in transition.conditions)
+            {
+                if (condition.parameter != parameterName)
+                {
+                    continue;
+                }
+                int value = Mathf.Abs(condition.threshold - Mathf.Round(condition.threshold)) < 0.001f
+                    ? (int)Mathf.Round(condition.threshold)
+                    : (int)condition.threshold;
+
+                // Only "Equals" identifies a value with a state; Greater/Less/NotEqual say the
+                // value is referenced but not which state it selects.
+                string name = null;
+                if (condition.mode == AnimatorConditionMode.Equals && transition.destinationState != null)
+                {
+                    name = UsefulStateName(transition.destinationState.name);
+                }
+                if (!values.TryGetValue(value, out var existing) || (existing == null && name != null))
+                {
+                    values[value] = name;
+                }
+            }
+        }
+
+        static string UsefulStateName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return null;
+            }
+            string trimmed = name.Trim();
+            string lower = trimmed.ToLowerInvariant();
+            if (lower == "blend tree" || lower == "new state" || lower.StartsWith("state ") ||
+                lower == "on" || lower == "off" || lower == "idle" || lower == "default" ||
+                trimmed.All(char.IsDigit))
+            {
+                return null;
+            }
+            return trimmed;
+        }
+
+        // Labels only: profiles restore by parameter name. Not DPS, which also means damage per second.
+        static string YapsLabel(BridgeContext ctx, string display)
+        {
+            if (ctx == null || !ctx.Settings.convertYapsSystems || string.IsNullOrEmpty(display))
+            {
+                return display;
+            }
+            return System.Text.RegularExpressions.Regex.Replace(
+                display, @"\b(?:SPS|TPS)(?=\d|\b)", "YAPS");
+        }
+
+        static string CleanMenuName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                return "-";
+            }
+            string clean = System.Text.RegularExpressions.Regex.Replace(name, "<[^>]*>", "");
+            clean = clean.Replace("\r", " ").Replace("\n", " ");
+            clean = System.Text.RegularExpressions.Regex.Replace(clean, @"\s+", " ").Trim();
+            return string.IsNullOrEmpty(clean) ? "-" : clean;
+        }
+
+        static string ShortName(string display, char separator = MenuSeparator)
+        {
+            int slash = display.LastIndexOf(separator);
+            return slash >= 0 && slash < display.Length - 1 ? display.Substring(slash + 1) : display;
+        }
+
+        static string FriendlyMenuName(string fullPath, Dictionary<string, int> leafCounts)
+        {
+            string leaf = ShortName(fullPath);
+            if (leafCounts.TryGetValue(leaf, out var count) && count > 1)
+            {
+                var segments = fullPath.Split(MenuSeparator);
+                if (segments.Length >= 2)
+                {
+                    return $"{leaf} ({segments[segments.Length - 2]})";
+                }
+            }
+            return leaf;
+        }
+
+        // A dropdown is a submenu of toggles each setting one value, so it takes the submenu's name,
+        // not its first option's. Null for a lone toggle, or toggles with no submenu in common.
+        static string DropdownTitle(List<MenuUse> uses)
+        {
+            if (uses.Select(u => u.Value).Distinct().Count() < 2) return null;
+            var common = uses[0].DisplayName.Split(MenuSeparator);
+            int shared = common.Length - 1;
+            foreach (var use in uses.Skip(1))
+            {
+                var parts = use.DisplayName.Split(MenuSeparator);
+                int n = 0;
+                while (n < shared && n < parts.Length - 1 && parts[n] == common[n]) n++;
+                shared = n;
+            }
+            return shared > 0 ? common[shared - 1] : null;
+        }
+
+        static string FriendlyParamName(string name)
+        {
+            string clean = System.Text.RegularExpressions.Regex.Replace(name, @"^VF\d+_", "");
+            return ShortName(clean, '/');
+        }
+
+        static string MakeUnique(string name, HashSet<string> usedNames)
+        {
+            string candidate = name;
+            int suffix = 2;
+            while (!usedNames.Add(candidate))
+            {
+                candidate = $"{name} ({suffix++})";
+            }
+            return candidate;
+        }
+    }
+}
+#endif

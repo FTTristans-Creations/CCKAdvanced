@@ -1,0 +1,376 @@
+#if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS
+using System.Collections.Generic;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using ABI.CCK.Scripts;
+
+namespace AvatarBridge
+{
+    // VRCFury bakes menu parameters as floats; CVR writes the entry's declared type, and a Bool
+    // into a Float parameter silently does nothing ("toggle does nothing in game"). The type comes
+    // from the menu control (AAS entries, whose machineName follows the renames), else from
+    // Equals/NotEqual against whole numbers 2 or more (an int selector). Veto first: anything read
+    // as a quantity (blend tree, motion time, speed, cycle offset, clip-written) stays float.
+    // Conditions are rewritten to the new type.
+    public static class ParameterTypeInference
+    {
+        const string Category = "Animator";
+
+        public static void Run(AnimatorController master, BridgeContext ctx)
+        {
+            var quantity = new HashSet<string>();
+            var exactMatches = new Dictionary<string, HashSet<float>>();
+            Collect(master, quantity, exactMatches);
+
+            var wanted = WantedTypes(ctx, exactMatches);
+            var parameters = master.parameters;
+            var changed = new Dictionary<string, AnimatorControllerParameterType>();
+            var vetoed = new List<string>();
+
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                var p = parameters[i];
+                // Only VRCFury's float bake is corrected. A parameter the author already
+                // declared Bool or Int is left exactly as it is.
+                if (p.type != AnimatorControllerParameterType.Float
+                    || !wanted.TryGetValue(p.name, out var target)
+                    || target == AnimatorControllerParameterType.Float)
+                {
+                    continue;
+                }
+                if (quantity.Contains(p.name))
+                {
+                    vetoed.Add(p.name);
+                    continue;
+                }
+
+                if (target == AnimatorControllerParameterType.Bool)
+                {
+                    p.defaultBool = p.defaultFloat != 0f;
+                }
+                else
+                {
+                    p.defaultInt = Mathf.RoundToInt(p.defaultFloat);
+                }
+                p.type = target;
+                changed[p.name] = target;
+            }
+
+            if (changed.Count == 0)
+            {
+                ReportVetoes(ctx, vetoed);
+                return;
+            }
+            master.parameters = parameters;
+            RewriteConditions(master, changed, ctx);
+
+            int bools = changed.Count(c => c.Value == AnimatorControllerParameterType.Bool);
+            int ints = changed.Count - bools;
+            var parts = new List<string>();
+            if (bools > 0)
+            {
+                parts.Add($"{bools} to Bool");
+            }
+            if (ints > 0)
+            {
+                parts.Add($"{ints} to Int");
+            }
+            ctx.Report.Converted(Category, $"{BridgeElements.Count(changed.Count, "parameter", "parameters")} retyped from Float ({string.Join(", ", parts)})",
+                "VRCFury bakes menu parameters as floats, and a bool written into one does nothing. Each now " +
+                "matches its menu control and conditions.");
+            ReportVetoes(ctx, vetoed);
+        }
+
+        static void ReportVetoes(BridgeContext ctx, List<string> vetoed)
+        {
+            if (vetoed.Count == 0)
+            {
+                return;
+            }
+            ctx.Report.Approximated(Category, $"{BridgeElements.Count(vetoed.Count, "parameter", "parameters")} kept as Float",
+                $"{string.Join(", ", vetoed.Take(6))}{(vetoed.Count > 6 ? ", …" : "")}: a blend tree, motion " +
+                "time or clip needs the values in between.");
+        }
+
+        static Dictionary<string, AnimatorControllerParameterType> WantedTypes(
+            BridgeContext ctx, Dictionary<string, HashSet<float>> exactMatches)
+        {
+            var wanted = new Dictionary<string, AnimatorControllerParameterType>();
+
+            var settings = ctx.CvrAvatar != null && ctx.CvrAvatar.avatarSettings != null
+                ? ctx.CvrAvatar.avatarSettings.settings
+                : null;
+            if (settings != null)
+            {
+                foreach (var entry in settings)
+                {
+                    if (entry == null || string.IsNullOrEmpty(entry.machineName))
+                    {
+                        continue;
+                    }
+                    switch (entry.type)
+                    {
+                        case CVRAdvancedSettingsEntry.SettingsType.Toggle:
+                            wanted[entry.machineName] = AnimatorControllerParameterType.Bool;
+                            break;
+                        case CVRAdvancedSettingsEntry.SettingsType.Dropdown:
+                            wanted[entry.machineName] = AnimatorControllerParameterType.Int;
+                            break;
+                        default:
+                            // Sliders, joysticks and vector inputs are genuinely continuous.
+                            wanted[entry.machineName] = AnimatorControllerParameterType.Float;
+                            break;
+                    }
+                }
+            }
+
+            // No menu control: a parameter only ever matched exactly, against whole numbers
+            // that reach 2 or more, is a selector. One matched only against 0 and 1 is left
+            // alone; that shape is just as likely to be a float someone compares to 1.
+            foreach (var pair in exactMatches)
+            {
+                if (wanted.ContainsKey(pair.Key))
+                {
+                    continue;
+                }
+                if (pair.Value.Count > 0 && pair.Value.All(IsWhole) && pair.Value.Any(v => v >= 2f))
+                {
+                    wanted[pair.Key] = AnimatorControllerParameterType.Int;
+                }
+            }
+            return wanted;
+        }
+
+        static bool IsWhole(float value)
+        {
+            return Mathf.Approximately(value, Mathf.Round(value));
+        }
+
+        static void Collect(AnimatorController master, HashSet<string> quantity,
+            Dictionary<string, HashSet<float>> exactMatches)
+        {
+            void NoteMotion(Motion motion)
+            {
+                if (motion is BlendTree tree)
+                {
+                    quantity.Add(tree.blendParameter);
+                    quantity.Add(tree.blendParameterY);
+                    foreach (var child in tree.children)
+                    {
+                        if (tree.blendType == BlendTreeType.Direct)
+                        {
+                            quantity.Add(child.directBlendParameter);
+                        }
+                        NoteMotion(child.motion);
+                    }
+                }
+                else if (motion is AnimationClip clip)
+                {
+                    foreach (var binding in AnimationUtility.GetCurveBindings(clip))
+                    {
+                        // An animated animator parameter: the clip drives it over time.
+                        if (binding.type == typeof(Animator) && string.IsNullOrEmpty(binding.path))
+                        {
+                            quantity.Add(binding.propertyName);
+                        }
+                    }
+                }
+            }
+
+            void NoteConditions(AnimatorTransitionBase[] transitions)
+            {
+                foreach (var transition in transitions)
+                {
+                    foreach (var condition in transition.conditions)
+                    {
+                        if (condition.mode != AnimatorConditionMode.Equals
+                            && condition.mode != AnimatorConditionMode.NotEqual)
+                        {
+                            continue;
+                        }
+                        if (!exactMatches.TryGetValue(condition.parameter, out var values))
+                        {
+                            values = new HashSet<float>();
+                            exactMatches[condition.parameter] = values;
+                        }
+                        values.Add(condition.threshold);
+                    }
+                }
+            }
+
+            foreach (var layer in master.layers)
+            {
+                Walk(layer.stateMachine, machine =>
+                {
+                    NoteConditions(machine.anyStateTransitions);
+                    NoteConditions(machine.entryTransitions);
+                    foreach (var child in machine.states)
+                    {
+                        var state = child.state;
+                        if (state.timeParameterActive) quantity.Add(state.timeParameter);
+                        if (state.speedParameterActive) quantity.Add(state.speedParameter);
+                        if (state.cycleOffsetParameterActive) quantity.Add(state.cycleOffsetParameter);
+                        if (state.mirrorParameterActive) quantity.Add(state.mirrorParameter);
+                        NoteMotion(state.motion);
+                        NoteConditions(state.transitions);
+                    }
+                });
+            }
+        }
+
+        static void RewriteConditions(AnimatorController master,
+            Dictionary<string, AnimatorControllerParameterType> changed, BridgeContext ctx)
+        {
+            int unreachableDropped = 0;
+            var unreachableNotes = new List<string>();
+
+            T[] Rewrite<T>(T[] transitions) where T : AnimatorTransitionBase
+            {
+                var kept = new List<T>(transitions.Length);
+                foreach (var transition in transitions)
+                {
+                    var conditions = transition.conditions;
+                    bool touched = false;
+                    // Unsatisfiable in the new domain was dead in VRChat: mapping "< 0" to "is false" would revive it.
+                    bool unreachable = false;
+                    var surviving = new List<AnimatorCondition>(conditions.Length);
+                    for (int i = 0; i < conditions.Length; i++)
+                    {
+                        if (!changed.TryGetValue(conditions[i].parameter, out var type))
+                        {
+                            surviving.Add(conditions[i]);
+                            continue;
+                        }
+                        var condition = conditions[i];
+                        if (type == AnimatorControllerParameterType.Bool)
+                        {
+                            // A bool only ever reads 0 or 1.
+                            switch (condition.mode)
+                            {
+                                // Tautologies too: VRCFury's remote band "IsLocal > -0.001 && < 0.001"
+                                // means 0; "> -0.001" as "is true" made it "true AND false", and
+                                // remotes played the local branch. Same fix as AnimatorMerger.ReconcileConditionModes.
+                                case AnimatorConditionMode.Greater:
+                                    if (condition.threshold >= 1f) { unreachable = true; }
+                                    else if (condition.threshold < 0f) { touched = true; continue; }
+                                    else { condition.mode = AnimatorConditionMode.If; }
+                                    break;
+                                case AnimatorConditionMode.Less:
+                                    if (condition.threshold <= 0f) { unreachable = true; }
+                                    else if (condition.threshold > 1f) { touched = true; continue; }
+                                    else { condition.mode = AnimatorConditionMode.IfNot; }
+                                    break;
+                                case AnimatorConditionMode.Equals:
+                                    if (Mathf.Approximately(condition.threshold, 0f)) { condition.mode = AnimatorConditionMode.IfNot; }
+                                    else if (Mathf.Approximately(condition.threshold, 1f)) { condition.mode = AnimatorConditionMode.If; }
+                                    else { unreachable = true; }
+                                    break;
+                                case AnimatorConditionMode.NotEqual:
+                                    if (Mathf.Approximately(condition.threshold, 0f)) { condition.mode = AnimatorConditionMode.If; }
+                                    else if (Mathf.Approximately(condition.threshold, 1f)) { condition.mode = AnimatorConditionMode.IfNot; }
+                                    else
+                                    {
+                                        // "not a value it can ever hold" is always true: the
+                                        // condition goes, the transition stays.
+                                        touched = true;
+                                        continue;
+                                    }
+                                    break;
+                            }
+                            if (unreachable)
+                            {
+                                break;
+                            }
+                            condition.threshold = 0f;
+                        }
+                        else
+                        {
+                            // Int comparisons are whole-number only, and If/IfNot don't exist
+                            // for them; they become "not zero" / "is zero".
+                            switch (condition.mode)
+                            {
+                                case AnimatorConditionMode.If:
+                                    condition.mode = AnimatorConditionMode.Greater;
+                                    condition.threshold = 0f;
+                                    break;
+                                case AnimatorConditionMode.IfNot:
+                                    condition.mode = AnimatorConditionMode.Less;
+                                    condition.threshold = 1f;
+                                    break;
+                                // Each side keeps the whole numbers it held: rounded half to even,
+                                // "less than 0.5" became "less than 0", which no dropdown is.
+                                case AnimatorConditionMode.Greater:
+                                    condition.threshold = Mathf.Floor(condition.threshold);
+                                    break;
+                                case AnimatorConditionMode.Less:
+                                    condition.threshold = Mathf.Ceil(condition.threshold);
+                                    break;
+                                default:
+                                    condition.threshold = Mathf.Round(condition.threshold);
+                                    break;
+                            }
+                        }
+                        surviving.Add(condition);
+                        touched = true;
+                    }
+                    if (unreachable)
+                    {
+                        unreachableDropped++;
+                        if (unreachableNotes.Count < 5)
+                        {
+                            string to = transition.destinationState != null
+                                ? transition.destinationState.name
+                                : (transition.destinationStateMachine != null
+                                    ? transition.destinationStateMachine.name : "Exit");
+                            unreachableNotes.Add($"-> \"{to}\"");
+                        }
+                        continue;
+                    }
+                    if (touched)
+                    {
+                        transition.conditions = surviving.ToArray();
+                    }
+                    kept.Add(transition);
+                }
+                return kept.ToArray();
+            }
+
+            foreach (var layer in master.layers)
+            {
+                Walk(layer.stateMachine, machine =>
+                {
+                    machine.anyStateTransitions = Rewrite(machine.anyStateTransitions);
+                    machine.entryTransitions = Rewrite(machine.entryTransitions);
+                    foreach (var child in machine.states)
+                    {
+                        child.state.transitions = Rewrite(child.state.transitions);
+                    }
+                });
+            }
+
+            if (unreachableDropped > 0)
+            {
+                ctx.Report.Approximated("Animator",
+                    $"{BridgeElements.Count(unreachableDropped, "transition", "transitions")} dropped that could never fire",
+                    $"{string.Join(", ", unreachableNotes)}{(unreachableDropped > unreachableNotes.Count ? ", …" : "")}" +
+                    ": the parameter's range can never satisfy them, so they never fired in VRChat either.");
+            }
+        }
+
+        static void Walk(AnimatorStateMachine machine, System.Action<AnimatorStateMachine> visit)
+        {
+            if (machine == null)
+            {
+                return;
+            }
+            visit(machine);
+            foreach (var child in machine.stateMachines)
+            {
+                Walk(child.stateMachine, visit);
+            }
+        }
+    }
+}
+#endif

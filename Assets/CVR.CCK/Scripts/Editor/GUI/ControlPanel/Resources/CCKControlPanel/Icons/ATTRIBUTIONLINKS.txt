@@ -1,0 +1,17 @@
+﻿
+
+Hub: https://www.flaticon.com/free-icon-font/user_3917705?page=1&position=3&term=profile&origin=search&related_id=3917705
+Builder: https://www.flaticon.com/free-icon-font/cube_5528180?page=1&position=3&term=cube&origin=search&related_id=5528180
+Browser: https://www.flaticon.com/free-icon-font/browser_3914082?page=1&position=13&term=browser&origin=search&related_id=3914082
+Settings: https://www.flaticon.com/free-icon-font/settings_3917110?page=1&position=5&term=settings&origin=search&related_id=3917110
+Languages: https://www.flaticon.com/free-icon-font/translation-app_18625368?page=1&position=3&term=translation-app&origin=search&related_id=18625368
+Uicons by <a href="https://www.flaticon.com/uicons">Flaticon</a>
+
+Avatar: https://www.flaticon.com/free-icon/man_9567040?term=person&page=1&position=50&origin=search&related_id=9567040
+<a href="https://www.flaticon.com/free-icons/planet" title="planet icons">Planet icons created by designvector10 - Flaticon</a>
+
+World: https://www.flaticon.com/free-icon/earth_3249720?term=planet&page=1&position=32&origin=search&related_id=3249720
+<a href="https://www.flaticon.com/free-icons/pictogram" title="pictogram icons">Pictogram icons created by Prosymbols Premium - Flaticon</a>
+
+Prop: https://www.flaticon.com/free-icon/game_13127028?term=rubix&page=1&position=2&origin=search&related_id=13127028
+<a href="https://www.flaticon.com/free-icons/rubix" title="rubix icons">Rubix icons created by msidiqf - Flaticon</a>

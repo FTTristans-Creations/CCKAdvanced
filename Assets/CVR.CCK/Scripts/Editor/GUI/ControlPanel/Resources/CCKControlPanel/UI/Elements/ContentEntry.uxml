@@ -1,0 +1,22 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" xsi="http://www.w3.org/2001/XMLSchema-instance" engine="UnityEngine.UIElements" editor="UnityEditor.UIElements" noNamespaceSchemaLocation="../../../UIElementsSchema/UIElements.xsd" editor-extension-mode="True">
+    <Style src="project://database/Assets/CVR.CCK/Scripts/Editor/GUI/ControlPanel/Resources/CCKControlPanel/UI/ControlPanelStyles.uss?fileID=7433441132597879392&amp;guid=1ddb0f4cf43313e49bfe30377cfbffdb&amp;type=3#ControlPanelStyles" />
+    <ui:VisualElement name="ContentEntry" style="flex-direction: row; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 1px; border-right-width: 1px; border-top-width: 1px; border-bottom-width: 1px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; margin-left: 5px; margin-right: 5px; margin-top: 5px; margin-bottom: 5px; padding-left: 5px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; display: flex; flex-shrink: 0;">
+        <ui:Image name="image-thumbnail" style="height: 68px; width: 68px; flex-shrink: 0;" />
+        <ui:VisualElement name="Info" style="flex-grow: 1; margin-left: 5px; margin-right: 5px;">
+            <ui:VisualElement name="Info" style="flex-grow: 1;">
+                <ui:Label text="Cute Lime 3.5" display-tooltip-when-elided="true" name="label-name" enable-rich-text="false" style="-unity-font-style: bold; white-space: normal;" />
+                <ui:Label text="Limes- small green orbs of tangy delight. Often overshadowed by their citrusy cousins, they offer a subtle zest to life&apos;s palate. Their green hue whispers of tropical breezes, yet they remain humble, simply waiting to be squeezed or sliced." display-tooltip-when-elided="true" name="label-description" enable-rich-text="false" style="white-space: normal; font-size: 10px; overflow: hidden; max-height: 38px;" />
+            </ui:VisualElement>
+            <ui:VisualElement name="Status" style="flex-direction: row;">
+                <ui:Label text="Private" display-tooltip-when-elided="true" name="label-status" style="flex-grow: 1; -unity-font-style: bold;" />
+                <ui:Label text="PC, Android" display-tooltip-when-elided="true" name="label-platform" style="-unity-font-style: bold;" />
+            </ui:VisualElement>
+        </ui:VisualElement>
+        <ui:VisualElement style="background-color: rgb(0, 0, 0); width: 1px; flex-shrink: 0; display: flex;" />
+        <ui:VisualElement name="Buttons" style="width: 100px; justify-content: center; flex-shrink: 0;">
+            <ui:Button text="View on Hub" display-tooltip-when-elided="true" name="button-view-on-hub" />
+            <ui:Button text="View in Client" display-tooltip-when-elided="true" name="button-view-in-client" />
+            <ui:Button text="Copy Asset ID" display-tooltip-when-elided="true" name="button-copy-asset-id" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

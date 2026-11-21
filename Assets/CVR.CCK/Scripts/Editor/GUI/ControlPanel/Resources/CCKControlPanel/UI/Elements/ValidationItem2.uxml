@@ -1,0 +1,19 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" editor-extension-mode="True">
+    <Style src="project://database/Assets/CVR.CCK/Scripts/Editor/GUI/ControlPanel/Resources/CCKControlPanel/UI/ControlPanelStyles.uss?fileID=7433441132597879392&amp;guid=1ddb0f4cf43313e49bfe30377cfbffdb&amp;type=3#ControlPanelStyles" />
+    <ui:VisualElement name="validationContainer" style="flex-direction: column; flex-shrink: 1; flex-grow: 0; border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-left-width: 0; border-right-width: 0; border-top-width: 0; border-bottom-width: 0; padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-top: 5px;">
+        <ui:VisualElement style="border-left-color: rgb(0, 0, 0); border-right-color: rgb(0, 0, 0); border-top-color: rgb(0, 0, 0); border-bottom-color: rgb(0, 0, 0); border-top-width: 1px; border-right-width: 1px; border-bottom-width: 1px; border-left-width: 1px; flex-direction: column; padding-top: 5px; padding-right: 5px; padding-bottom: 5px; padding-left: 5px; border-top-left-radius: 5px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-bottom-left-radius: 5px;">
+            <ui:VisualElement name="VisualElement" style="flex-direction: row; flex-shrink: 0; flex-grow: 1; align-items: center;">
+                <ui:VisualElement name="image-validation-severity" style="background-image: url(&quot;project://database/Assets/CVR.CCK/Legacy/GUIAssets/info.png?fileID=2800000&amp;guid=6e83bee75526bf04fa0b7578b478dfa1&amp;type=3#info&quot;); flex-shrink: 0; flex-grow: 0; -unity-background-scale-mode: stretch-to-fill; display: flex; width: 30px; height: 30px; flex-direction: column; align-items: center; justify-content: center; margin-top: 2px; margin-right: 4px; margin-bottom: 2px; margin-left: 0;" />
+                <ui:Label text="Some shaders may potentially lack stereo rendering (SPI) support. This could affect how they appear in VR. It&apos;s recommended to review them for compatibility." display-tooltip-when-elided="true" name="label-validation-message" style="flex-wrap: wrap; flex-shrink: 1; white-space: normal; font-size: 10px; padding-top: 0; padding-right: 0; padding-bottom: 0; padding-left: 0; margin-bottom: 5px;" />
+            </ui:VisualElement>
+            <FoldoutHeader folded="true" style="align-items: center; flex-shrink: 0; flex-grow: 1;">
+                <ui:VisualElement style="flex-shrink: 0; flex-grow: 5;" />
+                <ui:Button text="Select All" display-tooltip-when-elided="true" name="btn-select" style="width: 80px; visibility: visible; display: flex; flex-grow: 1; margin-left: 0; flex-shrink: 1;" />
+                <ui:Button text="Auto Fix" display-tooltip-when-elided="true" name="btn-autofix" style="width: 80px; visibility: visible; display: none; flex-grow: 1; flex-shrink: 1;" />
+                <ui:Button text="Open Docs" display-tooltip-when-elided="true" name="btn-docs" style="width: 80px; visibility: visible; display: flex; flex-grow: 1; margin-right: 0; flex-shrink: 1;" />
+            </FoldoutHeader>
+            <ui:VisualElement name="Seperator" class="cck-separator" style="flex-shrink: 0;" />
+            <FoldoutBody name="FoldoutBody" style="flex-shrink: 0; flex-grow: 1; flex-direction: column;" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

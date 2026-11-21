@@ -1,0 +1,781 @@
+// The in-game readout for a plug: fourteen cells (who resolved the socket, bend, atlas,
+// portal, bake and frame state) plus two markers for whether its bones moved. Unlike the
+// plug's debug view it does not straighten the plug.
+//
+// Drawn by the plug's own renderer, three quads in one extra submesh: animated material
+// properties land only in that renderer's block, and the frame comes from its skinned
+// vertices. A separate object read a bone matrix with no channel and reported nobody.
+// Strip and rest marker are skinned like the anchor vertex; the live marker like a vertex at
+// the shaft's far end, since only two points a shaft apart can see the bones move (one
+// vertex is world space). They sit past _YAPS_VertexCount, out of the plug material's reach.
+//
+// Built hidden where the In-game readout tick is on (off by default, the CCK counts the
+// slot). One synced toggle shows them all. Props get none, having no menu. Sockets get a
+// quad of their own beside the atlas writer (YAPS/Socket Readout) on the same toggle.
+#if CVR_CCK_EXISTS
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using ABI.CCK.Components;
+using ABI.CCK.Scripts;
+using AvatarBridge.Yaps;
+using Unity.Collections;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+namespace AvatarBridge
+{
+    public static class YapsDebugOverlayBuilder
+    {
+        const string Category = "YAPS";
+        // The object the first version built beside the plug. Still
+        // removed, so an avatar built with it does not keep a dead quad.
+        public const string ObjectName = "YAPS Debug Overlay";
+        const string ShaderName = "YAPS/Debug Overlay";
+        const string Folder = "Assets/YAPS/Generated";
+        const string MeshSuffix = " readout";
+        const int Corners = 4;
+        // The strip, the rest marker and the live marker.
+        const int Quads = 3;
+
+        // The menu switch that shows every readout on the avatar.
+        public const string Parameter = "YAPS/Readout";
+        const string MenuLabel = "YAPS readout";
+        const string LayerName = "YAPS readout";
+        const string Property = "_YAPS_ReadoutOn";
+        const string SocketShaderName = "YAPS/Socket Readout";
+        public const string SocketReadoutName = "Socket Readout";
+        const string SharedFolder = "Assets/YAPS";
+
+        // The toolkit's entry: this plug's readout recorded, then every
+        // readout on its mesh built again.
+        public static void Apply(YapsPlug plug, YapsBaker.Result result, Material patched,
+            BridgeReport report)
+        {
+            if (plug == null)
+            {
+                return;
+            }
+            Record(plug, result, patched, plug.name, report);
+            Build(plug.readoutRenderer, report);
+        }
+
+        // What a plug's readout is built from, kept on the plug so another plug on the mesh can
+        // rebuild it. Build runs once every plug is measured: one at a time, each plug measured
+        // the last readout as part of itself.
+        public static void Record(YapsPlug record, YapsBaker.Result result, Material patched,
+            string label, BridgeReport report)
+        {
+            if (record == null)
+            {
+                // Without somewhere to record the mesh this replaces, a later
+                // build could not put it back, and the readout would outlive
+                // the tick that asked for it.
+                report?.Warning(Category, label,
+                    "There is no plug component to remember the mesh the readout replaces, so none " +
+                    "was built. The plug itself is unaffected.");
+                return;
+            }
+            // The first version's object beside the plug.
+            Transform parent = result != null && result.Root != null ? result.Root : record.transform;
+            var old = parent.Find(ObjectName);
+            if (old != null)
+            {
+                UnityEngine.Object.DestroyImmediate(old.gameObject);
+            }
+
+            record.readoutRenderer = result != null ? result.Renderer : null;
+            // The mesh the bake measured, which every record on the renderer
+            // keeps: the plug that built the last readout can be deleted, and
+            // the mesh has to come back all the same.
+            var measured = MeshOf(record.readoutRenderer);
+            if (measured != null && !measured.name.EndsWith(MeshSuffix, StringComparison.Ordinal))
+            {
+                record.readoutReplaced = measured;
+            }
+            record.readoutSource = patched;
+            record.readoutAnchor = result != null ? result.AnchorVertex : -1;
+            record.readoutTip = result != null ? result.TipVertex : -1;
+            EditorUtility.SetDirty(record);
+            if (record.readoutRenderer == null)
+            {
+                return;
+            }
+            // A plug baked into this material before this one no longer owns
+            // it: the bake it would read is gone.
+            foreach (var other in Records(record.readoutRenderer))
+            {
+                if (other == record || other.readoutSource != patched)
+                {
+                    continue;
+                }
+                other.readoutSource = null;
+                EditorUtility.SetDirty(other);
+            }
+            if (record.readout && record.readoutAnchor < 0)
+            {
+                report?.Warning(Category, label,
+                    "The bake has no vertex for the readout to hang from, so none was built. The " +
+                    "plug itself is unaffected.");
+            }
+        }
+
+        // Every readout on one mesh, built together on the pre-readout mesh: a submesh and slot
+        // per plug that asks and still owns its material. Safe to run again.
+        public static void Build(Renderer renderer, BridgeReport report)
+        {
+            if (renderer == null)
+            {
+                return;
+            }
+            Restore(renderer);
+            var mats = renderer.sharedMaterials.ToList();
+            var wanted = Records(renderer)
+                .Where(p => p.readout && p.readoutSource != null && p.readoutAnchor >= 0
+                            && mats.Contains(p.readoutSource)
+                            && p.GetComponentInParent<CVRAvatar>(true) != null)
+                .ToList();
+            if (wanted.Count == 0)
+            {
+                return;
+            }
+
+            var shader = Shader.Find(ShaderName);
+            if (shader == null)
+            {
+                report?.Warning(Category, renderer.name,
+                    "The readout's shader could not be found, so none was built. The plug itself " +
+                    "is unaffected.");
+                return;
+            }
+            var source = MeshOf(renderer);
+            if (source == null)
+            {
+                report?.Warning(Category, renderer.name,
+                    "The plug's renderer has no mesh, so no readout was built.");
+                return;
+            }
+            if (source.name.EndsWith(MeshSuffix, StringComparison.Ordinal))
+            {
+                // Built on, it would stack a second set of readout vertices
+                // on the first.
+                report?.Warning(Category, renderer.name,
+                    "The renderer still wears an earlier readout's mesh and the mesh under it could not " +
+                    "be found, so no readout was built. Put the original mesh back on the renderer and bake again.");
+                return;
+            }
+
+            void Unbuilt(YapsPlug plug, string why) => report?.Warning(Category, plug.name,
+                "The readout could not be added to \"" + source.name + "\": " + why +
+                ". The plug itself is unaffected.");
+            var built = new List<YapsPlug>();
+            foreach (var plug in wanted)
+            {
+                if (plug.readoutAnchor >= source.vertexCount) Unbuilt(plug, "the anchor vertex is not on this mesh");
+                else built.Add(plug);
+            }
+            if (built.Count == 0)
+            {
+                return;
+            }
+            // Every readout in one pass: a pass per plug copied the whole mesh
+            // and every blendshape frame again for each.
+            var mesh = WithReadout(source, built, out string failed);
+            if (mesh == null)
+            {
+                foreach (var plug in built) Unbuilt(plug, failed);
+                return;
+            }
+            mesh.name = source.name + MeshSuffix;
+
+            string dir = DirOf(built[0].readoutSource.GetTexture("_YAPS_Bake") as Texture2D) ?? Folder;
+            Directory.CreateDirectory(dir);
+            // Named for where the renderer sits as well: two renderers can share
+            // a mesh, or a mesh name, and one would overwrite the other's.
+            string key = Safe(renderer.name) + " " + YapsBaker.PlaceKey(renderer.transform);
+            string meshPath = dir + "/YAPS " + key + MeshSuffix + ".asset";
+            // Rewritten in place when the file is there: deleting it destroys
+            // the mesh an earlier conversion's renderer still wears.
+            var saved = AssetDatabase.LoadAssetAtPath<Mesh>(meshPath);
+            if (saved != null)
+            {
+                EditorUtility.CopySerialized(mesh, saved);
+                UnityEngine.Object.DestroyImmediate(mesh);
+                EditorUtility.SetDirty(saved);
+                AssetDatabase.SaveAssetIfDirty(saved);
+                mesh = saved;
+            }
+            else
+            {
+                AssetDatabase.DeleteAsset(meshPath);
+                AssetDatabase.CreateAsset(mesh, meshPath);
+            }
+
+            var labels = new HashSet<string>();
+            foreach (var plug in built)
+            {
+                // A material each, even for plugs of the same name: each
+                // holds its own plug's anchor and bake. Every converted plug
+                // is called BakedSpsPlug, so the renderer's key goes first.
+                string label = key + " " + plug.name;
+                for (int n = 2; !labels.Add(label); n++)
+                {
+                    label = key + " " + plug.name + " " + n;
+                }
+                var material = MaterialFor(shader, dir, label);
+                Copy(plug.readoutSource, material, plug.name, report);
+                material.SetFloat("_YAPS_AnchorVertex", plug.readoutAnchor);
+                EditorUtility.SetDirty(material);
+                mats.Add(material);
+                plug.readoutReplaced = source;
+                EditorUtility.SetDirty(plug);
+
+                report?.Converted(Category, plug.name,
+                    "A readout was added to this plug, hidden until the avatar's \"" + MenuLabel + "\" " +
+                    "menu toggle shows it. Fourteen cells in two rows, and two " +
+                    "markers out on the plug itself. Top row, left to right: who resolved the " +
+                    "socket, whether it is bending, how far away the socket is, what the screen " +
+                    "atlas read, whether the atlas is on the camera drawing this view, whether " +
+                    "this plug asks for the atlas at all, and whether the hole it ends in is a portal " +
+                    "it can come out of. Bottom row: whether the plug recovered " +
+                    "its own frame, whether the readout's vertex is inside the bake, whether the " +
+                    "bake read anything, whether it will take its own wearer's sockets, how many " +
+                    "sockets are in the chain, whether a socket was refused by this plug's " +
+                    "tags, and a dark end cell. Grey or black is nothing, red is a fault, green is working. The two markers are the pair that " +
+                    "answers a different question: the white one sits where the tip would be if " +
+                    "nothing had moved the plug's BONES, the magenta one sits where the tip " +
+                    "actually is. Together means the bones are where the bake left them and any " +
+                    "bend you can see is the shader's; apart means something else is moving them, " +
+                    "cloth or an animation or a constraint, and no cell above can tell you that. " +
+                    "The toggle syncs, so everyone who can see the plug sees the readout while it is " +
+                    "on, each drawn from what their own game resolves.");
+            }
+            SetMesh(renderer, mesh);
+            renderer.sharedMaterials = mats.ToArray();
+            EditorUtility.SetDirty(renderer);
+        }
+
+        // Every readout off one mesh. Runs before every bake too: a bake over a readout counts its
+        // vertices and slot as the plug's.
+        public static void Restore(Renderer renderer)
+        {
+            if (renderer == null)
+            {
+                return;
+            }
+            var records = Records(renderer);
+            var current = MeshOf(renderer);
+            // Never a readout mesh itself: one built before readouts were
+            // built together could have replaced another's.
+            var original = records.Select(p => p.readoutReplaced)
+                .FirstOrDefault(m => m != null && !m.name.EndsWith(MeshSuffix, StringComparison.Ordinal));
+            if (original != null && current != null
+                && current.name.EndsWith(MeshSuffix, StringComparison.Ordinal))
+            {
+                SetMesh(renderer, original);
+            }
+            var mats = renderer.sharedMaterials.ToList();
+            if (mats.RemoveAll(IsReadout) > 0)
+            {
+                renderer.sharedMaterials = mats.ToArray();
+            }
+            EditorUtility.SetDirty(renderer);
+        }
+
+        public static void Restore(YapsPlug plug)
+        {
+            if (plug != null)
+            {
+                Restore(plug.readoutRenderer);
+            }
+        }
+
+        // A plug taken out: every readout off its mesh and its own record
+        // cleared. The caller builds the others again once the plug's
+        // materials are back, or they copy a bake that is about to go.
+        public static void Drop(YapsPlug plug)
+        {
+            if (plug == null || plug.readoutRenderer == null)
+            {
+                return;
+            }
+            var renderer = plug.readoutRenderer;
+            Restore(renderer);
+            plug.readoutRenderer = null;
+            plug.readoutReplaced = null;
+            plug.readoutSource = null;
+            EditorUtility.SetDirty(plug);
+        }
+
+        // The mesh under every readout on this renderer, after a plug's
+        // triangles were split out onto a copy of it.
+        public static void Replaced(Renderer renderer, Mesh mesh)
+        {
+            foreach (var plug in Records(renderer))
+            {
+                plug.readoutReplaced = mesh;
+                EditorUtility.SetDirty(plug);
+            }
+        }
+
+        // The plugs that recorded a readout on this renderer.
+        static List<YapsPlug> Records(Renderer renderer)
+        {
+            return YapsNativeBuilder.AvatarRoot(renderer.transform).GetComponentsInChildren<YapsPlug>(true)
+                .Where(p => p != null && p.readoutRenderer == renderer)
+                .ToList();
+        }
+
+        // By shader, and by name when the shader is gone: a project that
+        // lost the shader shows the slot magenta and still has to shed it.
+        public static bool IsReadout(Material m)
+        {
+            if (m == null)
+            {
+                return false;
+            }
+            if (YapsMarks.IsReadoutMaterial(m))
+            {
+                return true;
+            }
+            return m.name.StartsWith(ObjectName, StringComparison.Ordinal);
+        }
+
+        // Three quads per plug in its own submesh, each vertex a full copy of one plug vertex
+        // (all but uv0) so it skins and shapes the same. uv0 carries corner and quad index; the
+        // shader billboards from there. Quads 0 and 1 copy the anchor, sharing the deform's bake
+        // entry. Quad 2 copies a shaft-end vertex position only, to see the bones move.
+        static Mesh WithReadout(Mesh source, List<YapsPlug> plugs, out string why)
+        {
+            why = null;
+            int n = source.vertexCount;
+            Vector3[] vertices;
+            try
+            {
+                vertices = source.vertices;
+            }
+            catch (Exception e)
+            {
+                why = "it would not hand over its vertices (" + e.GetType().Name +
+                      "): tick Read/Write Enabled on the model importer";
+                return null;
+            }
+
+            // Which real vertex each added vertex copies, in order. The caller
+            // has checked every anchor is on the mesh.
+            int per = Quads * Corners;
+            var from = new int[plugs.Count * per];
+            for (int p = 0; p < plugs.Count; p++)
+            {
+                int anchor = plugs[p].readoutAnchor;
+                int tip = plugs[p].readoutTip;
+                if (tip < 0 || tip >= n)
+                {
+                    // Not fatal: the strip and the rest marker still mean what
+                    // they mean. Only the pair reading is lost.
+                    tip = anchor;
+                }
+                for (int q = 0; q < Quads; q++)
+                {
+                    for (int c = 0; c < Corners; c++)
+                    {
+                        from[p * per + q * Corners + c] = q == 2 ? tip : anchor;
+                    }
+                }
+            }
+
+            var mesh = new Mesh { name = source.name + MeshSuffix, indexFormat = IndexFormat.UInt32 };
+            mesh.vertices = Extend(vertices, from);
+            mesh.normals = Extend(source.normals, from);
+            mesh.tangents = Extend(source.tangents, from);
+            mesh.colors = Extend(source.colors, from);
+
+            var uv = new List<Vector4>();
+            for (int channel = 0; channel < 8; channel++)
+            {
+                uv.Clear();
+                source.GetUVs(channel, uv);
+                if (uv.Count == 0 && channel > 0)
+                {
+                    continue;
+                }
+                while (uv.Count < n)
+                {
+                    uv.Add(Vector4.zero);
+                }
+                if (channel == 0)
+                {
+                    // z is the quad. Nothing else separates three quads whose
+                    // vertices are otherwise the same numbers.
+                    for (int p = 0; p < plugs.Count; p++)
+                    {
+                        for (int q = 0; q < Quads; q++)
+                        {
+                            uv.Add(new Vector4(0f, 0f, q, 0f));
+                            uv.Add(new Vector4(1f, 0f, q, 0f));
+                            uv.Add(new Vector4(0f, 1f, q, 0f));
+                            uv.Add(new Vector4(1f, 1f, q, 0f));
+                        }
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < from.Length; i++)
+                    {
+                        uv.Add(uv[from[i]]);
+                    }
+                }
+                mesh.SetUVs(channel, uv);
+            }
+
+            // The full weight list, not the four-per-vertex view: a mesh
+            // imported with more than four influences keeps them.
+            var perVertex = source.GetBonesPerVertex();
+            if (perVertex.Length == n)
+            {
+                var weights = source.GetAllBoneWeights();
+                var starts = new int[n];
+                int running = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    starts[i] = running;
+                    running += perVertex[i];
+                }
+                int added = 0;
+                for (int i = 0; i < from.Length; i++)
+                {
+                    added += perVertex[from[i]];
+                }
+                var perVertexOut = new NativeArray<byte>(n + from.Length, Allocator.Temp);
+                var weightsOut = new NativeArray<BoneWeight1>(weights.Length + added, Allocator.Temp);
+                try
+                {
+                    NativeArray<byte>.Copy(perVertex, perVertexOut, n);
+                    NativeArray<BoneWeight1>.Copy(weights, weightsOut, weights.Length);
+                    int at = weights.Length;
+                    for (int i = 0; i < from.Length; i++)
+                    {
+                        int count = perVertex[from[i]];
+                        perVertexOut[n + i] = (byte) count;
+                        for (int k = 0; k < count; k++)
+                        {
+                            weightsOut[at++] = weights[starts[from[i]] + k];
+                        }
+                    }
+                    mesh.SetBoneWeights(perVertexOut, weightsOut);
+                }
+                finally
+                {
+                    perVertexOut.Dispose();
+                    weightsOut.Dispose();
+                }
+                mesh.bindposes = source.bindposes;
+            }
+
+            mesh.subMeshCount = source.subMeshCount + plugs.Count;
+            for (int s = 0; s < source.subMeshCount; s++)
+            {
+                mesh.SetIndices(source.GetIndices(s), source.GetTopology(s), s);
+            }
+            // One submesh for all three, so each readout still costs the
+            // renderer a single extra material slot.
+            var triangles = new List<int>();
+            for (int p = 0; p < plugs.Count; p++)
+            {
+                triangles.Clear();
+                for (int q = 0; q < Quads; q++)
+                {
+                    int b = n + p * per + q * Corners;
+                    triangles.AddRange(new[] { b, b + 2, b + 1, b + 2, b + 3, b + 1 });
+                }
+                mesh.SetTriangles(triangles, source.subMeshCount + p);
+            }
+
+            var dv = new Vector3[n];
+            var dn = new Vector3[n];
+            var dt = new Vector3[n];
+            for (int s = 0; s < source.blendShapeCount; s++)
+            {
+                string name = source.GetBlendShapeName(s);
+                int frames = source.GetBlendShapeFrameCount(s);
+                for (int f = 0; f < frames; f++)
+                {
+                    source.GetBlendShapeFrameVertices(s, f, dv, dn, dt);
+                    mesh.AddBlendShapeFrame(name, source.GetBlendShapeFrameWeight(s, f),
+                        Extend(dv, from), Extend(dn, from), Extend(dt, from));
+                }
+            }
+
+            mesh.bounds = source.bounds;
+            return mesh;
+        }
+
+        // An empty channel stays empty: Unity wants every channel either
+        // absent or exactly the vertex count long.
+        static T[] Extend<T>(T[] source, int[] from)
+        {
+            if (source == null || source.Length == 0)
+            {
+                return source;
+            }
+            var to = new T[source.Length + from.Length];
+            Array.Copy(source, to, source.Length);
+            for (int i = 0; i < from.Length; i++)
+            {
+                to[source.Length + i] = source[from[i]];
+            }
+            return to;
+        }
+
+        static Mesh MeshOf(Renderer renderer)
+        {
+            if (renderer is SkinnedMeshRenderer skin)
+            {
+                return skin.sharedMesh;
+            }
+            var filter = renderer != null ? renderer.GetComponent<MeshFilter>() : null;
+            return filter != null ? filter.sharedMesh : null;
+        }
+
+        static void SetMesh(Renderer renderer, Mesh mesh)
+        {
+            if (renderer is SkinnedMeshRenderer skin)
+            {
+                skin.sharedMesh = mesh;
+                return;
+            }
+            var filter = renderer != null ? renderer.GetComponent<MeshFilter>() : null;
+            if (filter != null)
+            {
+                filter.sharedMesh = mesh;
+            }
+        }
+
+        // Beside the bake, which both builders already keep per avatar.
+        static string DirOf(Texture2D bake)
+        {
+            string path = bake != null ? AssetDatabase.GetAssetPath(bake) : null;
+            if (string.IsNullOrEmpty(path))
+            {
+                return null;
+            }
+            return Path.GetDirectoryName(path)?.Replace('\\', '/');
+        }
+
+        // Every _YAPS_ value, reporting any the readout shader lacks so a zero cell says why.
+        // Animated ones arrive through the renderer's block regardless.
+        static void Copy(Material from, Material to, string label, BridgeReport report)
+        {
+            if (from == null || to == null)
+            {
+                return;
+            }
+            var missing = new List<string>();
+            YapsNativeBuilder.CopyYapsProperties(from, to, missing);
+            // The patch gives every shader the squash block, and no cell reads it.
+            // Nor the live tissue's values, which are the skin's, or the plug number,
+            // which only the atlas relay reads.
+            missing.RemoveAll(name => YapsSquash.Properties.Contains(name)
+                                      || name.StartsWith("_YAPS_Jelly", System.StringComparison.Ordinal)
+                                      || name == "_YAPS_PlugIndex");
+            EditorUtility.SetDirty(to);
+            if (missing.Count == 0)
+            {
+                return;
+            }
+            report?.Warning(Category, label,
+                $"The readout could not carry {missing.Count} of the plug's settings: " +
+                string.Join(", ", missing) + ". Cells that depend on them read as nothing rather " +
+                "than as their real value. The readout's shader needs the same property added.");
+        }
+
+        // One synced toggle for every readout on the avatar, off by default.
+        // Taken out with the last readout. Safe to run again.
+        public static string Menu(CVRAvatar avatar, AnimatorController controller)
+        {
+            if (avatar == null || controller == null)
+            {
+                return null;
+            }
+            // Every renderer drawing a readout, plugs' and sockets' alike.
+            var targets = avatar.GetComponentsInChildren<Renderer>(true)
+                .Where(r => r.sharedMaterials.Any(IsReadout))
+                .Select(r => (AnimationUtility.CalculateTransformPath(r.transform, avatar.transform), r))
+                .ToList();
+            bool had = RemoveLayer(controller);
+            var settings = avatar.avatarSettings != null ? avatar.avatarSettings.settings : null;
+            var ours = settings?.FirstOrDefault(e => e != null && e.machineName == Parameter);
+            if (targets.Count == 0)
+            {
+                // The parameter too. It syncs whether the menu names it or
+                // not, so it would keep its bit with nothing left to show.
+                int param = Array.FindIndex(controller.parameters, p => p.name == Parameter);
+                if (param >= 0 && !YapsRemover.ParameterUsed(controller, Parameter))
+                {
+                    controller.RemoveParameter(param);
+                    had = true;
+                }
+                if (ours != null)
+                {
+                    Undo.RecordObject(avatar, "YAPS readout");
+                    settings.Remove(ours);
+                    EditorUtility.SetDirty(avatar);
+                    had = true;
+                }
+                return had ? "readout toggle removed: nothing carries a readout" : null;
+            }
+
+            // Recorded first, or undo leaves the two writes below behind.
+            Undo.RecordObject(avatar, "YAPS readout");
+            if (avatar.avatarSettings == null)
+            {
+                avatar.avatarSettings = new CVRAdvancedAvatarSettings
+                {
+                    settings = new List<CVRAdvancedSettingsEntry>(),
+                    initialized = true,
+                };
+            }
+            avatar.avatarUsesAdvancedSettings = true;
+            if (ours == null)
+            {
+                ours = new CVRAdvancedSettingsEntry { machineName = Parameter };
+                avatar.avatarSettings.settings.Add(ours);
+            }
+            ours.name = MenuLabel;
+            ours.type = CVRAdvancedSettingsEntry.SettingsType.Toggle;
+            // No clips of its own: the layer below plays them, as the tag
+            // chooser's does.
+            ours.toggleSettings = new CVRAdvancesAvatarSettingGameObjectToggle
+            {
+                defaultValue = false,
+                usedType = CVRAdvancesAvatarSettingBase.ParameterType.Bool,
+            };
+            EditorUtility.SetDirty(avatar);
+
+            if (!controller.parameters.Any(p => p.name == Parameter))
+            {
+                controller.AddParameter(Parameter, AnimatorControllerParameterType.Bool);
+            }
+            string dir = YapsNativeBuilder.OutputRoot + "/" + Safe(avatar.name);
+            YapsNativeBuilder.EnsureFolderPublic(dir);
+            var machine = new AnimatorStateMachine { name = LayerName, hideFlags = HideFlags.HideInHierarchy };
+            if (!string.IsNullOrEmpty(AssetDatabase.GetAssetPath(controller)))
+            {
+                AssetDatabase.AddObjectToAsset(machine, controller);
+            }
+            // Both states write the value: ChilloutVR restores nothing when a
+            // state is left, so an Off that wrote nothing would stay on.
+            for (int on = 0; on < 2; on++)
+            {
+                var state = machine.AddState(on == 1 ? "Shown" : "Hidden");
+                state.writeDefaultValues = false;
+                state.motion = YapsToggles.Clip(targets, Property, on,
+                    dir + "/" + MenuLabel + (on == 1 ? " on" : " off") + ".anim");
+                if (on == 0)
+                {
+                    machine.defaultState = state;
+                }
+                var to = machine.AddAnyStateTransition(state);
+                to.hasExitTime = false;
+                to.duration = 0f;
+                to.canTransitionToSelf = false;
+                to.AddCondition(on == 1 ? AnimatorConditionMode.If : AnimatorConditionMode.IfNot, 0f, Parameter);
+            }
+            var layers = controller.layers.ToList();
+            layers.Add(new AnimatorControllerLayer { name = LayerName, defaultWeight = 1f, stateMachine = machine });
+            controller.layers = layers.ToArray();
+            EditorUtility.SetDirty(controller);
+            return $"readout toggle \"{MenuLabel}\" for {BridgeElements.Count(targets.Count, "readout", "readouts")}, off by default, synced (1 bit)";
+        }
+
+        // A socket's readout beside its atlas writer, so rebuild or remove takes both. Zero
+        // positions, corners in UV0: with custom shaders off the stand-in draws nothing.
+        public static GameObject AddSocketReadout(Transform parent)
+        {
+            var shader = Shader.Find(SocketShaderName);
+            if (parent == null || shader == null)
+            {
+                return null;
+            }
+            var host = new GameObject(SocketReadoutName);
+            host.transform.SetParent(parent, false);
+            host.AddComponent<MeshFilter>().sharedMesh = SocketQuad();
+            var renderer = host.AddComponent<MeshRenderer>();
+            string path = SharedFolder + "/YAPS Socket Readout.mat";
+            var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+            if (material == null)
+            {
+                Directory.CreateDirectory(SharedFolder);
+                material = new Material(shader) { name = "YAPS Socket Readout" };
+                AssetDatabase.CreateAsset(material, path);
+            }
+            material.shader = shader;
+            renderer.sharedMaterial = material;
+            YapsAtlas.Quiet(renderer);
+            return host;
+        }
+
+        static Mesh SocketQuad()
+        {
+            string path = SharedFolder + "/YAPS Socket Readout Quad.asset";
+            var have = AssetDatabase.LoadAssetAtPath<Mesh>(path);
+            if (have != null)
+            {
+                return have;
+            }
+            var mesh = new Mesh { name = "YAPS Socket Readout Quad" };
+            mesh.SetVertices(new List<Vector3> { Vector3.zero, Vector3.zero, Vector3.zero, Vector3.zero });
+            mesh.SetUVs(0, new List<Vector2> { new Vector2(0, 0), new Vector2(1, 0), new Vector2(0, 1), new Vector2(1, 1) });
+            mesh.SetTriangles(new[] { 0, 2, 1, 2, 3, 1 }, 0);
+            // Round the socket, not the strip: the vertex lights Unity hands a
+            // renderer are chosen by its bounds, and these should be the
+            // lights a socket there gets.
+            mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 0.5f);
+            Directory.CreateDirectory(SharedFolder);
+            AssetDatabase.CreateAsset(mesh, path);
+            return mesh;
+        }
+
+        static bool RemoveLayer(AnimatorController controller)
+        {
+            bool removed = false;
+            for (int i = controller.layers.Length - 1; i >= 0; i--)
+            {
+                if (controller.layers[i].name != LayerName)
+                {
+                    continue;
+                }
+                controller.RemoveLayer(i);
+                removed = true;
+            }
+            return removed;
+        }
+
+        static Material MaterialFor(Shader shader, string dir, string label)
+        {
+            string path = dir + "/" + ObjectName + " " + Safe(label) + ".mat";
+            var existing = AssetDatabase.LoadAssetAtPath<Material>(path);
+            if (existing != null)
+            {
+                existing.shader = shader;
+                return existing;
+            }
+            var made = new Material(shader) { name = Path.GetFileNameWithoutExtension(path) };
+            AssetDatabase.CreateAsset(made, path);
+            return made;
+        }
+
+        static string Safe(string name)
+        {
+            foreach (char bad in Path.GetInvalidFileNameChars())
+            {
+                name = name.Replace(bad, '_');
+            }
+            return name;
+        }
+    }
+}
+#endif

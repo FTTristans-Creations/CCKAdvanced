@@ -1,0 +1,16 @@
+{
+  "name": "com.fttristan.cck-advanced",
+  "displayName": "CCK Advanced",
+  "description": "Advanced tools for the ChilloutVR CCK: VRChat-to-ChilloutVR avatar conversion (bundled AvatarBridge), YAPS, the ChilloutVR toolkit, and CCK quality-of-life features.",
+  "version": "1.0.0",
+  "unity": "2021.3",
+  "url": "https://github.com/FTTristans-Creations/CCKAdvanced/releases/latest/download/com.fttristan.cck-advanced.zip",
+  "vpmDependencies": {},
+  "author": {
+    "name": "FTTristan",
+    "url": "https://github.com/FTTristans-Creations"
+  },
+  "legacyFolders": {
+    "Assets/CVR.CCK": "b1a782c175c99aa42822b03c0d89b1b0"
+  }
+}
