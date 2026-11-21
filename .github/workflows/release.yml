@@ -73,13 +73,18 @@ jobs:
           PY
           echo "Stamped version $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
-      # Source snapshot: package.json at zip root + the Assets tree with metas.
+      # Source snapshot of the Assets tree with metas. package.json is kept
+      # under package-info/ rather than the zip root so the VPM listing
+      # generator (which keys on a root package.json) does not re-list
+      # com.fttristan.cck-advanced as an installable package — distribution
+      # goes through the installer instead.
       - name: Create Source Zip
         run: |
           set -euo pipefail
-          ZIP_NAME="com.fttristan.cck-advanced-src.zip"
+          ZIP_NAME="cck-advanced-source-$VERSION.zip"
           STAGE="$(mktemp -d)"
-          cp Packages/com.fttristan.cck-advanced/package.json* "$STAGE/"
+          mkdir -p "$STAGE/package-info"
+          cp Packages/com.fttristan.cck-advanced/package.json* "$STAGE/package-info/"
           mkdir -p "$STAGE/Assets"
           cp -r Assets/CVR.CCK "$STAGE/Assets/"
           cp Assets/CVR.CCK.meta "$STAGE/Assets/"
@@ -165,7 +170,7 @@ jobs:
           tag_name: ${{ steps.version.outputs.value }}
           name: CCK Advanced ${{ steps.version.outputs.value }}
           files: |
-            com.fttristan.cck-advanced-src.zip
+            cck-advanced-source-${{ steps.version.outputs.value }}.zip
             cck-advanced-payload-${{ steps.version.outputs.value }}.zip
             com.fttristan.cck-advanced-${{ steps.version.outputs.value }}.unitypackage
             com.fttristan.cck-advanced-installer-${{ steps.version.outputs.value }}.zip
