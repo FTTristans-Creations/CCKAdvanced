@@ -3,10 +3,10 @@
 An enhanced distribution of the **ChilloutVR CCK** (Creator Companion Kit) with a full
 VRChat-to-ChilloutVR avatar conversion suite, bundled under `Assets/CVR.CCK/Advanced`.
 
-> **Install via the CCK Advanced Installer — not the raw package.** The installer
-> (`com.fttristan.cck-advanced.installer`) downloads, installs, and **force
-> auto-updates** CCK Advanced into `Assets/` on every editor launch. Installing the
-> CCK files directly means you will **not** receive updates.
+> **Install via the CCK Advanced Installer — not the raw package.** Install the
+> installer once and you never have to update CCK Advanced yourself again — it
+> downloads, installs, and keeps `Assets/CVR.CCK` up to date automatically.
+> Installing the CCK files directly means you will **not** receive updates.
 >
 > **Important:** This distribution *contains the entire CCK*. Do **not** also install
 > the official ChilloutVR CCK — remove any existing `Assets/CVR.CCK` folder first.
@@ -47,10 +47,10 @@ https://vcc.vrcband.com/index.json
 
 Then install **CCK Advanced Installer** (`com.fttristan.cck-advanced.installer`).
 
-On the next editor launch the installer automatically downloads the latest CCK
-Advanced release and installs it into `Assets/CVR.CCK`. It re-checks for updates
-once per day and force-updates without asking — you never have to install CCK
-Advanced itself. Requires Unity **2021.3.19+** / **2022.3 LTS**.
+On the next editor launch the installer downloads the latest CCK Advanced release
+and installs it into `Assets/CVR.CCK` — after that it keeps itself up to date
+automatically, so you never have to update it yourself again. Requires Unity
+**2021.3.19+** / **2022.3 LTS**.
 
 To trigger a check manually: `ChilloutVR CCK/Advanced/Common/Check for CCK Advanced Updates`.
 
