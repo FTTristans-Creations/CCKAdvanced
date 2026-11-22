@@ -66,5 +66,35 @@ public static class CCK_EnvConfig
             PlayerSettings.stereoRenderingPath = StereoRenderingPath.SinglePass;
 #endif
         }
+
+        EnsureRequiredPackages();
+    }
+
+    // Unity packages the CCK's Assembly-CSharp scripts need. Minimal CVR
+    // projects ship without them, and without these the CCK fails to compile
+    // with missing UnityEngine.UI / TMPro / Timeline errors. Versions match
+    // the CCK development manifest.
+    static readonly (string name, string version)[] RequiredPackages =
+    {
+        ("com.unity.ugui", "1.0.0"),
+        ("com.unity.textmeshpro", "3.0.7"),
+        ("com.unity.timeline", "1.7.6"),
+    };
+
+    static void EnsureRequiredPackages()
+    {
+        string manifestPath = System.IO.Path.GetFullPath(
+            System.IO.Path.Combine(Application.dataPath, "..", "Packages", "manifest.json"));
+        if (!System.IO.File.Exists(manifestPath)) return;
+        string json = System.IO.File.ReadAllText(manifestPath);
+        foreach (var (name, version) in RequiredPackages)
+        {
+            if (json.Contains("\"" + name + "\"")) continue;
+            Debug.Log($"[CCK:Init] Adding required Unity package {name}...");
+            var req = UnityEditor.PackageManager.Client.Add($"{name}@{version}");
+            req.completed += r =>
+                Debug.Log($"[CCK:Init] {name}: {r.Status}" +
+                    (r.Error != null ? $" ({r.Error.message})" : ""));
+        }
     }
 }

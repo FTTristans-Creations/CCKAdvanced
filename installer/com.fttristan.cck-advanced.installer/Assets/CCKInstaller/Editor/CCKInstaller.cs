@@ -38,6 +38,18 @@ namespace FTTristan.CCKInstaller
         // them into ProjectSettings. Merged into Assets/csc.rsp on install.
         static readonly string[] RequiredDefines = { "CVR_CCK_EXISTS", "CVR_CCK_4_OR_NEWER" };
 
+        // Unity packages the CCK's Assembly-CSharp scripts need. VPM packages
+        // cannot declare Unity package dependencies, and minimal CVR projects
+        // ship without them — without these the payload fails to compile with
+        // missing UnityEngine.UI / TMPro / Timeline errors. Versions match the
+        // CCK development manifest.
+        static readonly (string name, string version)[] RequiredPackages =
+        {
+            ("com.unity.ugui", "1.0.0"),
+            ("com.unity.textmeshpro", "3.0.7"),
+            ("com.unity.timeline", "1.7.6"),
+        };
+
         static readonly TimeSpan CheckInterval = TimeSpan.FromHours(24);
         static bool _running;
 
@@ -79,6 +91,11 @@ namespace FTTristan.CCKInstaller
         {
             string root = ProjectRoot();
             Directory.CreateDirectory(Path.Combine(root, StateDir));
+
+            // Runs before the throttle check: cheap manifest read, and it must
+            // also fix projects where the CCK is already installed but the
+            // Unity packages were never added.
+            EnsureUnityPackages(root);
 
             string localVersion = ReadLocalVersion(root);
             bool debugZip = TryGetDebugPayload(root, out string debugPath, out string debugVersion);
@@ -221,6 +238,27 @@ namespace FTTristan.CCKInstaller
                 File.WriteAllBytes(destPath, req.downloadHandler.data);
             }
             return true;
+        }
+
+        // Adds any RequiredPackages missing from Packages/manifest.json via
+        // PackageManager.Client.Add. Runs on every domain reload but converges
+        // immediately: once the package lands in the manifest the check is a
+        // no-op. Client.Add resolves asynchronously and triggers a reload, so
+        // callers must not depend on the packages being usable right away.
+        static void EnsureUnityPackages(string root)
+        {
+            string manifestPath = Path.Combine(root, "Packages", "manifest.json");
+            if (!File.Exists(manifestPath)) return;
+            string json = File.ReadAllText(manifestPath);
+            foreach (var (name, version) in RequiredPackages)
+            {
+                if (json.Contains("\"" + name + "\"")) continue;
+                Debug.Log($"[CCKAdvanced] Adding required Unity package {name}...");
+                var req = UnityEditor.PackageManager.Client.Add($"{name}@{version}");
+                req.completed += r =>
+                    Debug.Log($"[CCKAdvanced] {name}: {r.Status}" +
+                        (r.Error != null ? $" ({r.Error.message})" : ""));
+            }
         }
 
         // ------------------------------------------------------------ payload --
