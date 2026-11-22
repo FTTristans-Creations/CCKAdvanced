@@ -19,6 +19,9 @@ namespace AvatarBridge
         {
             var pb = data.Source;
             var db = data.SourceGameObject.AddComponent<DynamicBone>();
+            // Stacked systems leave extras disabled; without this every variant
+            // simulates at once and they fight over the same bones.
+            db.enabled = data.ComponentEnabled && data.InitiallyActive;
             db.m_Root = data.Root;
             db.m_Elasticity = data.Pull;
             db.m_Damping = data.Spring;
