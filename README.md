@@ -94,7 +94,6 @@ auto-update.
 | AvatarBridge (bundled, incl. YAPS) | [MrTactical](https://github.com/MrTactical/AvatarBridge) | MIT |
 | ChilloutVR CCK | [ChilloutVR Team](https://chilloutvr.net) | ChilloutVR CCK terms |
 | Harmony (vendored, editor-only) | Andreas Pardeike / Harmony | MIT |
-| Dynamic Bones Stub (vendored) | [VRLabs](https://github.com/VRLabs/Dynamic-Bones-Stub) | MIT |
 
 See [THIRD-PARTY-NOTICES](Assets/CVR.CCK/Advanced/THIRD-PARTY-NOTICES.md) inside the
 package for full license texts and attributions.

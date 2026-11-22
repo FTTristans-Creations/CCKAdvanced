@@ -53,13 +53,3 @@ below. The original CCK Advanced code is licensed separately — see
   `Assets/CVR.CCK/Advanced/Vendored/Harmony/0Harmony.dll`, used to patch
   VRCFury at runtime when present.
 - **License:** MIT License — full text in `Vendored/Harmony/LICENSE.txt`.
-
-## Dynamic Bones Stub
-
-- **Author:** VRLabs — https://github.com/VRLabs/Dynamic-Bones-Stub
-- **What:** Vendored installer + stub sources at
-  `Assets/CVR.CCK/Advanced/Vendored/DynamicBoneStub/`. On first editor load
-  it drops whitelisted DynamicBone stub components into
-  `Assets/DynamicBone/Scripts` when no DynamicBone implementation is
-  present.
-- **License:** MIT License — full text in `Vendored/DynamicBoneStub/LICENSE`.

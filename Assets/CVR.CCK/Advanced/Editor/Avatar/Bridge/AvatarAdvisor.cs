@@ -159,8 +159,8 @@ namespace AvatarBridge
                 {
                     Kind = AdviceKind.Blocked,
                     Setting = "Convert PhysBones to",
-                    Finding = $"DynamicBone is not installed, so {count} cannot be converted. The free " +
-                              "VRLabs Dynamic-Bones-Stub works for conversion" + (BridgeDefines.HasMagicaCloth2
+                    Finding = $"DynamicBone is not installed, so {count} cannot be converted. Import the " +
+                              "Dynamic Bone asset" + (BridgeDefines.HasMagicaCloth2
                                   ? ", or switch to MagicaCloth2, which is installed and gives the better result."
                                   : "."),
                     Apply = BridgeDefines.HasMagicaCloth2
