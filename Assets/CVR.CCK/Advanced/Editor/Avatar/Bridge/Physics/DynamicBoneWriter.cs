@@ -1,180 +1,37 @@
 #if VRC_SDK_VRCSDK3 && !UDON && CVR_CCK_EXISTS && AVATARBRIDGE_DYNBONE
+using System;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 using VRC.SDK3.Dynamics.PhysBone.Components;
 
 namespace AvatarBridge
 {
-    // Fallback writer: VRCPhysBone -> DynamicBone (ChilloutVR supports DynamicBone
-    // natively; the VRLabs stub also works for conversion-only projects).
-    //
-    // Mapping notes:
-    //   pull      -> m_Elasticity (scaled; DB's useful elasticity range is much smaller)
-    //   spring    -> m_Damping (inverted)
-    //   stiffness -> m_Stiffness
-    //   immobile  -> m_Inert
-    //   gravity   -> m_Force only, scaled by ElasticityScale so the force/restore balance,
-    //                and with it the resting pose, matches VRChat. m_Gravity is forced to
-    //                zero because ChilloutVR's rest-pose cancellation for it is
-    //                scale-dependent (see the comment on the gravity block below)
-    //   curves    -> distribution curves (identical multiplier-along-chain semantics)
+    // Writes VRCPhysBone chains as DynamicBone components using the same layout and
+    // raw value mapping as the pre-AvatarBridge converter: the component sits on the
+    // PhysBone's own GameObject, each collider is twinned onto the VRCPhysBoneCollider's
+    // own GameObject, and every PhysBone on the avatar is converted.
     public static class DynamicBoneWriter
     {
         const string Category = "PhysBones -> DynamicBone";
-        public const string CollectionName = "DynamicBone Phys";
-
-        // Tunable feel constants.
-        public static float ElasticityScale = 0.2f;
-        public static float MaxDamping = 0.2f;
-        public static float MinDamping = 0.02f;
-        public static float GravityScale = 1.0f;
 
         public static void Write(BridgeContext ctx, PhysBoneChainData data,
             Dictionary<VRCPhysBoneCollider, DynamicBoneColliderBase> colliderCache)
         {
-            // m_Root is what is simulated, so the host can live anywhere. One object per chain:
-            // a binding names path and type, so two on one object could not be toggled apart.
-            var home = PhysBoneConverter.CollectionUnder(ctx, CollectionName);
-            // GrabbyBones grabs DynamicBones too and names its parameters after the holder,
-            // so the holder takes the PhysBone's parameter name, as the cloth writer does.
-            string holderName = "DynamicBone_" + data.Root.name;
-            if (ctx.Settings.grabbyBonesSupport && !string.IsNullOrEmpty(data.Parameter))
-            {
-                holderName = GrabbyBonesSupport.RegisterAndName(ctx, data.Parameter);
-            }
-            var holder = new GameObject(PhysBoneConverter.UniqueChildName(home, holderName));
-            holder.transform.SetParent(home, false);
-            var db = holder.AddComponent<DynamicBone>();
+            var pb = data.Source;
+            var db = data.SourceGameObject.AddComponent<DynamicBone>();
             db.m_Root = data.Root;
-            // The holder is off the source's path, so the animator pass re-wires toggles through this.
-            ctx.ConvertedPhysicsChains.Add(new BridgeContext.ConvertedPhysicsChain
+            db.m_Elasticity = data.Pull;
+            db.m_Damping = data.Spring;
+            // Synthesized chains (HelperRigCleanup) carry no source component; their
+            // Stiffness was already resolved by the caller.
+            db.m_Stiffness = pb != null ? pb.stiffness : data.Stiffness;
+            db.m_Inert = data.Immobile;
+            db.m_Radius = data.Radius;
+            db.m_Gravity = new Vector3(0f, -data.Gravity, 0f);
+            if (pb != null && pb.ignoreTransforms != null && pb.ignoreTransforms.Count > 0)
             {
-                Source = data.SourceGameObject,
-                Host = holder,
-                Physics = db,
-                Root = data.Root
-            });
-            // Created active with the off state on the component, so a
-            // toggle can switch it back on: a component enabled on an
-            // inactive object never runs.
-            if (!data.ComponentEnabled)
-            {
-                db.enabled = false;
-                ctx.Report.Approximated(Category, data.Root.name,
-                    "Source PhysBone component was disabled; DynamicBone created disabled. Component " +
-                    "toggles are re-wired by the animator pass.");
+                db.m_Exclusions = new List<Transform>(pb.ignoreTransforms);
             }
-            else if (!data.InitiallyActive)
-            {
-                db.enabled = false;
-                ctx.Report.Approximated(Category, data.Root.name,
-                    "Style was inactive at conversion; DynamicBone created disabled. Its toggle is " +
-                    "re-wired to switch this chain on: see the Animator section of this report.");
-            }
-
-            db.m_Elasticity = Mathf.Clamp01(data.Pull) * ElasticityScale;
-            if (PhysBoneChainData.HasCurve(data.PullCurve))
-            {
-                db.m_ElasticityDistrib = new AnimationCurve(data.PullCurve.keys);
-            }
-
-            db.m_Damping = Mathf.Lerp(MaxDamping, MinDamping, Mathf.Clamp01(data.Spring));
-
-            db.m_Stiffness = Mathf.Clamp01(data.Stiffness);
-            if (PhysBoneChainData.HasCurve(data.StiffnessCurve))
-            {
-                db.m_StiffnessDistrib = new AnimationCurve(data.StiffnessCurve.keys);
-            }
-
-            db.m_Inert = Mathf.Clamp01(data.Immobile);
-            if (PhysBoneChainData.HasCurve(data.ImmobileCurve))
-            {
-                db.m_InertDistrib = new AnimationCurve(data.ImmobileCurve.keys);
-            }
-
-            // PhysBone scales radius by the bone's largest lossy scale, DynamicBone by its own x
-            // scale, so a scale-100 armature came out a hundred times thin.
-            var rootScale = data.Root.lossyScale;
-            float worldRadius = data.Radius *
-                                Mathf.Max(Mathf.Abs(rootScale.x), Mathf.Abs(rootScale.y), Mathf.Abs(rootScale.z));
-            db.m_Radius = worldRadius / Mathf.Max(Mathf.Abs(holder.transform.lossyScale.x), 1e-4f);
-            if (PhysBoneChainData.HasCurve(data.RadiusCurve))
-            {
-                db.m_RadiusDistrib = new AnimationCurve(data.RadiusCurve.keys);
-            }
-            // The same growth the MagicaCloth path applies: a slider
-            // that grows the body past the authored radius leaves the
-            // chain colliding with a body that is not the one shown.
-            if (ctx.Settings.sizePhysicsForLargest)
-            {
-                float push = MeshGrowth.Around(ctx, data.Root.position,
-                    Mathf.Max(worldRadius * 2.5f, 0.06f));
-                if (push >= 0.005f && worldRadius > 0f)
-                {
-                    float growth = Mathf.Min((worldRadius + push) / worldRadius, 3f);
-                    db.m_Radius *= growth;
-                    ctx.Report.Converted(Category, data.Root.name,
-                        $"Chain radius grown ×{growth:0.00} ({push * 100f:0.#} cm of surface travel) " +
-                        "for the largest the sliders make the body: measured at rest and with " +
-                        "every animated shape at full reach.");
-                }
-            }
-
-            // Gravity, all through m_Force; see docs/SolverCalibration.md.
-            db.m_Gravity = Vector3.zero;
-
-            float g = Mathf.Abs(data.Gravity) * GravityScale * ElasticityScale;
-            if (g > 0f)
-            {
-                float sign = data.Gravity >= 0f ? -1f : 1f;
-                db.m_Force += new Vector3(0f, sign * g, 0f);
-
-                // Falloff is the one thing that cannot survive the move: it only existed as
-                // m_Gravity's rest-pose cancellation. A chain the author expected to hang almost
-                // weightlessly at rest now feels the full pull all the time.
-                if (Mathf.Clamp01(data.GravityFalloff) > 0.01f)
-                {
-                    ctx.Report.Approximated(Category, data.Root.name,
-                        $"Gravity falloff {data.GravityFalloff:0.##} is not kept, so it hangs lower. Lower its " +
-                        "Gravity to compensate.");
-                }
-            }
-
-            // Endpoint Position is in the bone's scaled units (measured), m_EndOffset in metres.
-            // ponytail: length only; DynamicBone turns the offset by its own
-            // transform, not each leaf's, which one offset cannot match on a
-            // chain whose leaves face apart.
-            var tipScale = data.Root.lossyScale;
-            db.m_EndOffset = data.EndpointPosition *
-                             ((Mathf.Abs(tipScale.x) + Mathf.Abs(tipScale.y) + Mathf.Abs(tipScale.z)) / 3f);
-            db.m_Exclusions = data.Ignores.Concat(data.NestedExclusions).ToList();
-            if (data.NestedExclusions.Count > 0)
-            {
-                ctx.Report.Approximated(Category, data.Root.name,
-                    $"{BridgeElements.Count(data.NestedExclusions.Count, "other PhysBone's chain", "other PhysBones' chains")} added to the exclusions: " +
-                    $"{string.Join(", ", data.NestedExclusions.Take(4).Select(t => t.name))}" +
-                    $"{(data.NestedExclusions.Count > 4 ? ", …" : "")} and below, which VRChat leaves to their own PhysBone " +
-                    "(Ignore Other PhysBones).");
-            }
-            if (data.HumanoidExclusions.Count > 0)
-            {
-                ctx.Report.Approximated(Category, data.Root.name,
-                    $"{BridgeElements.Count(data.HumanoidExclusions.Count, "humanoid-mapped bone", "humanoid-mapped bones")} added to the exclusions: " +
-                    $"{string.Join(", ", data.HumanoidExclusions.Take(4).Select(t => t.name))}" +
-                    $"{(data.HumanoidExclusions.Count > 4 ? ", …" : "")}. The animator and IK drive " +
-                    "humanoid bones every frame, so simulating one fights them for the transform.");
-            }
-
-            if (data.ToeExclusions.Count > 0)
-            {
-                ctx.Report.Approximated(Category, data.Root.name,
-                    $"{BridgeElements.Count(data.ToeExclusions.Count, "toe branch", "toe branches")} added to the exclusions: " +
-                    $"{string.Join(", ", data.ToeExclusions.Take(4).Select(t => t.name))}" +
-                    $"{(data.ToeExclusions.Count > 4 ? ", …" : "")} and below. Turn on \"Convert toe PhysBones\" " +
-                    "if they are deliberate.");
-            }
-
             if (data.Colliders.Count > 0)
             {
                 db.m_Colliders = new List<DynamicBoneColliderBase>();
@@ -188,100 +45,59 @@ namespace AvatarBridge
                 }
             }
 
-            if (data.LimitTypeName != "None")
+            // The component lives on the source object itself, so the animator pass
+            // retargets PhysBone toggles straight onto it through this entry.
+            ctx.ConvertedPhysicsChains.Add(new BridgeContext.ConvertedPhysicsChain
             {
-                ctx.Report.Skipped(Category, data.Root.name,
-                    $"Limit type '{data.LimitTypeName}' has no DynamicBone equivalent.");
-            }
-            if (data.MaxStretch > 0f)
-            {
-                ctx.Report.Skipped(Category, data.Root.name, "Max Stretch is not converted.");
-            }
-            if (!string.IsNullOrEmpty(data.Parameter))
-            {
-                if (ctx.Settings.grabbyBonesSupport)
-                {
-                    ctx.Report.Approximated(Category, data.Root.name,
-                        $"PhysBone parameter \"{data.Parameter}\": _IsGrabbed and _Angle work via the GrabbyBones " +
-                        "mod (DynamicBone object named to match). _Stretch/_Squish/_IsPosed have no equivalent.");
-                }
-                else
-                {
-                    ctx.Report.Skipped(Category, data.Root.name,
-                        $"PhysBone parameter \"{data.Parameter}\" has no CVR equivalent.");
-                }
-            }
+                Source = data.SourceGameObject,
+                Host = data.SourceGameObject,
+                Physics = db,
+                Root = data.Root
+            });
 
             ctx.Report.Converted(Category, data.Root.name,
-                $"DynamicBone with {BridgeElements.Count(data.Colliders.Count, "collider", "colliders")}. Source PhysBone was " +
-                $"pull {data.Pull:0.##}, spring {data.Spring:0.##}, stiffness {data.Stiffness:0.##}, " +
-                $"gravity {data.Gravity:0.##}, immobile {data.Immobile:0.##}, radius {data.Radius:0.###}. " +
-                "Tune the DynamicBone directly if this chain wants a different feel.");
+                $"DynamicBone. Source PhysBone was pull {data.Pull:0.##}, spring {data.Spring:0.##}, " +
+                $"stiffness {(pb != null ? pb.stiffness : data.Stiffness):0.##}, gravity {data.Gravity:0.##}, " +
+                $"immobile {data.Immobile:0.##}, radius {data.Radius:0.###}.");
         }
 
-        static DynamicBoneColliderBase GetOrCreateCollider(BridgeContext ctx, VRCPhysBoneCollider pbCollider,
-            Dictionary<VRCPhysBoneCollider, DynamicBoneColliderBase> cache)
+        // Twinned onto the collider's own GameObject: DeleteConverted removes the
+        // VRCPhysBoneCollider component afterwards and this survives it.
+        internal static DynamicBoneColliderBase GetOrCreateCollider(BridgeContext ctx,
+            VRCPhysBoneCollider pbCollider, Dictionary<VRCPhysBoneCollider, DynamicBoneColliderBase> cache)
         {
+            if (pbCollider == null)
+            {
+                return null;
+            }
             if (cache.TryGetValue(pbCollider, out var cached))
             {
                 return cached;
             }
 
-            Transform parent = pbCollider.rootTransform != null ? pbCollider.rootTransform : pbCollider.transform;
-            string shape = pbCollider.shapeType.ToString();
-
-            // Sibling-unique: two colliders on one bone would share an animation path.
-            var go = new GameObject(PhysBoneConverter.UniqueChildName(parent, "DBCollider_" + parent.name));
-            go.transform.SetParent(parent, false);
-            go.transform.localPosition = pbCollider.position;
-            go.transform.localRotation = pbCollider.rotation;
-
-            DynamicBoneColliderBase collider;
-            if (shape.Contains("Plane"))
+            var collider = pbCollider.GetComponent<DynamicBoneCollider>();
+            if (collider == null)
             {
-                var plane = go.AddComponent<DynamicBonePlaneCollider>();
-                plane.m_Center = Vector3.zero;
-                plane.m_Direction = DynamicBoneColliderBase.Direction.Y;
-                collider = plane;
-            }
-            else
-            {
-                var round = go.AddComponent<DynamicBoneCollider>();
-                round.m_Center = Vector3.zero;
-                round.m_Radius = pbCollider.radius;
-                round.m_Height = shape.Contains("Capsule") ? pbCollider.height : 0f;
-                round.m_Direction = DynamicBoneColliderBase.Direction.Y;
-                round.m_Bound = pbCollider.insideBounds
-                    ? DynamicBoneColliderBase.Bound.Inside
-                    : DynamicBoneColliderBase.Bound.Outside;
-                // An inside-bound collider is a cage; growing the body
-                // it contains would shrink the room inside, so only
-                // ordinary colliders follow the sliders.
-                if (ctx.Settings.sizePhysicsForLargest
-                    && round.m_Bound == DynamicBoneColliderBase.Bound.Outside)
-                {
-                    var goScale = go.transform.lossyScale;
-                    float goMean = (Mathf.Abs(goScale.x) + Mathf.Abs(goScale.y) + Mathf.Abs(goScale.z)) / 3f;
-                    float worldRadius = round.m_Radius * Mathf.Max(goMean, 1e-4f);
-                    float push = MeshGrowth.Around(ctx,
-                        go.transform.TransformPoint(round.m_Center),
-                        Mathf.Max(worldRadius * 2.5f, 0.06f));
-                    if (push >= 0.005f && worldRadius > 0f)
-                    {
-                        float growth = Mathf.Min((worldRadius + push) / worldRadius, 3f);
-                        round.m_Radius *= growth;
-                        round.m_Height *= growth;
-                        ctx.Report.Converted("PhysBone colliders", parent.name,
-                            $"Collider grown ×{growth:0.00} ({push * 100f:0.#} cm of surface travel) " +
-                            "for the largest the sliders make the body: measured at rest and with " +
-                            "every animated shape at full reach.");
-                    }
-                }
-                collider = round;
+                collider = pbCollider.gameObject.AddComponent<DynamicBoneCollider>();
             }
 
-            ctx.Report.Converted("PhysBone colliders", parent.name, shape + " -> DynamicBone collider");
-            PhysBoneConverter.RecordColliderHost(ctx, pbCollider, go);
+            collider.m_Radius = pbCollider.radius;
+            collider.m_Height = pbCollider.height;
+            collider.m_Center = pbCollider.position;
+
+            int direction = 1; // Y axis
+            if (pbCollider.shapeType.ToString().Equals("Capsule", StringComparison.OrdinalIgnoreCase))
+            {
+                Vector3 dirVec = pbCollider.rotation * Vector3.up;
+                if (Mathf.Abs(dirVec.x) > 0.8f) direction = 0;
+                else if (Mathf.Abs(dirVec.z) > 0.8f) direction = 2;
+            }
+            collider.m_Direction = (DynamicBoneColliderBase.Direction)direction;
+            collider.m_Bound = pbCollider.insideBounds
+                ? DynamicBoneColliderBase.Bound.Inside
+                : DynamicBoneColliderBase.Bound.Outside;
+
+            PhysBoneConverter.RecordColliderHost(ctx, pbCollider, pbCollider.gameObject);
             cache[pbCollider] = collider;
             return collider;
         }
