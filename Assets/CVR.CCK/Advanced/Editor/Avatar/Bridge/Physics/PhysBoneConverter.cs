@@ -382,15 +382,17 @@ namespace AvatarBridge
                 case PhysicsTarget.DynamicBone:
 #if AVATARBRIDGE_DYNBONE
                     var dbColliderCache = new Dictionary<VRCPhysBoneCollider, DynamicBoneColliderBase>();
-                    // The legacy converter twinned a DynamicBoneCollider onto EVERY
-                    // VRCPhysBoneCollider on the avatar, referenced or not.
-                    foreach (var pbc in ctx.Target.GetComponentsInChildren<VRCPhysBoneCollider>(true))
-                    {
-                        DynamicBoneWriter.GetOrCreateCollider(ctx, pbc, dbColliderCache);
-                    }
+                    var skinnedD = SkinnedBones(ctx);
+                    var drivenD = ConstraintDriven(ctx);
                     foreach (var pb in physBones)
                     {
                         var dbChain = PhysBoneChainData.Read(pb, ctx.TargetAnimator, !ctx.Settings.convertToePhysBones);
+                        if (SkipToeChain(ctx, dbChain) || SkipConstraintDrivenChain(ctx, dbChain, drivenD)
+                            || SkipSquishOnlyChain(ctx, dbChain, skinnedD, drivenD)
+                            || SkipHelperRigChain(ctx, dbChain, skinnedD))
+                        {
+                            continue;
+                        }
                         DynamicBoneWriter.Write(ctx, dbChain, dbColliderCache);
                     }
                     DeleteConverted(ctx, physBones);
