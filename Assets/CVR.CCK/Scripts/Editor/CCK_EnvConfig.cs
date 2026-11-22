@@ -91,10 +91,7 @@ public static class CCK_EnvConfig
         {
             if (json.Contains("\"" + name + "\"")) continue;
             Debug.Log($"[CCK:Init] Adding required Unity package {name}...");
-            var req = UnityEditor.PackageManager.Client.Add($"{name}@{version}");
-            req.completed += r =>
-                Debug.Log($"[CCK:Init] {name}: {r.Status}" +
-                    (r.Error != null ? $" ({r.Error.message})" : ""));
+            UnityEditor.PackageManager.Client.Add($"{name}@{version}");
         }
     }
 }

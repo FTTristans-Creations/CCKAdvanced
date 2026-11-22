@@ -254,10 +254,7 @@ namespace FTTristan.CCKInstaller
             {
                 if (json.Contains("\"" + name + "\"")) continue;
                 Debug.Log($"[CCKAdvanced] Adding required Unity package {name}...");
-                var req = UnityEditor.PackageManager.Client.Add($"{name}@{version}");
-                req.completed += r =>
-                    Debug.Log($"[CCKAdvanced] {name}: {r.Status}" +
-                        (r.Error != null ? $" ({r.Error.message})" : ""));
+                UnityEditor.PackageManager.Client.Add($"{name}@{version}");
             }
         }
 
