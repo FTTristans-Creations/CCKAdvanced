@@ -561,7 +561,7 @@ namespace AvatarBridge
             if (settings.physicsTarget == PhysicsTarget.DynamicBone && !BridgeDefines.HasDynamicBone)
             {
                 b.Add(BridgeElements.Notice(Tone.Warn,
-                    "DynamicBone is not installed. Import the Dynamic Bone asset to convert PhysBones."));
+                    "DynamicBone is not installed. The free VRLabs Dynamic-Bones-Stub also works for conversion."));
             }
 
             // Both writers name their holders from it.

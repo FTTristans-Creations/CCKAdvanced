@@ -398,7 +398,7 @@ namespace AvatarBridge
 #else
                     // Same shape as the MagicaCloth2 branch above, and the same reason.
                     ctx.Report.Error(Category, "DynamicBone is not installed",
-                        "Import DynamicBone, or choose MagicaCloth2" +
+                        "Import DynamicBone or the VRLabs Dynamic-Bones-Stub, or choose MagicaCloth2" +
                         (ctx.Standalone ? " in the Convert tab's Physics options." : "."));
                     return;
 #endif
